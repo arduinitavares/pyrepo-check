@@ -1,5 +1,5 @@
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess  # nosec B404
 
 import pytest
 

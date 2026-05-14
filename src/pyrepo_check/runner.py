@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from subprocess import CompletedProcess
 import shlex
 import subprocess  # nosec B404
 
@@ -99,7 +98,7 @@ def run_checks(
     checks: Sequence[Check],
     *,
     cwd: Path,
-    runner: Callable[..., CompletedProcess[tuple[str, ...]]] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess[tuple[str, ...]]] = subprocess.run,
 ) -> int:
     exit_code = 0
     for check in checks:

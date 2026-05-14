@@ -11,8 +11,10 @@ pyrepo-check = "pyrepo_check.cli:main"
 
 [dependency-groups]
 dev = [
+    "bandit>=1.9,<2",
     "pytest>=8,<9",
     "ruff>=0.15,<1",
+    "ty>=0.0.35,<0.1",
 ]
 
 [build-system]
@@ -29,3 +31,9 @@ target-version = "py311"
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+
+[tool.bandit]
+exclude_dirs = [".venv", ".pytest_cache", ".ruff_cache"]
+
+[tool.bandit.assert_used]
+skips = ["./tests/*"]

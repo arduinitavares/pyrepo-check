@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 import argparse
 import subprocess  # nosec B404
@@ -35,7 +35,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None, *, runner=subprocess.run) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[tuple[str, ...]]] = subprocess.run,
+) -> int:
     args = parse_args(argv)
     try:
         config = load_project_config(Path(args.root), no_frozen=args.no_frozen)
