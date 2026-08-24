@@ -6,12 +6,24 @@ from pyrepo_check.config import ProjectConfig
 from pyrepo_check.planning import (
     PlannedCheck,
     PlanningFacts,
+    PlanningFailure,
     RunPlan,
     RunRequest,
     build_checks as build_planned_checks,
     plan_run,
     select_check_names,
 )
+
+
+def test_carries_internal_output_intent(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    facts = PlanningFacts(frozenset())
+    terminal = RunRequest(tmp_path, ("ty",), False, False)
+    machine = RunRequest(tmp_path, ("ty",), False, False, "json")
+
+    assert terminal.output_format == "terminal"
+    assert plan_run(machine, config, facts).output_format == "json"
+    assert plan_run(terminal, config, facts).output_format == "terminal"
 
 
 def make_config(
@@ -282,7 +294,7 @@ def test_preserves_direct_target_order_and_duplicates(tmp_path: Path) -> None:
 
 
 def test_rejects_unknown_target_only_request(tmp_path: Path) -> None:
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(PlanningFailure) as raised:
         plan_run(
             RunRequest(tmp_path, ("z.py", "a.py"), False, no_frozen=False),
             make_config(tmp_path),
@@ -290,6 +302,45 @@ def test_rejects_unknown_target_only_request(tmp_path: Path) -> None:
         )
 
     assert str(raised.value) == "Unknown check(s): a.py, z.py"
+    assert raised.value.code == "unknown_target"
+    assert raised.value.hint == "Check the target path or select a check name."
+
+
+def test_unknown_check_has_typed_failure_and_hint() -> None:
+    available = ("ruff", "annotations", "annotations-fix", "ty", "bandit", "pytest")
+
+    with pytest.raises(PlanningFailure) as raised:
+        select_check_names(available, requested=("mypy",), all_selected=False)
+
+    assert isinstance(raised.value, ValueError)
+    assert raised.value.code == "unknown_check"
+    assert str(raised.value) == "Unknown check(s): mypy"
+    assert raised.value.hint == "Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest"
+
+
+@pytest.mark.parametrize("token", ("a.py", "src/foo", "tests::test_name"))
+def test_unknown_path_like_target_has_unknown_target_code(token: str) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        select_check_names((), requested=(token,), all_selected=False)
+
+    assert raised.value.code == "unknown_target"
+
+
+def test_mixed_unknown_tokens_choose_check_code() -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        select_check_names((), requested=("a.py", "mypy"), all_selected=False)
+
+    assert raised.value.code == "unknown_check"
+
+
+def test_known_check_with_missing_target_remains_allowed(tmp_path: Path) -> None:
+    plan = plan_run(
+        RunRequest(tmp_path, ("ruff", "missing.py"), False, False),
+        make_config(tmp_path),
+        PlanningFacts(frozenset()),
+    )
+
+    assert command_names(plan) == ("ruff",)
 
 
 @pytest.mark.parametrize("frozen", (False, True))

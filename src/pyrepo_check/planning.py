@@ -17,6 +17,29 @@ CheckName = Literal[
     "pytest",
 ]
 RunMode = Literal["focused", "strict_aggregate"]
+OutputFormat = Literal["terminal", "json"]
+PlanningErrorCode = Literal[
+    "invalid_arguments",
+    "invalid_project_config",
+    "unknown_check",
+    "unknown_target",
+    "internal_planning_error",
+]
+
+
+class PlanningFailure(ValueError):
+    def __init__(
+        self,
+        code: PlanningErrorCode,
+        message: str,
+        *,
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
+
 
 CHECK_ORDER: tuple[CheckName, ...] = (
     "ruff",
@@ -40,6 +63,7 @@ class RunRequest:
     positionals: tuple[str, ...]
     all_selected: bool
     no_frozen: bool
+    output_format: OutputFormat = "terminal"
 
 
 @dataclass(frozen=True)
@@ -59,6 +83,7 @@ class RunPlan:
     mode: RunMode
     targets: tuple[str, ...]
     checks: tuple[PlannedCheck, ...]
+    output_format: OutputFormat = "terminal"
 
 
 def plan_run(
@@ -73,7 +98,11 @@ def plan_run(
         )
         if missing:
             names = ", ".join(sorted(missing))
-            raise ValueError(f"Unknown check(s): {names}")
+            raise PlanningFailure(
+                "unknown_target",
+                f"Unknown check(s): {names}",
+                hint="Check the target path or select a check name.",
+            )
         requested = TARGET_DEFAULT_CHECKS
 
     strict_all = not targets and (request.all_selected or not request.positionals)
@@ -87,6 +116,7 @@ def plan_run(
         mode="strict_aggregate" if strict_all else "focused",
         targets=targets,
         checks=selected,
+        output_format=request.output_format,
     )
 
 
@@ -200,10 +230,23 @@ def select_check_names(
     unknown = sorted(set(requested) - set(available_names))
     if unknown:
         names = ", ".join(unknown)
-        raise ValueError(f"Unknown check(s): {names}")
+        code: PlanningErrorCode = (
+            "unknown_target" if all(_is_path_like(token) for token in unknown)
+            else "unknown_check"
+        )
+        hint = (
+            "Check the target path or select a check name."
+            if code == "unknown_target"
+            else "Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest"
+        )
+        raise PlanningFailure(code, f"Unknown check(s): {names}", hint=hint)
 
     requested_names = set(requested)
     return tuple(name for name in SELECTABLE_CHECK_ORDER if name in requested_names)
+
+
+def _is_path_like(token: str) -> bool:
+    return any(marker in token for marker in ("/", "\\", "::")) or "." in Path(token).name
 
 
 def _uv_python_prefix(config: ProjectConfig) -> tuple[str, ...]:
