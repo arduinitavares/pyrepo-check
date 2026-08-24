@@ -167,7 +167,6 @@ def test_accepts_existing_contained_test_targets(tmp_path: Path, target: str) ->
         ("-p",),
         ("",),
         ("missing.py",),
-        ("/tmp",),
         ("../escape",),
     ),
 )
@@ -175,6 +174,14 @@ def test_rejects_invalid_test_shortcut_grammar_or_targets(
     tmp_path: Path, args: tuple[str, ...]
 ) -> None:
     _write_test_shortcuts(tmp_path, {"unit": list(args)})
+
+    with pytest.raises(InvalidTestShortcutError):
+        load_project_config(tmp_path)
+
+
+def test_rejects_absolute_test_shortcut_target(tmp_path: Path) -> None:
+    absolute_target = tmp_path / "test_absolute.py"
+    _write_test_shortcuts(tmp_path, {"unit": [str(absolute_target)]})
 
     with pytest.raises(InvalidTestShortcutError):
         load_project_config(tmp_path)
