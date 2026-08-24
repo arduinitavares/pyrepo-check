@@ -211,6 +211,38 @@ def test_invalid_shortcut_config_renders_typed_planning_error_without_spawning(
 
 
 @pytest.mark.parametrize("output_format", ("terminal", "json"))
+@pytest.mark.parametrize("selector", ("-k", "-m"))
+def test_nul_selector_config_renders_typed_planning_error_without_spawning(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+    selector: str,
+) -> None:
+    _write_test_shortcuts(tmp_path, {"unit": [selector, "bad\x00expr"]})
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path)]
+    if output_format == "json":
+        argv.extend(("--format", "json"))
+    argv.append("ty")
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="invalid_test_shortcut",
+        message=(
+            f"Invalid Test Shortcut 'unit': selector {selector} expression cannot contain NUL"
+        ),
+        hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
 def test_symlink_loop_shortcut_config_renders_typed_error_without_spawning(
     tmp_path: Path,
     capsysbinary: pytest.CaptureFixture[bytes],

@@ -166,6 +166,11 @@ def _validate_test_shortcut(
                     f"Invalid Test Shortcut {name!r}: selector {token} "
                     "requires one non-empty expression that does not begin with '-'"
                 )
+            if "\x00" in pytest_args[operand_index]:
+                raise InvalidTestShortcutError(
+                    f"Invalid Test Shortcut {name!r}: selector {token} "
+                    "expression cannot contain NUL"
+                )
             seen_selectors.add(token)
             index += 2
             continue

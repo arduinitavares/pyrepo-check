@@ -179,6 +179,19 @@ def test_rejects_invalid_test_shortcut_grammar_or_targets(
         load_project_config(tmp_path)
 
 
+@pytest.mark.parametrize("selector", ("-k", "-m"))
+def test_rejects_test_shortcut_selector_expression_with_embedded_nul(
+    tmp_path: Path, selector: str
+) -> None:
+    _write_test_shortcuts(tmp_path, {"unit": [selector, "bad\x00expr"]})
+
+    with pytest.raises(
+        InvalidTestShortcutError,
+        match=rf"Invalid Test Shortcut 'unit': selector {selector} expression cannot contain NUL",
+    ):
+        load_project_config(tmp_path)
+
+
 def test_rejects_absolute_test_shortcut_target(tmp_path: Path) -> None:
     absolute_target = tmp_path / "test_absolute.py"
     absolute_target.write_text("", encoding="utf-8")
