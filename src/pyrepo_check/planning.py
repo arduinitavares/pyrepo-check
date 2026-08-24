@@ -98,11 +98,17 @@ def plan_run(
         )
         if missing:
             names = ", ".join(sorted(missing))
-            raise PlanningFailure(
-                "unknown_target",
-                f"Unknown check(s): {names}",
-                hint="Check the target path or select a check name.",
+            code: PlanningErrorCode = (
+                "unknown_target"
+                if all(_is_path_like(token) for token in missing)
+                else "unknown_check"
             )
+            hint = (
+                "Check the target path or select a check name."
+                if code == "unknown_target"
+                else "Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest"
+            )
+            raise PlanningFailure(code, f"Unknown check(s): {names}", hint=hint)
         requested = TARGET_DEFAULT_CHECKS
 
     strict_all = not targets and (request.all_selected or not request.positionals)

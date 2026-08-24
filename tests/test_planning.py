@@ -306,6 +306,26 @@ def test_rejects_unknown_target_only_request(tmp_path: Path) -> None:
     assert raised.value.hint == "Check the target path or select a check name."
 
 
+@pytest.mark.parametrize(
+    ("positionals", "expected_code"),
+    (("mypy", "unknown_check"), ("a.py", "unknown_target"), (("a.py", "mypy"), "unknown_check")),
+)
+def test_plan_run_classifies_unknown_target_only_tokens(
+    tmp_path: Path,
+    positionals: tuple[str, ...] | str,
+    expected_code: str,
+) -> None:
+    tokens = (positionals,) if isinstance(positionals, str) else positionals
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, tokens, False, no_frozen=False),
+            make_config(tmp_path),
+            PlanningFacts(frozenset()),
+        )
+
+    assert raised.value.code == expected_code
+
+
 def test_unknown_check_has_typed_failure_and_hint() -> None:
     available = ("ruff", "annotations", "annotations-fix", "ty", "bandit", "pytest")
 
