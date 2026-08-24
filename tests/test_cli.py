@@ -1,364 +1,87 @@
 from pathlib import Path
-from subprocess import CompletedProcess  # nosec B404
 
 import pytest
 
 from pyrepo_check.cli import main
+from pyrepo_check.config import ProjectConfig
+from pyrepo_check.execution import ExecutionResult, ProcessRunner
+from pyrepo_check.planning import PlanningFacts, RunPlan, RunRequest
+from tests.support import RecordingRunner
 
 
-def test_cli_runs_selected_check_from_root(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    calls: list[tuple[tuple[str, ...], Path]] = []
+def test_cli_builds_request_and_executes_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_plan = RunPlan(mode="focused", targets=(), checks=())
+    planned_requests: list[RunRequest] = []
+    executed_plans: list[RunPlan] = []
+    injected_runner = RecordingRunner()
 
-    def fake_runner(
-        command: tuple[str, ...],
+    def fake_plan_run(
+        request: RunRequest,
+        config: ProjectConfig,
+        facts: PlanningFacts,
+    ) -> RunPlan:
+        planned_requests.append(request)
+        assert config.root == tmp_path.resolve()
+        assert config.frozen is False
+        assert facts == PlanningFacts(existing_positionals=frozenset())
+        return expected_plan
+
+    def fake_execute_plan(
+        plan: RunPlan,
         *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append((command, cwd))
-        return CompletedProcess(command, returncode=0)
+        runner: ProcessRunner,
+    ) -> ExecutionResult:
+        executed_plans.append(plan)
+        assert runner is injected_runner
+        return ExecutionResult(checks=(), exit_code=7)
 
-    result = main(["--root", str(tmp_path), "ruff"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [(("uv", "run", "python", "-m", "ruff", "check", "src"), tmp_path)]
-
-
-def test_cli_runs_annotations_check_from_root(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "annotations"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            "src",
-            "--select",
-            "ANN",
-            "--output-format",
-            "concise",
-        )
-    ]
-
-
-def test_cli_runs_annotations_fix_from_root(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "annotations-fix"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            "src",
-            "--select",
-            "ANN",
-            "--fix",
-            "--unsafe-fixes",
-        )
-    ]
-
-
-def test_cli_passes_file_target_to_selected_check(tmp_path: Path) -> None:
-    (tmp_path / "api.py").write_text("", encoding="utf-8")
-    calls: list[tuple[tuple[str, ...], Path]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append((command, cwd))
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "ruff", "api.py"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        (("uv", "run", "python", "-m", "ruff", "check", "api.py"), tmp_path)
-    ]
-
-
-def test_cli_passes_file_target_to_annotations_check(tmp_path: Path) -> None:
-    (tmp_path / "api.py").write_text("", encoding="utf-8")
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "annotations", "api.py"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            "api.py",
-            "--select",
-            "ANN",
-            "--output-format",
-            "concise",
-        )
-    ]
-
-
-def test_cli_passes_file_target_to_annotations_fix(tmp_path: Path) -> None:
-    (tmp_path / "api.py").write_text("", encoding="utf-8")
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "annotations-fix", "api.py"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            "api.py",
-            "--select",
-            "ANN",
-            "--fix",
-            "--unsafe-fixes",
-        )
-    ]
-
-
-def test_cli_runs_file_checks_against_file_target_when_no_check_is_named(tmp_path: Path) -> None:
-    (tmp_path / "api.py").write_text("", encoding="utf-8")
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "api.py"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        ("uv", "run", "python", "-m", "ruff", "check", "api.py"),
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            "api.py",
-            "--select",
-            "ANN",
-            "--output-format",
-            "concise",
-        ),
-        ("uv", "run", "python", "-m", "ty", "check", "api.py"),
-        ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "api.py"),
-    ]
-
-
-def test_cli_runs_all_checks_against_file_target_with_all_flag(tmp_path: Path) -> None:
-    (tmp_path / "api.py").write_text("", encoding="utf-8")
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "--all", "api.py"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        ("uv", "run", "python", "-m", "ruff", "check", "api.py"),
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            "api.py",
-            "--select",
-            "ANN",
-            "--output-format",
-            "concise",
-        ),
-        ("uv", "run", "python", "-m", "ty", "check", "api.py"),
-        ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "api.py"),
-        ("uv", "run", "python", "-m", "pytest", "api.py"),
-    ]
-
-
-def test_cli_all_includes_annotations_but_not_annotations_fix(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    calls: list[tuple[str, ...]] = []
-
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
-
-    result = main(["--root", str(tmp_path), "--all"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        ("uv", "run", "python", "-m", "ruff", "check", "."),
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            ".",
-            "--select",
-            "ANN",
-            "--output-format",
-            "concise",
-        ),
-        ("uv", "run", "python", "-m", "ty", "check"),
-        ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "-r", "."),
-        ("uv", "run", "python", "-m", "pytest"),
-    ]
-
-
-def test_cli_no_args_uses_strict_repository_targets(tmp_path: Path) -> None:
-    (tmp_path / "api.py").write_text("", encoding="utf-8")
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "scripts").mkdir()
-    (tmp_path / "pyproject.toml").write_text(
-        """
-[tool.pyrepo-check]
-ruff_targets = ["tests", "scripts"]
-bandit_targets = ["tests"]
-""".strip(),
-        encoding="utf-8",
+    monkeypatch.setattr("pyrepo_check.cli.plan_run", fake_plan_run, raising=False)
+    monkeypatch.setattr(
+        "pyrepo_check.cli.execute_plan",
+        fake_execute_plan,
+        raising=False,
     )
-    calls: list[tuple[str, ...]] = []
 
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
+    result = main(
+        ["--root", str(tmp_path), "--no-frozen", "ty"],
+        runner=injected_runner,
+    )
 
-    result = main(["--root", str(tmp_path)], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [
-        ("uv", "run", "python", "-m", "ruff", "check", "."),
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "ruff",
-            "check",
-            ".",
-            "--select",
-            "ANN",
-            "--output-format",
-            "concise",
-        ),
-        ("uv", "run", "python", "-m", "ty", "check"),
-        ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "-r", "."),
-        ("uv", "run", "python", "-m", "pytest"),
+    assert result == 7
+    assert planned_requests == [
+        RunRequest(
+            root=tmp_path,
+            positionals=("ty",),
+            all_selected=False,
+            no_frozen=True,
+        )
     ]
+    assert executed_plans == [expected_plan]
 
 
-def test_cli_returns_two_for_unknown_check(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    result = main(["--root", str(tmp_path), "mypy"])
+def test_cli_reports_planning_error_without_spawning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = RecordingRunner()
+
+    result = main(["--root", str(tmp_path), "mypy"], runner=runner)
 
     captured = capsys.readouterr()
-
     assert result == 2
-    assert "Unknown check(s): mypy" in captured.err
+    assert captured.err == "Unknown check(s): mypy\n"
+    assert runner.calls == []
 
 
-def test_cli_no_frozen_flag_overrides_lock(tmp_path: Path) -> None:
+def test_cli_propagates_runner_value_error_by_identity(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
-    (tmp_path / "uv.lock").write_text("", encoding="utf-8")
-    calls: list[tuple[str, ...]] = []
+    error = ValueError("runner failed")
+    runner = RecordingRunner(raise_on_call=1, exception=error)
 
-    def fake_runner(
-        command: tuple[str, ...],
-        *,
-        cwd: Path,
-        check: bool,
-    ) -> CompletedProcess[tuple[str, ...]]:
-        calls.append(command)
-        return CompletedProcess(command, returncode=0)
+    with pytest.raises(ValueError) as raised:
+        main(["--root", str(tmp_path), "ruff"], runner=runner)
 
-    result = main(["--root", str(tmp_path), "--no-frozen", "ruff"], runner=fake_runner)
-
-    assert result == 0
-    assert calls == [("uv", "run", "python", "-m", "ruff", "check", "src")]
+    assert raised.value is error

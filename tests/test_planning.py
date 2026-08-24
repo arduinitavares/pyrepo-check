@@ -8,7 +8,9 @@ from pyrepo_check.planning import (
     PlanningFacts,
     RunPlan,
     RunRequest,
+    build_checks as build_planned_checks,
     plan_run,
+    select_check_names,
 )
 
 
@@ -29,6 +31,190 @@ def make_config(
 
 def command_names(plan: RunPlan) -> tuple[str, ...]:
     return tuple(check.name for check in plan.checks)
+
+
+def commands(plan: RunPlan) -> tuple[tuple[str, ...], ...]:
+    return tuple(check.command for check in plan.checks)
+
+
+def test_builds_legacy_frozen_command_matrix(tmp_path: Path) -> None:
+    checks = build_planned_checks(
+        make_config(
+            tmp_path,
+            ruff_targets=("src/pkg", "tests"),
+            bandit_targets=("src/pkg",),
+            frozen=True,
+        )
+    )
+
+    assert {name: check.command for name, check in checks.items()} == {
+        "ruff": (
+            "uv", "run", "--frozen", "python", "-m", "ruff", "check", "src/pkg", "tests"
+        ),
+        "annotations": (
+            "uv", "run", "--frozen", "python", "-m", "ruff", "check", "src/pkg", "tests",
+            "--select", "ANN", "--output-format", "concise",
+        ),
+        "annotations-fix": (
+            "uv", "run", "--frozen", "python", "-m", "ruff", "check", "src/pkg", "tests",
+            "--select", "ANN", "--fix", "--unsafe-fixes",
+        ),
+        "ty": ("uv", "run", "--frozen", "python", "-m", "ty", "check"),
+        "bandit": (
+            "uv", "run", "--frozen", "python", "-m", "bandit", "-c", "pyproject.toml", "-r", "src/pkg"
+        ),
+        "pytest": ("uv", "run", "--frozen", "python", "-m", "pytest"),
+    }
+
+
+def test_selects_legacy_names_in_canonical_order() -> None:
+    available = ("ruff", "annotations", "annotations-fix", "ty", "bandit", "pytest")
+
+    assert select_check_names(available, requested=(), all_selected=False) == (
+        "ruff", "annotations", "ty", "bandit", "pytest"
+    )
+    assert select_check_names(
+        available,
+        requested=("annotations-fix",),
+        all_selected=False,
+    ) == ("annotations-fix",)
+    assert select_check_names(available, requested=(), all_selected=True) == (
+        "ruff", "annotations", "ty", "bandit", "pytest"
+    )
+    with pytest.raises(ValueError, match=r"Unknown check\(s\): mypy"):
+        select_check_names(available, requested=("ruff", "mypy"), all_selected=False)
+
+
+@pytest.mark.parametrize(
+    (
+        "positionals",
+        "all_selected",
+        "existing",
+        "ruff_targets",
+        "bandit_targets",
+        "expected",
+    ),
+    (
+        pytest.param(
+            ("ruff",), False, frozenset(), ("src",), ("src",),
+            (("uv", "run", "python", "-m", "ruff", "check", "src"),),
+            id="focused-ruff-from-root",
+        ),
+        pytest.param(
+            ("annotations",), False, frozenset(), ("src",), ("src",),
+            ((
+                "uv", "run", "python", "-m", "ruff", "check", "src", "--select", "ANN",
+                "--output-format", "concise",
+            ),),
+            id="focused-annotations-from-root",
+        ),
+        pytest.param(
+            ("annotations-fix",), False, frozenset(), ("src",), ("src",),
+            ((
+                "uv", "run", "python", "-m", "ruff", "check", "src", "--select", "ANN",
+                "--fix", "--unsafe-fixes",
+            ),),
+            id="focused-annotations-fix-from-root",
+        ),
+        pytest.param(
+            ("ruff", "api.py"), False, frozenset(), ("src",), ("src",),
+            (("uv", "run", "python", "-m", "ruff", "check", "api.py"),),
+            id="ruff-with-direct-target",
+        ),
+        pytest.param(
+            ("annotations", "api.py"), False, frozenset(), ("src",), ("src",),
+            ((
+                "uv", "run", "python", "-m", "ruff", "check", "api.py", "--select", "ANN",
+                "--output-format", "concise",
+            ),),
+            id="annotations-with-direct-target",
+        ),
+        pytest.param(
+            ("annotations-fix", "api.py"), False, frozenset(), ("src",), ("src",),
+            ((
+                "uv", "run", "python", "-m", "ruff", "check", "api.py", "--select", "ANN",
+                "--fix", "--unsafe-fixes",
+            ),),
+            id="annotations-fix-with-direct-target",
+        ),
+        pytest.param(
+            ("api.py",), False, frozenset(("api.py",)), ("src",), ("src",),
+            (
+                ("uv", "run", "python", "-m", "ruff", "check", "api.py"),
+                (
+                    "uv", "run", "python", "-m", "ruff", "check", "api.py", "--select", "ANN",
+                    "--output-format", "concise",
+                ),
+                ("uv", "run", "python", "-m", "ty", "check", "api.py"),
+                ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "api.py"),
+            ),
+            id="target-only-four-check-order",
+        ),
+        pytest.param(
+            ("api.py",), True, frozenset(("api.py",)), ("src",), ("src",),
+            (
+                ("uv", "run", "python", "-m", "ruff", "check", "api.py"),
+                (
+                    "uv", "run", "python", "-m", "ruff", "check", "api.py", "--select", "ANN",
+                    "--output-format", "concise",
+                ),
+                ("uv", "run", "python", "-m", "ty", "check", "api.py"),
+                ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "api.py"),
+                ("uv", "run", "python", "-m", "pytest", "api.py"),
+            ),
+            id="all-with-direct-target-five-check-order",
+        ),
+        pytest.param(
+            (), True, frozenset(), ("tests", "scripts"), ("tests",),
+            (
+                ("uv", "run", "python", "-m", "ruff", "check", "."),
+                (
+                    "uv", "run", "python", "-m", "ruff", "check", ".", "--select", "ANN",
+                    "--output-format", "concise",
+                ),
+                ("uv", "run", "python", "-m", "ty", "check"),
+                ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "-r", "."),
+                ("uv", "run", "python", "-m", "pytest"),
+            ),
+            id="strict-all-ignores-configured-narrow-targets",
+        ),
+        pytest.param(
+            (), False, frozenset(), ("tests", "scripts"), ("tests",),
+            (
+                ("uv", "run", "python", "-m", "ruff", "check", "."),
+                (
+                    "uv", "run", "python", "-m", "ruff", "check", ".", "--select", "ANN",
+                    "--output-format", "concise",
+                ),
+                ("uv", "run", "python", "-m", "ty", "check"),
+                ("uv", "run", "python", "-m", "bandit", "-c", "pyproject.toml", "-r", "."),
+                ("uv", "run", "python", "-m", "pytest"),
+            ),
+            id="no-positionals-use-strict-repository-targets",
+        ),
+    ),
+)
+def test_preserves_legacy_cli_command_contracts(
+    tmp_path: Path,
+    positionals: tuple[str, ...],
+    all_selected: bool,
+    existing: frozenset[str],
+    ruff_targets: tuple[str, ...],
+    bandit_targets: tuple[str, ...],
+    expected: tuple[tuple[str, ...], ...],
+) -> None:
+    plan = plan_run(
+        RunRequest(tmp_path, positionals, all_selected, no_frozen=False),
+        make_config(
+            tmp_path,
+            ruff_targets=ruff_targets,
+            bandit_targets=bandit_targets,
+        ),
+        PlanningFacts(existing),
+    )
+
+    assert commands(plan) == expected
+    assert all(check.cwd == tmp_path for check in plan.checks)
 
 
 @pytest.mark.parametrize(
