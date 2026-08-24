@@ -45,13 +45,15 @@ def execute_plan(
         if not is_json:
             print(f"\n==> {check.name}: {shlex.join(check.command)}", flush=True)
 
-        started_ns = clock_ns()
         returncode: int | None = None
         stdout: bytes | None = None
         stderr: bytes | None = None
         spawn_error: str | None = None
+        started_ns: int | None = None
+        duration_ms = 0
         try:
             if is_json:
+                started_ns = clock_ns()
                 completed = runner(
                     check.command,
                     cwd=check.cwd,
@@ -60,13 +62,18 @@ def execute_plan(
                 )
                 stdout = _as_bytes(cast(bytes | str | None, completed.stdout))
                 stderr = _as_bytes(cast(bytes | str | None, completed.stderr))
+                returncode = completed.returncode
             else:
+                started_ns = clock_ns()
                 completed = runner(check.command, cwd=check.cwd, check=False)
-            returncode = completed.returncode
+                returncode = completed.returncode
         except OSError as error:
+            if started_ns is None:
+                raise
             spawn_error = f"{type(error).__name__}: {error}"
         finally:
-            duration_ms = (clock_ns() - started_ns + 500_000) // 1_000_000
+            if started_ns is not None:
+                duration_ms = _duration_ms(started_ns, clock_ns())
 
         executed.append(
             ExecutedCheck(
@@ -101,3 +108,8 @@ def _as_bytes(output: bytes | str | None) -> bytes | None:
     if isinstance(output, str):
         return output.encode()
     return output
+
+
+def _duration_ms(started_ns: int, ended_ns: int) -> int:
+    elapsed_ns = max(0, ended_ns - started_ns)
+    return (elapsed_ns + 500_000) // 1_000_000
