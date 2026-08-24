@@ -45,6 +45,8 @@ pyrepo-check annotations-fix api.py
 pyrepo-check ruff api.py
 pyrepo-check ruff annotations ty bandit api.py
 pyrepo-check --all api.py
+pyrepo-check --format json ty
+pyrepo-check --format json --all
 ```
 
 No arguments behaves the same as `--all`.
@@ -62,6 +64,29 @@ When multiple checks are selected, `pyrepo-check` runs every selected check and
 returns a non-zero exit code if any check fails. This keeps focused runs like
 `pyrepo-check --all api.py` from hiding later Ruff, annotation, ty, Bandit, or
 pytest diagnostics behind the first failing tool.
+
+## Agent report output
+
+Terminal output is the default. It streams each tool's native diagnostics as
+the checks run, then adds one deterministic post-run summary. Focused and
+strict selection commands are unchanged:
+
+```bash
+pyrepo-check ty
+pyrepo-check pytest tests/test_cli.py::test_name
+pyrepo-check --format json ty
+pyrepo-check --format json --all
+```
+
+Use `--format json` when an agent needs a machine-readable result. Its stdout
+is exactly one versioned JSON document followed by a newline; native tool
+stdout and stderr are captured inside that document. In schema version 1, the
+top-level `pytest` and `coverage` sections are explicitly `null`. The selected
+pytest process is still listed in `selection.checks` and `checks`.
+
+The CLI keeps the first positive tool exit code in planned execution order.
+Checks continue after ordinary failures. If execution has only spawn or
+signal errors, the CLI returns `2`.
 
 ## Project Configuration
 

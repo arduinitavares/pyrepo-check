@@ -1,6 +1,6 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Milestone A implemented and verified; Milestones B-D designed and not implemented
+**Status:** Milestones A-B implemented and verified; Milestones C-D designed and not implemented
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
@@ -9,11 +9,16 @@
 
 As of 2026-08-24, the prior research, design specification, Agent Skill, README
 guidance, and repository cleanup are implemented and merged. On this branch,
-Milestone A planning and execution extraction is implemented and verified; this
-implementation branch is not implied to be merged or pushed. Only the
-Milestone B-D artifacts and features remain unimplemented: Agent Report and
-JSON, Test Shortcuts, structured pytest evidence, coverage execution, and
-repository coverage adoption.
+Milestones A and B are implemented and verified; this implementation branch is
+not implied to be merged or pushed. Test Shortcuts, structured pytest evidence,
+coverage execution, and repository coverage adoption remain unimplemented.
+
+| Milestone | Delivery status | Verification evidence |
+| --- | --- | --- |
+| A | Implemented and verified | Planner/executor extraction and compatibility coverage. |
+| B | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
+| C | Designed; not implemented | Test Shortcuts, structured pytest evidence, and coverage. |
+| D | Designed; not implemented | Repository coverage adoption. |
 
 ## Problem
 
