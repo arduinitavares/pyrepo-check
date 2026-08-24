@@ -442,6 +442,10 @@ def _validate_run_report(report: RunReportV1) -> None:
     selection = report.selection
     if any(name not in _CHECK_NAMES for name in selection.checks):
         _invalid("selection contains an unknown check name")
+    if not isinstance(selection.targets, tuple) or any(
+        not isinstance(target, str) for target in selection.targets
+    ):
+        _invalid("targets must be a tuple of strings")
     if selection.planned_test_scope not in _PLANNED_TEST_SCOPES:
         _invalid("unknown planned test scope")
     if selection.planned_coverage_scope not in _PLANNED_COVERAGE_SCOPES:

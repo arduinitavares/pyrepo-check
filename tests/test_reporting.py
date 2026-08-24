@@ -1014,6 +1014,29 @@ def test_rejects_invalid_producer_report(tmp_path: Path, case: str) -> None:
         validate_report_v1(invalid_report)
 
 
+@pytest.mark.parametrize("targets", (None, False, "", []))
+def test_rejects_shortcut_reports_with_malformed_falsy_targets(
+    tmp_path: Path,
+    targets: object,
+) -> None:
+    pytest_check = planned_check(tmp_path, "pytest")
+    report = build_run_report(
+        tmp_path,
+        run_plan(
+            (pytest_check,),
+            test_shortcut="unit",
+            pytest_args=("tests/unit",),
+            planned_test_scope="partial",
+        ),
+        ExecutionResult((executed_check(pytest_check, 0),), 0),
+    )
+
+    assert validate_report_v1(report) is None
+    selection = replace(report.selection, targets=cast(Any, targets))
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(replace(report, selection=selection))
+
+
 def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
     check = planned_check(tmp_path, "ruff")
     plan = run_plan((check,))
