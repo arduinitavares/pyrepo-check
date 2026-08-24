@@ -682,10 +682,10 @@ def test_rejects_out_of_order_execution_observations(tmp_path: Path) -> None:
             id="one-above-limit",
         ),
         pytest.param(
-            b"discarded-prefix" + b"tail" * 16_384,
-            "tail" * 16_384,
+            b"discarded-prefix" + b"tail" * reporting.CAPTURE_LIMIT_BYTES,
+            "tail" * (reporting.CAPTURE_LIMIT_BYTES // len(b"tail")),
             True,
-            len(b"discarded-prefix"),
+            len(b"discarded-prefix") + 3 * reporting.CAPTURE_LIMIT_BYTES,
             id="large-exact-tail",
         ),
         pytest.param(
@@ -751,6 +751,11 @@ def test_capture_boundaries_apply_independently_to_each_stream(
             b"before\x1b]unfinished diagnostic",
             "before\x1b]unfinished diagnostic",
             id="incomplete-osc",
+        ),
+        pytest.param(
+            b"before\x1b]unfinished \x1b[31mred",
+            "before\x1b]unfinished \x1b[31mred",
+            id="incomplete-osc-preserves-nested-csi",
         ),
     ),
 )
@@ -852,15 +857,27 @@ INVALID_REPORT_CASES = (
     "check-error-code-enum",
     "advisory-code-enum",
     "planning-error-code-enum",
+    "non-integer-schema-version",
+    "boolean-schema-version",
     "negative-duration",
+    "non-integer-duration",
+    "boolean-duration",
     "negative-omitted-bytes",
+    "non-integer-omitted-bytes",
+    "boolean-omitted-bytes",
     "relative-project-root",
     "relative-process-cwd",
     "exited-missing-exit-code",
+    "exited-negative-exit-code",
+    "exited-non-integer-exit-code",
+    "exited-boolean-exit-code",
     "exited-unexpected-signal",
     "exited-unexpected-error-message",
     "signaled-unexpected-exit-code",
     "signaled-missing-signal",
+    "signaled-zero-signal",
+    "signaled-non-integer-signal",
+    "signaled-boolean-signal",
     "signaled-missing-error-message",
     "spawn-failed-unexpected-exit-code",
     "spawn-failed-unexpected-signal",
@@ -882,6 +899,24 @@ INVALID_REPORT_CASES = (
     "planning-complete",
     "nonnull-pytest",
     "nonnull-coverage",
+    "selection-does-not-match-checks",
+    "selection-is-not-canonical",
+    "emitted-checks-are-not-canonical",
+    "duplicate-selected-check",
+    "selected-pytest-null-arguments",
+    "selected-pytest-wrong-arguments",
+    "selected-pytest-wrong-scope",
+    "unselected-pytest-has-arguments",
+    "unselected-pytest-wrong-scope",
+    "non-b-planned-coverage-scope",
+    "ordinary-check-without-primary",
+    "ordinary-check-with-two-primary-processes",
+    "ordinary-check-with-c-only-role",
+    "positive-exit-claimed-passed",
+    "zero-exit-claimed-failed",
+    "signal-with-wrong-error-code",
+    "spawn-failure-with-wrong-error-code",
+    "missing-primary-with-wrong-error-code",
 )
 
 
@@ -973,10 +1008,24 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
     if case == "planning-error-code-enum":
         error = replace(planning_error.error, code=cast(Any, "other"))
         return replace(planning_error, error=error)
+    if case == "non-integer-schema-version":
+        return replace(passed, schema_version=cast(Any, 1.0))
+    if case == "boolean-schema-version":
+        return replace(passed, schema_version=cast(Any, True))
     if case == "negative-duration":
         return replace_process(passed, replace(process, duration_ms=-1))
+    if case == "non-integer-duration":
+        return replace_process(passed, replace(process, duration_ms=cast(Any, 1.0)))
+    if case == "boolean-duration":
+        return replace_process(passed, replace(process, duration_ms=cast(Any, True)))
     if case == "negative-omitted-bytes":
         stdout = replace(process.stdout, omitted_bytes=-1)
+        return replace_process(passed, replace(process, stdout=stdout))
+    if case == "non-integer-omitted-bytes":
+        stdout = replace(process.stdout, omitted_bytes=cast(Any, 1.0))
+        return replace_process(passed, replace(process, stdout=stdout))
+    if case == "boolean-omitted-bytes":
+        stdout = replace(process.stdout, omitted_bytes=cast(Any, True))
         return replace_process(passed, replace(process, stdout=stdout))
     if case == "relative-project-root":
         return replace(passed, project_root="relative/project")
@@ -984,6 +1033,12 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
         return replace_process(passed, replace(process, cwd="relative/project"))
     if case == "exited-missing-exit-code":
         return replace_process(passed, replace(process, exit_code=None))
+    if case == "exited-negative-exit-code":
+        return replace_process(passed, replace(process, exit_code=-1))
+    if case == "exited-non-integer-exit-code":
+        return replace_process(passed, replace(process, exit_code=cast(Any, 1.0)))
+    if case == "exited-boolean-exit-code":
+        return replace_process(passed, replace(process, exit_code=cast(Any, True)))
     if case == "exited-unexpected-signal":
         return replace_process(passed, replace(process, signal=9))
     if case == "exited-unexpected-error-message":
@@ -992,6 +1047,12 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
         return replace_process(signaled, replace(signal_process, exit_code=1))
     if case == "signaled-missing-signal":
         return replace_process(signaled, replace(signal_process, signal=None))
+    if case == "signaled-zero-signal":
+        return replace_process(signaled, replace(signal_process, signal=0))
+    if case == "signaled-non-integer-signal":
+        return replace_process(signaled, replace(signal_process, signal=cast(Any, 9.0)))
+    if case == "signaled-boolean-signal":
+        return replace_process(signaled, replace(signal_process, signal=cast(Any, True)))
     if case == "signaled-missing-error-message":
         return replace_process(signaled, replace(signal_process, error_message=None))
     if case == "spawn-failed-unexpected-exit-code":
@@ -1048,6 +1109,100 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
         return replace(passed, pytest=cast(Any, object()))
     if case == "nonnull-coverage":
         return replace(passed, coverage=cast(Any, object()))
+    if case == "selection-does-not-match-checks":
+        selection = replace(passed.selection, checks=("ty",))
+        return replace(passed, selection=selection)
+    if case == "selection-is-not-canonical":
+        ruff = planned_check(tmp_path, "ruff")
+        ty = planned_check(tmp_path, "ty")
+        report = build_run_report(
+            tmp_path,
+            run_plan((ty, ruff)),
+            ExecutionResult((executed_check(ty, 0), executed_check(ruff, 0)), 0),
+        )
+        return report
+    if case == "emitted-checks-are-not-canonical":
+        ruff = planned_check(tmp_path, "ruff")
+        ty = planned_check(tmp_path, "ty")
+        report = build_run_report(
+            tmp_path,
+            run_plan((ruff, ty)),
+            ExecutionResult((executed_check(ruff, 0), executed_check(ty, 0)), 0),
+        )
+        selection = replace(report.selection, checks=("ty", "ruff"))
+        return replace(report, selection=selection, checks=tuple(reversed(report.checks)))
+    if case == "duplicate-selected-check":
+        selection = replace(passed.selection, checks=("ruff", "ruff"))
+        result = replace(passed.checks[0], name=cast(Any, "ruff"))
+        return replace(passed, selection=selection, checks=(result, result))
+    if case == "selected-pytest-null-arguments":
+        pytest_check = planned_check(tmp_path, "pytest")
+        report = build_run_report(
+            tmp_path,
+            run_plan((pytest_check,)),
+            ExecutionResult((executed_check(pytest_check, 0),), 0),
+        )
+        return replace(report, selection=replace(report.selection, pytest_args=None))
+    if case == "selected-pytest-wrong-arguments":
+        pytest_check = planned_check(tmp_path, "pytest")
+        report = build_run_report(
+            tmp_path,
+            run_plan((pytest_check,), targets=("tests/unit",)),
+            ExecutionResult((executed_check(pytest_check, 0),), 0),
+        )
+        return replace(report, selection=replace(report.selection, pytest_args=("other",)))
+    if case == "selected-pytest-wrong-scope":
+        pytest_check = planned_check(tmp_path, "pytest")
+        report = build_run_report(
+            tmp_path,
+            run_plan((pytest_check,), targets=("tests/unit",)),
+            ExecutionResult((executed_check(pytest_check, 0),), 0),
+        )
+        return replace(report, selection=replace(report.selection, planned_test_scope="complete"))
+    if case == "unselected-pytest-has-arguments":
+        selection = replace(passed.selection, pytest_args=("tests/unit",))
+        return replace(passed, selection=selection)
+    if case == "unselected-pytest-wrong-scope":
+        selection = replace(passed.selection, planned_test_scope="complete")
+        return replace(passed, selection=selection)
+    if case == "non-b-planned-coverage-scope":
+        selection = replace(passed.selection, planned_coverage_scope="partial")
+        return replace(passed, selection=selection)
+    if case == "ordinary-check-without-primary":
+        result = replace(passed.checks[0], processes=())
+        return replace(passed, checks=(result,))
+    if case == "ordinary-check-with-two-primary-processes":
+        result = replace(passed.checks[0], processes=(process, process))
+        return replace(passed, checks=(result,))
+    if case == "ordinary-check-with-c-only-role":
+        return replace_process(passed, replace(process, role=cast(Any, "pytest_preflight")))
+    if case == "positive-exit-claimed-passed":
+        failed_process = failed.checks[0].processes[0]
+        result = replace(failed.checks[0], status="passed", error=None)
+        return replace(failed, overall_status="passed", checks=(replace(result, processes=(failed_process,)),))
+    if case == "zero-exit-claimed-failed":
+        result = replace(passed.checks[0], status="failed", error=None)
+        return replace(passed, overall_status="failed", checks=(result,))
+    if case == "signal-with-wrong-error-code":
+        result = replace(
+            signaled.checks[0],
+            error=CheckError("spawn_failed", "wrong evidence"),
+        )
+        return replace(signaled, checks=(result,))
+    if case == "spawn-failure-with-wrong-error-code":
+        result = replace(
+            spawn_failed.checks[0],
+            error=CheckError("terminated_by_signal", "wrong evidence"),
+        )
+        return replace(spawn_failed, checks=(result,))
+    if case == "missing-primary-with-wrong-error-code":
+        result = CheckResult(
+            name="ruff",
+            status="error",
+            processes=(),
+            error=CheckError("spawn_failed", "wrong evidence"),
+        )
+        return replace(passed, overall_status="error", complete=False, checks=(result,))
     raise AssertionError(f"unhandled invalid report case: {case}")
 
 

@@ -1330,7 +1330,7 @@ worktree files are never included.
 | Milestone | State | Evidence |
 | --- | --- | --- |
 | A — planning and execution extraction | Implemented and verified | Pure planner tests, executor tests, compatibility tests, and strict gate pass. |
-| B — Agent Report and JSON | Designed; not implemented | No `reporting.py` or JSON CLI format exists. |
+| B — Agent Report and JSON | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C — Test Shortcuts, pytest evidence, coverage | Designed; not implemented | No shortcut parser, pytest evidence plugin, or coverage execution exists. |
 | D — repository coverage adoption | Designed; not implemented | No locked Coverage.py dependency or native coverage policy exists. |
 

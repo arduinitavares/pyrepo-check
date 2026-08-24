@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
-from typing import Literal
+from typing import Literal, cast
 
 from pyrepo_check.execution import ExecutedCheck, ExecutionResult
 from pyrepo_check.planning import (
@@ -43,8 +43,15 @@ AdvisoryCode = Literal[
 
 CAPTURE_LIMIT_BYTES = 65_536
 _CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_OSC_PATTERN = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 _CHECK_NAMES = frozenset(("ruff", "annotations", "annotations-fix", "ty", "bandit", "pytest"))
+_B_CANONICAL_CHECK_ORDER: tuple[CheckName, ...] = (
+    "ruff",
+    "annotations",
+    "ty",
+    "bandit",
+    "pytest",
+    "annotations-fix",
+)
 _PLANNING_ERROR_CODES = frozenset(
     (
         "invalid_arguments",
@@ -61,9 +68,7 @@ _PLANNED_TEST_SCOPES = frozenset(("not_selected", "partial", "complete"))
 _PLANNED_COVERAGE_SCOPES = frozenset(
     ("not_requested", "unavailable", "partial", "complete")
 )
-_PROCESS_ROLES = frozenset(
-    ("primary", "pytest_preflight", "coverage_preflight", "coverage_json")
-)
+_PROCESS_ROLES = frozenset(("primary",))
 _PROCESS_OUTCOMES = frozenset(("exited", "signaled", "spawn_failed"))
 _CHECK_ERROR_CODES = frozenset(
     (
@@ -248,6 +253,7 @@ def build_run_report(
 
 
 def validate_report_v1(report: AgentReportV1) -> None:
+    _validate_exact_int(report.schema_version, "schema_version")
     if report.schema_version != 1:
         _invalid("schema_version must be 1")
     if isinstance(report, PlanningErrorReportV1):
@@ -450,14 +456,40 @@ def _validate_run_report(report: RunReportV1) -> None:
         _invalid("unknown planned test scope")
     if selection.planned_coverage_scope not in _PLANNED_COVERAGE_SCOPES:
         _invalid("unknown planned coverage scope")
+    if selection.planned_coverage_scope != "not_requested":
+        _invalid("planned_coverage_scope must be not_requested in milestone B")
 
-    for check in report.checks:
-        _validate_check_result(check)
+    emitted_names = tuple(check.name for check in report.checks)
+    if selection.checks != emitted_names:
+        _invalid("selection checks must exactly match emitted checks")
+    if len(set(selection.checks)) != len(selection.checks):
+        _invalid("selection checks must be unique")
+    canonical_selection = tuple(
+        name for name in _B_CANONICAL_CHECK_ORDER if name in selection.checks
+    )
+    if selection.checks != canonical_selection:
+        _invalid("selection checks must use canonical order")
+
+    pytest_selected = "pytest" in selection.checks
+    if not pytest_selected:
+        if selection.pytest_args is not None:
+            _invalid("pytest_args must be null when pytest is not selected")
+        if selection.planned_test_scope != "not_selected":
+            _invalid("planned_test_scope must be not_selected when pytest is not selected")
+    else:
+        if selection.pytest_args != selection.targets:
+            _invalid("pytest_args must exactly match targets when pytest is selected")
+        expected_scope: PlannedTestScope = (
+            "partial" if selection.targets else "complete"
+        )
+        if selection.planned_test_scope != expected_scope:
+            _invalid("planned_test_scope is inconsistent with pytest selection")
+
+    statuses = {_validate_check_result(check) for check in report.checks}
     for advisory in report.advisories:
         if advisory.code not in _ADVISORY_CODES:
             _invalid("unknown advisory code")
 
-    statuses = {check.status for check in report.checks}
     if "error" in statuses:
         expected_status: OverallStatus = "error"
     elif "failed" in statuses:
@@ -470,17 +502,45 @@ def _validate_run_report(report: RunReportV1) -> None:
         _invalid("complete is inconsistent with check errors")
 
 
-def _validate_check_result(check: CheckResult) -> None:
+def _validate_check_result(check: CheckResult) -> CheckStatus:
     if check.name not in _CHECK_NAMES:
         _invalid("unknown check name")
     if check.status not in _CHECK_STATUSES:
         _invalid("unknown check status")
-    if (check.error is not None) is not (check.status == "error"):
-        _invalid("check error must be present exactly for error status")
-    if check.error is not None and check.error.code not in _CHECK_ERROR_CODES:
-        _invalid("unknown check error code")
-    for process in check.processes:
-        _validate_process_result(process)
+    if not check.processes:
+        if (
+            check.status != "error"
+            or check.error is None
+            or check.error.code != "missing_primary_process"
+        ):
+            _invalid("no-process check must be missing_primary_process error")
+        return "error"
+    if len(check.processes) != 1:
+        _invalid("ordinary check must contain exactly one primary process")
+
+    process = check.processes[0]
+    _validate_process_result(process)
+    if process.role != "primary":
+        _invalid("ordinary check process role must be primary")
+
+    if process.outcome == "exited":
+        expected_status: CheckStatus = "passed" if process.exit_code == 0 else "failed"
+        expected_error_code: CheckErrorCode | None = None
+    elif process.outcome == "signaled":
+        expected_status = "error"
+        expected_error_code = "terminated_by_signal"
+    else:
+        expected_status = "error"
+        expected_error_code = "spawn_failed"
+
+    if check.status != expected_status:
+        _invalid("check status contradicts primary process evidence")
+    if expected_error_code is None:
+        if check.error is not None:
+            _invalid("exited check must not have an error")
+    elif check.error is None or check.error.code != expected_error_code:
+        _invalid("check error contradicts primary process evidence")
+    return expected_status
 
 
 def _validate_process_result(process: ProcessResult) -> None:
@@ -490,19 +550,32 @@ def _validate_process_result(process: ProcessResult) -> None:
         _invalid("unknown process outcome")
     if not Path(process.cwd).is_absolute():
         _invalid("process cwd must be absolute")
+    _validate_exact_int(process.duration_ms, "process duration_ms")
     if process.duration_ms < 0:
         _invalid("process duration_ms must be non-negative")
     _validate_captured_text(process.stdout)
     _validate_captured_text(process.stderr)
 
     if process.outcome == "exited":
-        if process.exit_code is None or process.signal is not None:
+        exit_code = process.exit_code
+        if exit_code is None:
             _invalid("exited process requires exit_code and null signal")
+        if process.signal is not None:
+            _invalid("exited process requires exit_code and null signal")
+        exit_code = _validate_exact_int(exit_code, "exited process exit_code")
+        if exit_code < 0:
+            _invalid("exited process exit_code must be non-negative")
         if process.error_message is not None:
             _invalid("exited process requires null error_message")
     elif process.outcome == "signaled":
-        if process.exit_code is not None or process.signal is None:
+        signal = process.signal
+        if process.exit_code is not None:
             _invalid("signaled process requires signal and null exit_code")
+        if signal is None:
+            _invalid("signaled process requires signal and null exit_code")
+        signal = _validate_exact_int(signal, "signaled process signal")
+        if signal <= 0:
+            _invalid("signaled process signal must be positive")
         if process.error_message is None:
             _invalid("signaled process requires error_message")
     elif process.outcome == "spawn_failed":
@@ -513,6 +586,7 @@ def _validate_process_result(process: ProcessResult) -> None:
 
 
 def _validate_captured_text(captured: CapturedText) -> None:
+    _validate_exact_int(captured.omitted_bytes, "captured omitted_bytes")
     if captured.omitted_bytes < 0:
         _invalid("captured omitted_bytes must be non-negative")
     if not captured.captured:
@@ -527,6 +601,12 @@ def _invalid(message: str) -> None:
     raise ReportingError(f"invalid report: {message}")
 
 
+def _validate_exact_int(value: object, field: str) -> int:
+    if type(value) is not int:
+        _invalid(f"{field} must be an integer")
+    return cast(int, value)
+
+
 def capture_text(raw: bytes) -> CapturedText:
     retained = raw[-CAPTURE_LIMIT_BYTES:]
     omitted = len(raw) - len(retained)
@@ -535,8 +615,25 @@ def capture_text(raw: bytes) -> CapturedText:
 
 
 def strip_terminal_sequences(text: str) -> str:
-    without_osc = _OSC_PATTERN.sub("", text)
-    return _CSI_PATTERN.sub("", without_osc)
+    pieces: list[str] = []
+    cursor = 0
+    while True:
+        osc_start = text.find("\x1b]", cursor)
+        if osc_start == -1:
+            pieces.append(_CSI_PATTERN.sub("", text[cursor:]))
+            return "".join(pieces)
+
+        pieces.append(_CSI_PATTERN.sub("", text[cursor:osc_start]))
+        bel_end = text.find("\x07", osc_start + 2)
+        st_start = text.find("\x1b\\", osc_start + 2)
+        terminators = [end for end in (bel_end, st_start) if end != -1]
+        if not terminators:
+            # An unfinished OSC consumes its remaining tail; preserve it intact,
+            # including escape-like diagnostic bytes nested within that tail.
+            pieces.append(text[osc_start:])
+            return "".join(pieces)
+        terminator_start = min(terminators)
+        cursor = terminator_start + (1 if terminator_start == bel_end else 2)
 
 
 def _build_advisories(checks: tuple[CheckResult, ...]) -> tuple[Advisory, ...]:
