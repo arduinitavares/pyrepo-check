@@ -1314,6 +1314,15 @@ Each milestone is delivered through independently verified commits:
 Refactoring and feature behavior remain separate commits. Existing unrelated
 worktree files are never included.
 
+## Delivery status
+
+| Milestone | State | Evidence |
+| --- | --- | --- |
+| A — planning and execution extraction | Implemented and verified | Pure planner tests, executor tests, compatibility tests, and strict gate pass. |
+| B — Agent Report and JSON | Designed; not implemented | No `reporting.py` or JSON CLI format exists. |
+| C — Test Shortcuts, pytest evidence, coverage | Designed; not implemented | No shortcut parser, pytest evidence plugin, or coverage execution exists. |
+| D — repository coverage adoption | Designed; not implemented | No locked Coverage.py dependency or native coverage policy exists. |
+
 ## Acceptance criteria
 
 The work is complete when all of the following are proven:
