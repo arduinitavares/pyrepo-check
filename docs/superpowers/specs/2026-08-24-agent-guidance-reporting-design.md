@@ -1,9 +1,21 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Draft for user review
+**Status:** Approved design; runtime implementation pending
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
+
+## Delivery status
+
+As of 2026-08-24, the research, design specification, Agent Skill, README
+guidance, and repository cleanup are implemented and merged. The runtime
+architecture and features described below are not implemented yet. In
+particular, the repository does not yet contain `planning.py`, `execution.py`,
+`reporting.py`, Test Shortcuts, structured pytest evidence, JSON output, or
+coverage guidance.
+
+The pending runtime work is named **Milestone A** through **Milestone D** to
+avoid confusing it with the already completed design and repository work.
 
 ## Problem
 
@@ -67,7 +79,7 @@ meaningful policy.
 
 ## Compatibility contract
 
-Phase 1 must preserve all current observable behavior:
+Milestone A must preserve all current observable behavior:
 
 - Check names: `ruff`, `annotations`, `annotations-fix`, `ty`, `bandit`, and
   `pytest`.
@@ -83,11 +95,12 @@ Phase 1 must preserve all current observable behavior:
 - Once execution starts, a failed check does not hide later diagnostics.
 - Existing `uv run` and `--frozen` selection remains unchanged.
 
-Phase 2 may add a compact terminal summary, but existing tool diagnostics and
-exit semantics remain available. Phase 3 may instrument pytest for reporting
-and coverage, but must preserve pytest selection and run it only once.
+Milestone B adds a compact terminal summary, while existing tool diagnostics
+and exit semantics remain available. Milestone C instruments pytest for
+reporting and coverage, but must preserve pytest selection and run it only
+once.
 
-## Final architecture
+## Target architecture
 
 The dependency direction is:
 
@@ -100,10 +113,10 @@ CLI adapter -> configuration + planner -> run plan
 
 ### `cli.py`: input and output adapter
 
-The CLI parses syntax into a `RunRequest`, loads project configuration, asks
-the planner for a `RunPlan`, executes it, and renders the resulting
-`AgentReport`. It does not decide target defaults, check ordering, strict-gate
-policy, Test Shortcut expansion, or tool command shapes.
+In the target architecture, the CLI parses syntax into a `RunRequest`, loads
+project configuration, asks the planner for a `RunPlan`, executes it, and
+renders the resulting `AgentReport`. It does not decide target defaults, check
+ordering, strict-gate policy, Test Shortcut expansion, or tool command shapes.
 
 ### `config.py`: project facts
 
@@ -277,8 +290,9 @@ pre-collection exclusions remain the project's canonical suite definition.
 
 A `RunRequest` carries only user intent:
 
-- selected check names;
-- direct targets;
+- project root;
+- raw positional tokens, which the planner classifies as selected check names
+  and direct targets;
 - `--all`;
 - `--no-frozen`;
 - output format (`terminal` or `json`);
@@ -1173,8 +1187,8 @@ After execution begins:
 - spawn failures, signals, interrupted/internally failed pytest, and missing
   required artifacts are `error`;
 - later independent checks continue after an ordinary failure or per-check
-  error; this spawn-error continuation is an intentional Phase 2 behavior
-  change, not part of the Phase 1 compatibility refactor;
+  error; this spawn-error continuation is an intentional Milestone B behavior
+  change, not part of the Milestone A compatibility refactor;
 - coverage generation is attempted after a completed pytest failure when
   run-owned data exists; and
 - no score or advisory overrides failure, error, or incomplete evidence.
@@ -1197,7 +1211,7 @@ serialized document is outside the no-partial-document guarantee.
 Development is test-first. Each behavior moves only after a failing test proves
 the intended contract.
 
-### Phase 1 tests: behavior-preserving architecture
+### Milestone A tests: behavior-preserving architecture
 
 - Characterize current command names, target disambiguation, configured target
   precedence, strict repository-root behavior, `--all <target>`, command order,
@@ -1205,11 +1219,11 @@ the intended contract.
 - Add a table-driven planner matrix mapping `RunRequest + ProjectConfig` to an
   ordered `RunPlan`.
 - Test ordinary-failure continuation and first-nonzero aggregation through one
-  recording executor. Characterize the current spawn-exception abort so Phase
-  1 does not accidentally change it.
+  recording executor. Characterize the current spawn-exception abort so
+  Milestone A does not accidentally change it.
 - Reduce CLI tests to argument syntax, user-facing errors, and exit behavior.
 
-### Phase 2 tests: reporting
+### Milestone B tests: reporting
 
 - Assert terminal rendering independently from execution.
 - Assert the exact version-1 JSON keys, status vocabulary, deterministic order,
@@ -1222,7 +1236,7 @@ the intended contract.
   still run while overall evidence becomes incomplete/error.
 - Prove rendering errors fail without emitting partial JSON.
 
-### Phase 3 tests: Test Shortcuts, pytest evidence, and coverage
+### Milestone C tests: Test Shortcuts, pytest evidence, and coverage
 
 - Test shortcut name/value validation, expansion, unknown-name suggestions,
   exact grammar, path containment, and every invalid combination.
@@ -1274,7 +1288,7 @@ the intended contract.
 - Prove the consumer's existing `.coverage`, coverage JSON, and worktree status
   remain unchanged by run-owned artifacts and cleanup.
 
-### Phase 4 tests: repository adoption
+### Milestone D tests: repository adoption
 
 - Add `coverage[toml]>=7.15,<8` to this repository's development group and
   regenerate `uv.lock` before activating coverage configuration.
@@ -1284,16 +1298,16 @@ the intended contract.
 - Set an optional no-regression threshold at or below the verified baseline,
   not an arbitrary 100%.
 - Run focused planner/renderer tests during development and the strict
-  aggregate gate at every phase boundary.
+  aggregate gate at every milestone boundary.
 
 ## Delivery sequence
 
-Each phase is an independently verified commit:
+Each milestone is delivered through independently verified commits:
 
 1. **Refactor:** extract planning and execution with no behavior change.
 2. **Report:** add Agent Report plus terminal/JSON renderers.
 3. **Feature:** add Test Shortcuts, pytest evidence, and coverage as separate
-   atomic commits within the phase.
+   atomic commits within the milestone.
 4. **Adopt:** add/lock the supported Coverage.py dependency, configure this
    repository's coverage, and document focused and strict workflows.
 
@@ -1305,7 +1319,7 @@ worktree files are never included.
 The work is complete when all of the following are proven:
 
 1. Existing focused and aggregate commands retain their selection, targets,
-   ordering, and exit behavior through Phase 1.
+   ordering, and exit behavior through Milestone A.
 2. `pyrepo-check ty` remains a typing-only Focused Run.
 3. Direct pytest files and node IDs remain supported.
 4. Valid Test Shortcuts expand deterministically; invalid or conflicting ones
