@@ -81,8 +81,10 @@ def test_selects_legacy_names_in_canonical_order() -> None:
     assert select_check_names(available, requested=(), all_selected=True) == (
         "ruff", "annotations", "ty", "bandit", "pytest"
     )
-    with pytest.raises(ValueError, match=r"Unknown check\(s\): mypy"):
+    with pytest.raises(ValueError) as raised:
         select_check_names(available, requested=("ruff", "mypy"), all_selected=False)
+
+    assert str(raised.value) == "Unknown check(s): mypy"
 
 
 @pytest.mark.parametrize(
@@ -280,12 +282,14 @@ def test_preserves_direct_target_order_and_duplicates(tmp_path: Path) -> None:
 
 
 def test_rejects_unknown_target_only_request(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match=r"Unknown check\(s\): a.py, z.py"):
+    with pytest.raises(ValueError) as raised:
         plan_run(
             RunRequest(tmp_path, ("z.py", "a.py"), False, no_frozen=False),
             make_config(tmp_path),
             PlanningFacts(frozenset()),
         )
+
+    assert str(raised.value) == "Unknown check(s): a.py, z.py"
 
 
 @pytest.mark.parametrize("frozen", (False, True))
@@ -340,3 +344,35 @@ def test_direct_targets_override_configured_targets_and_bandit_is_not_recursive(
     assert checks["ruff"].command[-1:] == ("api.py",)
     assert checks["bandit"].command[-1:] == ("api.py",)
     assert "-r" not in checks["bandit"].command
+
+
+def test_explicit_targets_override_strict_all_targets(tmp_path: Path) -> None:
+    checks = build_planned_checks(
+        make_config(
+            tmp_path,
+            ruff_targets=("tests", "scripts"),
+            bandit_targets=("src",),
+        ),
+        targets=("api.py",),
+        strict_all=True,
+    )
+
+    assert checks["ruff"].command == (
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "api.py",
+    )
+    assert checks["bandit"].command == (
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "bandit",
+        "-c",
+        "pyproject.toml",
+        "api.py",
+    )
