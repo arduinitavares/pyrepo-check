@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,18 @@ class ProjectConfig:
     ruff_targets: tuple[str, ...]
     bandit_targets: tuple[str, ...]
     frozen: bool
+
+
+def collect_existing_positionals(
+    root: Path,
+    positionals: Sequence[str],
+) -> frozenset[str]:
+    return frozenset(token for token in positionals if _target_exists(root, token))
+
+
+def _target_exists(root: Path, target: str) -> bool:
+    path = Path(target)
+    return path.exists() if path.is_absolute() else (root / path).exists()
 
 
 def load_project_config(root: Path, *, no_frozen: bool = False) -> ProjectConfig:

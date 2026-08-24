@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from pyrepo_check.config import ProjectConfig, load_project_config
+from pyrepo_check.config import (
+    ProjectConfig,
+    collect_existing_positionals,
+    load_project_config,
+)
 
 
 def test_loads_pyproject_targets(tmp_path: Path) -> None:
@@ -64,3 +68,17 @@ ruff_targets = "src"
 
     with pytest.raises(ValueError, match="ruff_targets must be a list of strings"):
         load_project_config(tmp_path)
+
+
+def test_collects_existing_relative_and_absolute_positionals(tmp_path: Path) -> None:
+    relative = tmp_path / "api.py"
+    relative.write_text("", encoding="utf-8")
+    absolute = tmp_path / "outside.py"
+    absolute.write_text("", encoding="utf-8")
+
+    result = collect_existing_positionals(
+        tmp_path,
+        ("api.py", str(absolute), "missing.py", "tests/test_x.py::test_name"),
+    )
+
+    assert result == frozenset(("api.py", str(absolute)))
