@@ -1,21 +1,19 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Approved design; runtime implementation pending
+**Status:** Milestone A implemented and verified; Milestones B-D designed and not implemented
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
 
 ## Delivery status
 
-As of 2026-08-24, the research, design specification, Agent Skill, README
-guidance, and repository cleanup are implemented and merged. The runtime
-architecture and features described below are not implemented yet. In
-particular, the repository does not yet contain `planning.py`, `execution.py`,
-`reporting.py`, Test Shortcuts, structured pytest evidence, JSON output, or
-coverage guidance.
-
-The pending runtime work is named **Milestone A** through **Milestone D** to
-avoid confusing it with the already completed design and repository work.
+As of 2026-08-24, the prior research, design specification, Agent Skill, README
+guidance, and repository cleanup are implemented and merged. On this branch,
+Milestone A planning and execution extraction is implemented and verified; this
+implementation branch is not implied to be merged or pushed. Only the
+Milestone B-D artifacts and features remain unimplemented: Agent Report and
+JSON, Test Shortcuts, structured pytest evidence, coverage execution, and
+repository coverage adoption.
 
 ## Problem
 
