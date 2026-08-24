@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
 from typing import Literal
@@ -256,6 +257,163 @@ def validate_report_v1(report: AgentReportV1) -> None:
         _validate_run_report(report)
         return
     _invalid("unsupported producer model")
+
+
+def render_terminal(report: AgentReportV1) -> str:
+    """Render a validated report as a complete terminal-ready string."""
+    validate_report_v1(report)
+    if isinstance(report, PlanningErrorReportV1):
+        lines = [report.error.message]
+        if report.error.hint is not None:
+            lines.append(f"Hint: {report.error.hint}")
+        return "\n".join(lines) + "\n"
+
+    completeness = "complete" if report.complete else "incomplete"
+    lines = ["", f"==> pyrepo-check summary: {report.overall_status} ({completeness})"]
+    for check in report.checks:
+        if check.status != "error":
+            continue
+        error = check.error
+        if error is not None:
+            lines.append(f"    error: {check.name}: {error.message}")
+    for check in report.checks:
+        if check.status != "failed":
+            continue
+        exit_code = _first_positive_exit_code(check.processes)
+        if exit_code is None:
+            lines.append(f"    failed: {check.name}")
+        else:
+            lines.append(f"    failed: {check.name} (exit {exit_code})")
+    for advisory in report.advisories:
+        lines.append(f"    advisory: {advisory.message}")
+    passed_checks = [check.name for check in report.checks if check.status == "passed"]
+    if passed_checks:
+        lines.append(f"    passed: {', '.join(passed_checks)}")
+    return "\n".join(lines) + "\n"
+
+
+def serialize_json(report: AgentReportV1) -> bytes:
+    """Serialize a validated report as one compact UTF-8 JSON document."""
+    validate_report_v1(report)
+    payload = _report_payload(report)
+    text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return text.encode("utf-8") + b"\n"
+
+
+def select_exit_code(report: AgentReportV1) -> int:
+    """Select the public exit code from report evidence in execution order."""
+    if isinstance(report, PlanningErrorReportV1):
+        return 2
+    for check in report.checks:
+        exit_code = _first_positive_exit_code(check.processes)
+        if exit_code is not None:
+            return exit_code
+    if report.overall_status == "failed":
+        return 1
+    if report.overall_status == "error":
+        return 2
+    return 0
+
+
+def _report_payload(report: AgentReportV1) -> dict[str, object]:
+    if isinstance(report, PlanningErrorReportV1):
+        return {
+            "schema_version": report.schema_version,
+            "kind": report.kind,
+            "overall_status": report.overall_status,
+            "complete": report.complete,
+            "error": {
+                "code": report.error.code,
+                "message": report.error.message,
+                "hint": report.error.hint,
+            },
+        }
+    return {
+        "schema_version": report.schema_version,
+        "kind": report.kind,
+        "project_root": report.project_root,
+        "mode": report.mode,
+        "overall_status": report.overall_status,
+        "complete": report.complete,
+        "selection": _selection_payload(report.selection),
+        "checks": [_check_result_payload(check) for check in report.checks],
+        "pytest": report.pytest,
+        "coverage": report.coverage,
+        "advisories": [_advisory_payload(advisory) for advisory in report.advisories],
+    }
+
+
+def _selection_payload(selection: Selection) -> dict[str, object]:
+    return {
+        "checks": list(selection.checks),
+        "targets": list(selection.targets),
+        "test_shortcut": selection.test_shortcut,
+        "pytest_args": list(selection.pytest_args) if selection.pytest_args is not None else None,
+        "planned_test_scope": selection.planned_test_scope,
+        "planned_coverage_scope": selection.planned_coverage_scope,
+    }
+
+
+def _check_result_payload(check: CheckResult) -> dict[str, object]:
+    return {
+        "name": check.name,
+        "status": check.status,
+        "processes": [_process_result_payload(process) for process in check.processes],
+        "error": _check_error_payload(check.error),
+    }
+
+
+def _process_result_payload(process: ProcessResult) -> dict[str, object]:
+    return {
+        "role": process.role,
+        "argv": list(process.argv),
+        "cwd": process.cwd,
+        "outcome": process.outcome,
+        "exit_code": process.exit_code,
+        "signal": process.signal,
+        "duration_ms": process.duration_ms,
+        "stdout": _captured_text_payload(process.stdout),
+        "stderr": _captured_text_payload(process.stderr),
+        "error_message": process.error_message,
+    }
+
+
+def _captured_text_payload(captured: CapturedText) -> dict[str, object]:
+    return {
+        "captured": captured.captured,
+        "text": captured.text,
+        "truncated": captured.truncated,
+        "omitted_bytes": captured.omitted_bytes,
+    }
+
+
+def _check_error_payload(error: CheckError | None) -> dict[str, object] | None:
+    if error is None:
+        return None
+    return {
+        "code": error.code,
+        "message": error.message,
+    }
+
+
+def _advisory_payload(advisory: Advisory) -> dict[str, object]:
+    return {
+        "code": advisory.code,
+        "message": advisory.message,
+        "hint": advisory.hint,
+    }
+
+
+def _first_positive_exit_code(processes: tuple[ProcessResult, ...]) -> int | None:
+    for process in processes:
+        if process.exit_code is not None and process.exit_code > 0:
+            return process.exit_code
+    return None
 
 
 def _validate_planning_error_report(report: PlanningErrorReportV1) -> None:

@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import pytest
 
+import pyrepo_check.reporting as reporting
 from pyrepo_check.execution import ExecutedCheck, ExecutionResult
 from pyrepo_check.planning import CheckName, OutputFormat, PlannedCheck, RunMode, RunPlan
 from pyrepo_check.reporting import (
@@ -22,6 +23,9 @@ from pyrepo_check.reporting import (
     Selection,
     build_planning_error_report,
     build_run_report,
+    render_terminal,
+    select_exit_code,
+    serialize_json,
     validate_report_v1,
 )
 
@@ -394,6 +398,222 @@ def test_builds_exact_planning_error_without_run_fields() -> None:
             "hint": "Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest",
         },
     }
+
+
+def test_render_terminal_snapshot_for_passed_run(tmp_path: Path) -> None:
+    ruff = planned_check(tmp_path, "ruff")
+    ty = planned_check(tmp_path, "ty")
+    report = build_run_report(
+        tmp_path,
+        run_plan((ruff, ty)),
+        ExecutionResult((executed_check(ruff, 0), executed_check(ty, 0)), 0),
+    )
+
+    assert render_terminal(report) == (
+        "\n"
+        "==> pyrepo-check summary: passed (complete)\n"
+        "    passed: ruff, ty\n"
+    )
+
+
+def test_render_terminal_snapshot_orders_errors_failures_advisories_and_passes(
+    tmp_path: Path,
+) -> None:
+    ruff = planned_check(tmp_path, "ruff")
+    annotations = planned_check(tmp_path, "annotations")
+    ty = planned_check(tmp_path, "ty")
+    report = build_run_report(
+        tmp_path,
+        run_plan((ruff, annotations, ty)),
+        ExecutionResult(
+            (
+                executed_check(
+                    ruff,
+                    None,
+                    stdout=None,
+                    stderr=None,
+                    spawn_error="FileNotFoundError: uv",
+                ),
+                executed_check(annotations, 1, stderr=b"x" * 65_537),
+                executed_check(ty, 0),
+            ),
+            1,
+        ),
+    )
+
+    assert render_terminal(report) == (
+        "\n"
+        "==> pyrepo-check summary: error (incomplete)\n"
+        "    error: ruff: Could not start process: FileNotFoundError: uv\n"
+        "    failed: annotations (exit 1)\n"
+        "    advisory: annotations process 1 (primary) stderr omitted 1 byte(s); "
+        "only the final 65536 bytes are included.\n"
+        "    passed: ty\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("hint", "expected"),
+    (
+        (
+            "Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest",
+            (
+                "Unknown check(s): mypy\n"
+                "Hint: Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest\n"
+            ),
+        ),
+        (None, "Unknown check(s): mypy\n"),
+    ),
+)
+def test_render_terminal_planning_errors_are_stderr_ready(
+    hint: str | None,
+    expected: str,
+) -> None:
+    report = build_planning_error_report("unknown_check", "Unknown check(s): mypy", hint=hint)
+
+    assert render_terminal(report) == expected
+
+
+def test_serialize_json_returns_exact_utf8_planning_error_bytes() -> None:
+    report = build_planning_error_report(
+        "unknown_check",
+        "Unknown check(s): caf\u00e9",
+        hint="Use the configured caf\u00e9 check.",
+    )
+
+    expected = (
+        b'{"schema_version":1,"kind":"planning_error","overall_status":"error",'
+        b'"complete":false,"error":{"code":"unknown_check","message":'
+        b'"Unknown check(s): caf\xc3\xa9","hint":"Use the configured caf\xc3\xa9 check."}}\n'
+    )
+
+    assert serialize_json(report) == expected
+    assert serialize_json(report) == expected
+    assert expected.endswith(b"\n")
+    assert b"\n" not in expected[:-1]
+    assert b"\\u00e9" not in expected
+
+
+def test_serialize_json_projects_exact_run_members_in_normative_order(tmp_path: Path) -> None:
+    ruff = planned_check(tmp_path, "ruff")
+    root = str(tmp_path.resolve()).encode("utf-8")
+    report = build_run_report(
+        tmp_path,
+        run_plan((ruff,), output_format="json"),
+        ExecutionResult((executed_check(ruff, 0, stdout="snowman \u2603".encode("utf-8")),), 0),
+    )
+
+    expected = (
+        b'{"schema_version":1,"kind":"run","project_root":"'
+        + root
+        + b'","mode":"focused","overall_status":"passed","complete":true,'
+        b'"selection":{"checks":["ruff"],"targets":[],"test_shortcut":null,'
+        b'"pytest_args":null,"planned_test_scope":"not_selected",'
+        b'"planned_coverage_scope":"not_requested"},"checks":[{"name":"ruff",'
+        b'"status":"passed","processes":[{"role":"primary","argv":["uv","run",'
+        b'"python","-m","ruff"],"cwd":"'
+        + root
+        + b'","outcome":"exited","exit_code":0,"signal":null,"duration_ms":7,'
+        b'"stdout":{"captured":true,"text":"snowman \xe2\x98\x83","truncated":false,'
+        b'"omitted_bytes":0},"stderr":{"captured":true,"text":"","truncated":false,'
+        b'"omitted_bytes":0},"error_message":null}],"error":null}],"pytest":null,'
+        b'"coverage":null,"advisories":[]}\n'
+    )
+
+    assert serialize_json(report) == expected
+    assert serialize_json(report) == serialize_json(report)
+
+
+def test_serialize_json_validates_before_encoding_and_returns_no_bytes_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = build_planning_error_report("unknown_check", "Unknown check(s): mypy")
+
+    def fail_validation(_: AgentReportV1) -> None:
+        raise ReportingError("validation failed")
+
+    monkeypatch.setattr(reporting, "validate_report_v1", fail_validation)
+
+    with pytest.raises(ReportingError, match=r"^validation failed$"):
+        serialize_json(report)
+
+
+def test_serialize_json_propagates_encoder_failure_before_returning_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = build_planning_error_report("unknown_check", "Unknown check(s): mypy")
+
+    def fail_encoding(*_: object, **__: object) -> str:
+        raise ValueError("encoding failed")
+
+    monkeypatch.setattr(reporting.json, "dumps", fail_encoding)
+
+    with pytest.raises(ValueError, match=r"^encoding failed$"):
+        serialize_json(report)
+
+
+def test_select_exit_code_preserves_first_positive_process_code(tmp_path: Path) -> None:
+    ruff = planned_check(tmp_path, "ruff")
+    annotations = planned_check(tmp_path, "annotations")
+    ty = planned_check(tmp_path, "ty")
+    report = build_run_report(
+        tmp_path,
+        run_plan((ruff, annotations, ty)),
+        ExecutionResult(
+            (executed_check(ruff, 0), executed_check(annotations, 7), executed_check(ty, 3)),
+            7,
+        ),
+    )
+
+    assert select_exit_code(report) == 7
+
+
+def test_select_exit_code_uses_report_status_when_no_positive_process_exists(tmp_path: Path) -> None:
+    passed_check = planned_check(tmp_path, "ruff")
+    passed = build_run_report(
+        tmp_path,
+        run_plan((passed_check,)),
+        ExecutionResult((executed_check(passed_check, 0),), 0),
+    )
+    failed = RunReportV1(
+        schema_version=1,
+        kind="run",
+        project_root=str(tmp_path.resolve()),
+        mode="focused",
+        overall_status="failed",
+        complete=True,
+        selection=Selection((), (), None, None, "not_selected", "not_requested"),
+        checks=(CheckResult("ruff", "failed", (), None),),
+        pytest=None,
+        coverage=None,
+        advisories=(),
+    )
+    errored = RunReportV1(
+        schema_version=1,
+        kind="run",
+        project_root=str(tmp_path.resolve()),
+        mode="focused",
+        overall_status="error",
+        complete=False,
+        selection=Selection((), (), None, None, "not_selected", "not_requested"),
+        checks=(
+            CheckResult(
+                "ruff",
+                "error",
+                (),
+                CheckError("missing_primary_process", "No primary process observation was recorded."),
+            ),
+        ),
+        pytest=None,
+        coverage=None,
+        advisories=(),
+    )
+    planning_error = build_planning_error_report("unknown_check", "Unknown check(s): mypy")
+
+    assert select_exit_code(passed) == 0
+    assert select_exit_code(failed) == 1
+    assert select_exit_code(errored) == 2
+    assert select_exit_code(planning_error) == 2
 
 
 def test_rejects_extra_execution_observation(tmp_path: Path) -> None:
