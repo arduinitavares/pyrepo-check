@@ -16,6 +16,43 @@ from pyrepo_check.planning import (
 from tests.support import RecordingRunner
 
 
+def _write_test_shortcuts(root: Path, shortcuts: dict[str, object]) -> None:
+    shortcut_toml = "\n".join(
+        f"{json.dumps(name)} = {json.dumps(args)}"
+        for name, args in shortcuts.items()
+    )
+    (root / "pyproject.toml").write_text(
+        "[tool.pyrepo-check.test-shortcuts]\n" + shortcut_toml,
+        encoding="utf-8",
+    )
+
+
+def _assert_planning_error_output(
+    stdout: bytes,
+    stderr: bytes,
+    *,
+    output_format: str,
+    code: str,
+    message: str,
+    hint: str | None,
+) -> None:
+    if output_format == "json":
+        assert stderr == b""
+        assert stdout.endswith(b"\n")
+        assert json.loads(stdout.decode("utf-8")) == {
+            "schema_version": 1,
+            "kind": "planning_error",
+            "overall_status": "error",
+            "complete": False,
+            "error": {"code": code, "message": message, "hint": hint},
+        }
+    else:
+        assert stdout == b""
+        assert stderr == (
+            message + (f"\nHint: {hint}" if hint is not None else "") + "\n"
+        ).encode()
+
+
 def test_cli_builds_request_and_executes_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -70,7 +107,7 @@ def test_cli_builds_request_and_executes_plan(
     )
 
     result = main(
-        ["--root", str(tmp_path), "--no-frozen", "ty"],
+        ["--root", str(tmp_path), "--no-frozen", "--shortcut", "unit", "ty"],
         runner=injected_runner,
     )
 
@@ -81,9 +118,213 @@ def test_cli_builds_request_and_executes_plan(
             positionals=("ty",),
             all_selected=False,
             no_frozen=True,
+            test_shortcut="unit",
         )
     ]
     assert executed_plans == [expected_plan]
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+@pytest.mark.parametrize(
+    ("positionals", "all_selected"),
+    (
+        (("pytest", "tests/direct.py"), False),
+        (("ruff", "pytest"), False),
+        (("pytest",), True),
+        ((), False),
+    ),
+)
+def test_shortcut_conflicts_render_planning_errors_without_spawning(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+    positionals: tuple[str, ...],
+    all_selected: bool,
+) -> None:
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    (tmp_path / "tests" / "direct.py").write_text("", encoding="utf-8")
+    _write_test_shortcuts(tmp_path, {"unit": ["tests/unit"]})
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path)]
+    if output_format == "json":
+        argv.extend(("--format", "json"))
+    if all_selected:
+        argv.append("--all")
+    argv.extend(positionals)
+    argv.extend(("--shortcut", "unit"))
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="invalid_arguments",
+        message=(
+            "--shortcut requires an explicit pytest-only run with no direct targets or --all."
+        ),
+        hint="Use: pyrepo-check pytest --shortcut NAME",
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+@pytest.mark.parametrize(
+    ("shortcuts", "message"),
+    (
+        (
+            {"unit": ["bad\x00path"]},
+            "Invalid Test Shortcut 'unit': target path cannot be inspected safely: bad\x00path",
+        ),
+        ({"broken": []}, "Invalid Test Shortcut 'broken': value must be a non-empty list of strings"),
+    ),
+)
+def test_invalid_shortcut_config_renders_typed_planning_error_without_spawning(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+    shortcuts: dict[str, object],
+    message: str,
+) -> None:
+    _write_test_shortcuts(tmp_path, shortcuts)
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path)]
+    if output_format == "json":
+        argv.extend(("--format", "json"))
+    argv.append("ty")
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="invalid_test_shortcut",
+        message=message,
+        hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+def test_symlink_loop_shortcut_config_renders_typed_error_without_spawning(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+) -> None:
+    try:
+        (tmp_path / "loop").symlink_to("loop")
+    except OSError:
+        pytest.skip()
+    _write_test_shortcuts(tmp_path, {"unit": ["loop"]})
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path)]
+    if output_format == "json":
+        argv.extend(("--format", "json"))
+    argv.append("ty")
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="invalid_test_shortcut",
+        message="Invalid Test Shortcut 'unit': target path cannot be inspected safely: loop",
+        hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+@pytest.mark.parametrize(
+    ("shortcuts", "expected_hint"),
+    (
+        (
+            {
+                "unit": ["tests/unit"],
+                "cli": ["tests/unit"],
+                "integration": ["tests/unit"],
+            },
+            "Available Test Shortcuts: cli, integration, unit",
+        ),
+        ({}, "No Test Shortcuts are configured."),
+    ),
+)
+def test_unknown_shortcut_renders_name_hint_without_spawning(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+    shortcuts: dict[str, object],
+    expected_hint: str,
+) -> None:
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    _write_test_shortcuts(tmp_path, shortcuts)
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path)]
+    if output_format == "json":
+        argv.extend(("--format", "json"))
+    argv.extend(("pytest", "--shortcut", "missing"))
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="unknown_test_shortcut",
+        message="Unknown Test Shortcut: missing",
+        hint=expected_hint,
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+) -> None:
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    _write_test_shortcuts(tmp_path, {"unit": ["tests/unit", "-m", "not slow"]})
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path)]
+    if output_format == "json":
+        argv.extend(("--format", "json"))
+    argv.extend(("pytest", "--shortcut", "unit"))
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    assert result == 0
+    assert [call.command for call in runner.calls] == [
+        ("uv", "run", "python", "-m", "pytest", "tests/unit", "-m", "not slow")
+    ]
+    if output_format == "json":
+        assert captured.err == b""
+        assert captured.out.endswith(b"\n")
+        payload = json.loads(captured.out.decode("utf-8"))
+        assert payload["selection"] == {
+            "checks": ["pytest"],
+            "targets": [],
+            "test_shortcut": "unit",
+            "pytest_args": ["tests/unit", "-m", "not slow"],
+            "planned_test_scope": "partial",
+            "planned_coverage_scope": "not_requested",
+        }
+    else:
+        assert captured.err == b""
+        assert captured.out.endswith(
+            b"\n==> pyrepo-check summary: passed (complete)\n    passed: pytest\n"
+        )
 
 
 def test_terminal_summary_is_written_only_after_final_runner_call(

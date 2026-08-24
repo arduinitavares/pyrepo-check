@@ -7,7 +7,11 @@ import subprocess  # nosec B404
 import sys
 from typing import cast
 
-from pyrepo_check.config import collect_existing_positionals, load_project_config
+from pyrepo_check.config import (
+    InvalidTestShortcutError,
+    collect_existing_positionals,
+    load_project_config,
+)
 from pyrepo_check.execution import ExecutionResult, ProcessRunner, execute_plan
 from pyrepo_check.planning import (
     OutputFormat,
@@ -50,6 +54,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Output terminal diagnostics or one JSON document.",
     )
     parser.add_argument(
+        "--shortcut",
+        metavar="NAME",
+        help="Run a configured Test Shortcut in a pytest-only focused run.",
+    )
+    parser.add_argument(
         "checks",
         nargs="*",
         help=f"Optional check names and target paths. Checks: {CHECK_HELP}.",
@@ -70,10 +79,18 @@ def main(
         all_selected=args.all,
         no_frozen=args.no_frozen,
         output_format=output_format,
+        test_shortcut=args.shortcut,
     )
 
     try:
         config = load_project_config(request.root, no_frozen=request.no_frozen)
+    except InvalidTestShortcutError as error:
+        return _write_planning_error(
+            "invalid_test_shortcut",
+            str(error),
+            hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
+            output_format=output_format,
+        )
     except ValueError as error:
         return _write_planning_error(
             "invalid_project_config",

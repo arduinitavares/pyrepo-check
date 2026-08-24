@@ -133,7 +133,7 @@ def test_help_surface_is_unchanged(
     output = capsys.readouterr()
     assert captured.value.code == 0
     assert output.out == """usage: pyrepo-check [-h] [--all] [--root ROOT] [--no-frozen]
-                    [--format {terminal,json}]
+                    [--format {terminal,json}] [--shortcut NAME]
                     [checks ...]
 
 Run Python repository quality checks.
@@ -150,6 +150,8 @@ options:
   --no-frozen           Run uv without --frozen even when uv.lock exists.
   --format {terminal,json}
                         Output terminal diagnostics or one JSON document.
+  --shortcut NAME       Run a configured Test Shortcut in a pytest-only
+                        focused run.
 """
     assert output.err == ""
 
@@ -163,6 +165,34 @@ def test_json_format_is_public_syntax_before_checks() -> None:
 
     assert args.format == "json"
     assert args.checks == ["ty"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--shortcut", "unit", "pytest"),
+        ("pytest", "--shortcut", "unit"),
+    ),
+)
+def test_shortcut_is_public_syntax_in_both_supported_placements(
+    argv: tuple[str, ...],
+) -> None:
+    args = parse_args(argv)
+
+    assert args.checks == ["pytest"]
+    assert args.shortcut == "unit"
+
+
+def test_missing_shortcut_operand_remains_argparse_owned(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as captured:
+        parse_args(["--shortcut"])
+
+    output = capsys.readouterr()
+    assert captured.value.code == 2
+    assert output.out == ""
+    assert "argument --shortcut: expected one argument" in output.err
 
 
 def test_invalid_format_remains_argparse_owned(
