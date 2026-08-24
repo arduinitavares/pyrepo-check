@@ -8,7 +8,14 @@ import pytest
 
 import pyrepo_check.reporting as reporting
 from pyrepo_check.execution import ExecutedCheck, ExecutionResult
-from pyrepo_check.planning import CheckName, OutputFormat, PlannedCheck, RunMode, RunPlan
+from pyrepo_check.planning import (
+    CheckName,
+    OutputFormat,
+    PlannedCheck,
+    PlannedTestScope,
+    RunMode,
+    RunPlan,
+)
 from pyrepo_check.reporting import (
     Advisory,
     AgentReportV1,
@@ -63,12 +70,29 @@ def run_plan(
     targets: tuple[str, ...] = (),
     mode: RunMode = "focused",
     output_format: OutputFormat = "json",
+    test_shortcut: str | None = None,
+    pytest_args: tuple[str, ...] | None = None,
+    planned_test_scope: PlannedTestScope | None = None,
 ) -> RunPlan:
+    pytest_selected = any(check.name == "pytest" for check in checks)
+    if pytest_args is None:
+        pytest_args = targets if pytest_selected else None
+    if planned_test_scope is None:
+        planned_test_scope = (
+            "not_selected"
+            if not pytest_selected
+            else "partial"
+            if targets
+            else "complete"
+        )
     return RunPlan(
         mode=mode,
         targets=targets,
         checks=checks,
         output_format=output_format,
+        test_shortcut=test_shortcut,
+        pytest_args=pytest_args,
+        planned_test_scope=planned_test_scope,
     )
 
 
@@ -524,6 +548,60 @@ def test_serialize_json_projects_exact_run_members_in_normative_order(tmp_path: 
     assert serialize_json(report) == serialize_json(report)
 
 
+def test_serialize_json_projects_test_shortcut_selection_in_normative_order(
+    tmp_path: Path,
+) -> None:
+    pytest_check = planned_check(tmp_path, "pytest")
+    root = str(tmp_path.resolve()).encode("utf-8")
+    report = build_run_report(
+        tmp_path,
+        run_plan(
+            (pytest_check,),
+            test_shortcut="unit",
+            pytest_args=("tests/unit", "-m", "not slow"),
+            planned_test_scope="partial",
+        ),
+        ExecutionResult((executed_check(pytest_check, 0),), 0),
+    )
+
+    assert report.selection == Selection(
+        checks=("pytest",),
+        targets=(),
+        test_shortcut="unit",
+        pytest_args=("tests/unit", "-m", "not slow"),
+        planned_test_scope="partial",
+        planned_coverage_scope="not_requested",
+    )
+    expected = (
+        b'{"schema_version":1,"kind":"run","project_root":"'
+        + root
+        + b'","mode":"focused","overall_status":"passed","complete":true,'
+        b'"selection":{"checks":["pytest"],"targets":[],"test_shortcut":"unit",'
+        b'"pytest_args":["tests/unit","-m","not slow"],"planned_test_scope":"partial",'
+        b'"planned_coverage_scope":"not_requested"},"checks":[{"name":"pytest",'
+        b'"status":"passed","processes":[{"role":"primary","argv":["uv","run",'
+        b'"python","-m","pytest"],"cwd":"'
+        + root
+        + b'","outcome":"exited","exit_code":0,"signal":null,"duration_ms":7,'
+        b'"stdout":{"captured":true,"text":"","truncated":false,"omitted_bytes":0},'
+        b'"stderr":{"captured":true,"text":"","truncated":false,"omitted_bytes":0},'
+        b'"error_message":null}],"error":null}],"pytest":null,"coverage":null,'
+        b'"advisories":[]}\n'
+    )
+
+    assert serialize_json(report) == expected
+
+
+@pytest.mark.parametrize("code", ("unknown_test_shortcut", "invalid_test_shortcut"))
+def test_serialize_json_accepts_test_shortcut_planning_errors(code: str) -> None:
+    report = build_planning_error_report(cast(Any, code), "shortcut planning failed")
+
+    assert validate_report_v1(report) is None
+    assert serialize_json(report).startswith(
+        b'{"schema_version":1,"kind":"planning_error"'
+    )
+
+
 def test_serialize_json_validates_before_encoding_and_returns_no_bytes_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -903,6 +981,14 @@ INVALID_REPORT_CASES = (
     "selection-is-not-canonical",
     "emitted-checks-are-not-canonical",
     "duplicate-selected-check",
+    "shortcut-without-pytest",
+    "shortcut-with-direct-targets",
+    "shortcut-with-second-check",
+    "shortcut-with-null-pytest-args",
+    "shortcut-with-empty-pytest-args",
+    "shortcut-with-invalid-name",
+    "shortcut-with-non-tuple-string-pytest-args",
+    "shortcut-with-non-partial-scope",
     "selected-pytest-null-arguments",
     "selected-pytest-wrong-arguments",
     "selected-pytest-wrong-scope",
@@ -969,6 +1055,27 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
     process = passed.checks[0].processes[0]
     signal_process = signaled.checks[0].processes[0]
     spawn_process = spawn_failed.checks[0].processes[0]
+
+    def shortcut_report(
+        checks: tuple[PlannedCheck, ...],
+        *,
+        targets: tuple[str, ...] = (),
+        test_shortcut: object = "unit",
+        pytest_args: object = ("tests/unit",),
+        planned_test_scope: object = "partial",
+    ) -> RunReportV1:
+        report = build_run_report(
+            tmp_path,
+            run_plan(checks, targets=targets),
+            ExecutionResult(tuple(executed_check(check, 0) for check in checks), 0),
+        )
+        selection = replace(
+            report.selection,
+            test_shortcut=cast(Any, test_shortcut),
+            pytest_args=cast(Any, pytest_args),
+            planned_test_scope=cast(Any, planned_test_scope),
+        )
+        return replace(report, selection=selection)
 
     if case == "schema-version":
         return replace(passed, schema_version=2)
@@ -1135,6 +1242,29 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
         selection = replace(passed.selection, checks=("ruff", "ruff"))
         result = replace(passed.checks[0], name=cast(Any, "ruff"))
         return replace(passed, selection=selection, checks=(result, result))
+    if case == "shortcut-without-pytest":
+        return shortcut_report((check,))
+    if case == "shortcut-with-direct-targets":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((pytest_check,), targets=("tests/unit",))
+    if case == "shortcut-with-second-check":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((check, pytest_check))
+    if case == "shortcut-with-null-pytest-args":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((pytest_check,), pytest_args=None)
+    if case == "shortcut-with-empty-pytest-args":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((pytest_check,), pytest_args=())
+    if case == "shortcut-with-invalid-name":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((pytest_check,), test_shortcut="Unit")
+    if case == "shortcut-with-non-tuple-string-pytest-args":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((pytest_check,), pytest_args=("tests/unit", 1))
+    if case == "shortcut-with-non-partial-scope":
+        pytest_check = planned_check(tmp_path, "pytest")
+        return shortcut_report((pytest_check,), planned_test_scope="complete")
     if case == "selected-pytest-null-arguments":
         pytest_check = planned_check(tmp_path, "pytest")
         report = build_run_report(

@@ -6,11 +6,13 @@ from pathlib import Path
 import re
 from typing import Literal, cast
 
+from pyrepo_check.config import TEST_SHORTCUT_NAME_PATTERN
 from pyrepo_check.execution import ExecutedCheck, ExecutionResult
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
     PlannedCheck,
+    PlannedTestScope,
     PlanningErrorCode,
     RunMode,
     RunPlan,
@@ -20,7 +22,6 @@ from pyrepo_check.planning import (
 ReportKind = Literal["planning_error", "run"]
 OverallStatus = Literal["passed", "failed", "error"]
 CheckStatus = Literal["passed", "failed", "error"]
-PlannedTestScope = Literal["not_selected", "partial", "complete"]
 PlannedCoverageScope = Literal["not_requested", "unavailable", "partial", "complete"]
 ProcessRole = Literal["primary", "pytest_preflight", "coverage_preflight", "coverage_json"]
 ProcessOutcome = Literal["exited", "signaled", "spawn_failed"]
@@ -56,7 +57,9 @@ _PLANNING_ERROR_CODES = frozenset(
     (
         "invalid_arguments",
         "invalid_project_config",
+        "invalid_test_shortcut",
         "unknown_check",
+        "unknown_test_shortcut",
         "unknown_target",
         "internal_planning_error",
     )
@@ -151,7 +154,7 @@ class CheckResult:
 class Selection:
     checks: tuple[CheckName, ...]
     targets: tuple[str, ...]
-    test_shortcut: None
+    test_shortcut: str | None
     pytest_args: tuple[str, ...] | None
     planned_test_scope: PlannedTestScope
     planned_coverage_scope: PlannedCoverageScope
@@ -219,17 +222,6 @@ def build_run_report(
     else:
         overall_status = "passed"
 
-    pytest_selected = any(check.name == "pytest" for check in plan.checks)
-    if not pytest_selected:
-        planned_test_scope: PlannedTestScope = "not_selected"
-        pytest_args = None
-    elif plan.targets:
-        planned_test_scope = "partial"
-        pytest_args = plan.targets
-    else:
-        planned_test_scope = "complete"
-        pytest_args = plan.targets
-
     return RunReportV1(
         schema_version=1,
         kind="run",
@@ -240,9 +232,9 @@ def build_run_report(
         selection=Selection(
             checks=tuple(check.name for check in plan.checks),
             targets=plan.targets,
-            test_shortcut=None,
-            pytest_args=pytest_args,
-            planned_test_scope=planned_test_scope,
+            test_shortcut=plan.test_shortcut,
+            pytest_args=plan.pytest_args,
+            planned_test_scope=plan.planned_test_scope,
             planned_coverage_scope="not_requested",
         ),
         checks=checks,
@@ -443,21 +435,19 @@ def _validate_run_report(report: RunReportV1) -> None:
     if not Path(report.project_root).is_absolute():
         _invalid("project_root must be absolute")
     if report.pytest is not None:
-        _invalid("pytest must be null in milestone B")
+        _invalid("pytest must be null before structured pytest evidence")
     if report.coverage is not None:
-        _invalid("coverage must be null in milestone B")
+        _invalid("coverage must be null before coverage execution")
 
     selection = report.selection
     if any(name not in _CHECK_NAMES for name in selection.checks):
         _invalid("selection contains an unknown check name")
-    if selection.test_shortcut is not None:
-        _invalid("test_shortcut must be null in milestone B")
     if selection.planned_test_scope not in _PLANNED_TEST_SCOPES:
         _invalid("unknown planned test scope")
     if selection.planned_coverage_scope not in _PLANNED_COVERAGE_SCOPES:
         _invalid("unknown planned coverage scope")
     if selection.planned_coverage_scope != "not_requested":
-        _invalid("planned_coverage_scope must be not_requested in milestone B")
+        _invalid("planned_coverage_scope must be not_requested before coverage planning")
 
     emitted_names = tuple(check.name for check in report.checks)
     if selection.checks != emitted_names:
@@ -470,15 +460,39 @@ def _validate_run_report(report: RunReportV1) -> None:
     if selection.checks != canonical_selection:
         _invalid("selection checks must use canonical order")
 
+    shortcut = selection.test_shortcut
+    if shortcut is not None and (
+        not isinstance(shortcut, str)
+        or TEST_SHORTCUT_NAME_PATTERN.fullmatch(shortcut) is None
+    ):
+        _invalid("test_shortcut must be null or a valid Test Shortcut name")
+
+    if selection.pytest_args is not None and (
+        not isinstance(selection.pytest_args, tuple)
+        or any(not isinstance(arg, str) for arg in selection.pytest_args)
+    ):
+        _invalid("pytest_args must be null or a tuple of strings")
+
     pytest_selected = "pytest" in selection.checks
     if not pytest_selected:
+        if shortcut is not None:
+            _invalid("test_shortcut requires pytest selection")
         if selection.pytest_args is not None:
             _invalid("pytest_args must be null when pytest is not selected")
         if selection.planned_test_scope != "not_selected":
             _invalid("planned_test_scope must be not_selected when pytest is not selected")
+    elif shortcut is not None:
+        if selection.checks != ("pytest",):
+            _invalid("test_shortcut requires a pytest-only selection")
+        if selection.targets:
+            _invalid("test_shortcut cannot coexist with direct targets")
+        if not selection.pytest_args:
+            _invalid("test_shortcut requires non-empty pytest_args")
+        if selection.planned_test_scope != "partial":
+            _invalid("test_shortcut requires partial planned test scope")
     else:
         if selection.pytest_args != selection.targets:
-            _invalid("pytest_args must exactly match targets when pytest is selected")
+            _invalid("pytest_args must exactly match targets without a Test Shortcut")
         expected_scope: PlannedTestScope = (
             "partial" if selection.targets else "complete"
         )
