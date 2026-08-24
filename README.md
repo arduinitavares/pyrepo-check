@@ -117,7 +117,8 @@ Configured targets apply to focused commands like `pyrepo-check ruff` and
 ### Test Shortcuts
 
 A Test Shortcut is a repository-owned safe name for a repeatable pytest subset.
-Run one only with explicit pytest:
+Its name must match `[a-z][a-z0-9_-]*`, and its value must be a non-empty list
+of strings. Run one only with explicit pytest:
 
 ```bash
 pyrepo-check pytest --shortcut unit
@@ -125,9 +126,11 @@ pyrepo-check --format json pytest --shortcut unit
 ```
 
 A shortcut cannot be combined with `--all`, another check, or direct pytest
-targets. Definitions accept existing project-relative test paths or node IDs,
-plus at most one `-m` pair and one `-k` pair. Definitions are validated eagerly,
-so an invalid configured shortcut blocks execution even when it is not selected.
+targets. Definition tokens may appear in any order. They may be existing
+project-relative test paths or node IDs, plus at most one `-m VALUE` pair and
+one `-k VALUE` pair. Selector values must be non-empty and cannot begin with
+`-`; no other option tokens are allowed. Definitions are validated eagerly, so
+an invalid configured shortcut blocks execution even when it is not selected.
 Invalid or unknown shortcut requests are planning errors: they run zero
 processes and exit with code `2`.
 
