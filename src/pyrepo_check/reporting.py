@@ -6,7 +6,14 @@ import re
 from typing import Literal
 
 from pyrepo_check.execution import ExecutedCheck, ExecutionResult
-from pyrepo_check.planning import CheckName, PlannedCheck, PlanningErrorCode, RunMode, RunPlan
+from pyrepo_check.planning import (
+    CheckName,
+    OutputFormat,
+    PlannedCheck,
+    PlanningErrorCode,
+    RunMode,
+    RunPlan,
+)
 
 
 ReportKind = Literal["planning_error", "run"]
@@ -191,7 +198,11 @@ def build_run_report(
 ) -> RunReportV1:
     observations = _match_observations(plan.checks, execution.checks)
     checks = tuple(
-        _build_check_result(planned, observations.get(index))
+        _build_check_result(
+            planned,
+            observations.get(index),
+            output_format=plan.output_format,
+        )
         for index, planned in enumerate(plan.checks)
     )
     statuses = {check.status for check in checks}
@@ -436,6 +447,8 @@ def _match_observations(
 def _build_check_result(
     planned: PlannedCheck,
     observation: ExecutedCheck | None,
+    *,
+    output_format: OutputFormat,
 ) -> CheckResult:
     if observation is None:
         return CheckResult(
@@ -448,7 +461,10 @@ def _build_check_result(
             ),
         )
 
-    process, status, error = _build_process_result(observation)
+    process, status, error = _build_process_result(
+        observation,
+        output_format=output_format,
+    )
     return CheckResult(
         name=planned.name,
         status=status,
@@ -459,6 +475,8 @@ def _build_check_result(
 
 def _build_process_result(
     observation: ExecutedCheck,
+    *,
+    output_format: OutputFormat,
 ) -> tuple[ProcessResult, CheckStatus, CheckError | None]:
     returncode = observation.returncode
     if returncode is None:
@@ -495,8 +513,8 @@ def _build_process_result(
             exit_code=exit_code,
             signal=signal,
             duration_ms=observation.duration_ms,
-            stdout=_captured_stream(observation.stdout),
-            stderr=_captured_stream(observation.stderr),
+            stdout=_captured_stream(observation.stdout, output_format=output_format),
+            stderr=_captured_stream(observation.stderr, output_format=output_format),
             error_message=error_message,
         ),
         status,
@@ -504,7 +522,11 @@ def _build_process_result(
     )
 
 
-def _captured_stream(raw: bytes | None) -> CapturedText:
+def _captured_stream(
+    raw: bytes | None,
+    *,
+    output_format: OutputFormat,
+) -> CapturedText:
     if raw is None:
-        return CapturedText(False, "", False, 0)
+        return CapturedText(output_format == "json", "", False, 0)
     return capture_text(raw)

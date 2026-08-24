@@ -185,8 +185,8 @@ def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> 
                         exit_code=None,
                         signal=None,
                         duration_ms=14,
-                        stdout=CapturedText(False, "", False, 0),
-                        stderr=CapturedText(False, "", False, 0),
+                        stdout=CapturedText(True, "", False, 0),
+                        stderr=CapturedText(True, "", False, 0),
                         error_message="FileNotFoundError: uv",
                     ),
                 ),
@@ -217,6 +217,27 @@ def test_terminal_observations_are_explicitly_uncaptured(tmp_path: Path) -> None
     process = report.checks[0].processes[0]
     assert process.stdout == CapturedText(False, "", False, 0)
     assert process.stderr == CapturedText(False, "", False, 0)
+
+
+def test_json_spawn_failure_streams_are_captured_empty(tmp_path: Path) -> None:
+    check = planned_check(tmp_path, "ruff")
+    observation = executed_check(
+        check,
+        None,
+        stdout=None,
+        stderr=None,
+        spawn_error="FileNotFoundError: uv",
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), output_format="json"),
+        ExecutionResult((observation,), 2),
+    )
+
+    process = report.checks[0].processes[0]
+    assert process.stdout == CapturedText(True, "", False, 0)
+    assert process.stderr == CapturedText(True, "", False, 0)
 
 
 @pytest.mark.parametrize(
