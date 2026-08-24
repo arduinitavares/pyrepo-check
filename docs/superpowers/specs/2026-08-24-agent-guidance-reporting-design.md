@@ -8,10 +8,9 @@
 ## Delivery status
 
 As of 2026-08-24, the prior research, design specification, Agent Skill, README
-guidance, and repository cleanup are implemented and merged. On this branch,
-Milestones A and B are implemented and verified; this implementation branch is
-not implied to be merged or pushed. Test Shortcuts, structured pytest evidence,
-coverage execution, and repository coverage adoption remain unimplemented.
+guidance, repository cleanup, and Milestones A-B implementation are merged and
+pushed on `main`. Test Shortcuts, structured pytest evidence, coverage execution,
+and repository coverage adoption remain unimplemented.
 
 | Milestone | Delivery status | Verification evidence |
 | --- | --- | --- |
