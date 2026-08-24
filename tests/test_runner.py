@@ -71,5 +71,6 @@ def test_legacy_run_checks_delegates_to_executor(
                     cwd=tmp_path,
                 ),
             ),
+            output_format="terminal",
         )
     ]

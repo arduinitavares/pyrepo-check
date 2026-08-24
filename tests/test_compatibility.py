@@ -36,17 +36,31 @@ def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
     ]
 
 
-def test_first_negative_nonzero_is_returned_and_later_checks_run(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("returncodes", "raise_on_call", "expected"),
+    [
+        ((-15, 7, 0, 0, 0), None, 7),
+        ((-15, 0, 0, 0, 0), None, 2),
+        ((0, 0, 0, 0, 0), 1, 2),
+        ((0, 7, 0, 0, 0), 1, 7),
+    ],
+)
+def test_legacy_exit_code_classifies_spawn_and_negative_outcomes(
+    tmp_path: Path,
+    returncodes: tuple[int, ...],
+    raise_on_call: int | None,
+    expected: int,
+) -> None:
     (tmp_path / "src").mkdir()
-    runner = RecordingRunner(returncodes=(-15, 7, 0, 0, 0))
+    runner = RecordingRunner(returncodes=returncodes, raise_on_call=raise_on_call)
 
     result = main(["--root", str(tmp_path), "--all"], runner=runner)
 
-    assert result == -15
+    assert result == expected
     assert len(runner.calls) == 5
 
 
-def test_spawn_exception_is_propagated_and_aborts(
+def test_spawn_exception_is_recorded_and_later_checks_continue(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -59,17 +73,19 @@ def test_spawn_exception_is_propagated_and_aborts(
         on_call=lambda _call: stdout_at_spawn.append(capsys.readouterr().out),
     )
 
-    with pytest.raises(FileNotFoundError) as captured:
-        main(["--root", str(tmp_path), "--all"], runner=runner)
+    result = main(["--root", str(tmp_path), "--all"], runner=runner)
 
-    assert captured.value is error
-    assert len(runner.calls) == 2
+    assert result == 2
+    assert len(runner.calls) == 5
     assert stdout_at_spawn == [
         "\n==> ruff: uv run python -m ruff check .\n",
         (
             "\n==> annotations: uv run python -m ruff check . "
             "--select ANN --output-format concise\n"
         ),
+        "\n==> ty: uv run python -m ty check\n",
+        "\n==> bandit: uv run python -m bandit -c pyproject.toml -r .\n",
+        "\n==> pytest: uv run python -m pytest\n",
     ]
 
 

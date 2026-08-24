@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess  # nosec B404
+from typing import cast
 
 
 @dataclass(frozen=True)
@@ -11,6 +12,7 @@ class RecordedCall:
     command: tuple[str, ...]
     cwd: Path
     check: bool
+    capture_output: bool
 
 
 class RecordingRunner:
@@ -18,11 +20,15 @@ class RecordingRunner:
         self,
         *,
         returncodes: tuple[int, ...] = (),
+        stdout: tuple[bytes | str | None, ...] = (),
+        stderr: tuple[bytes | str | None, ...] = (),
         raise_on_call: int | None = None,
         exception: Exception | None = None,
         on_call: Callable[[RecordedCall], None] | None = None,
     ) -> None:
         self.returncodes = returncodes
+        self.stdout = stdout
+        self.stderr = stderr
         self.raise_on_call = raise_on_call
         self.exception = exception
         self.on_call = on_call
@@ -34,8 +40,14 @@ class RecordingRunner:
         *,
         cwd: Path,
         check: bool,
+        capture_output: bool = False,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
-        recorded = RecordedCall(command=command, cwd=cwd, check=check)
+        recorded = RecordedCall(
+            command=command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+        )
         self.calls.append(recorded)
         if self.on_call is not None:
             self.on_call(recorded)
@@ -51,4 +63,20 @@ class RecordingRunner:
             if returncode_index < len(self.returncodes)
             else 0
         )
-        return subprocess.CompletedProcess(command, returncode=returncode)
+        return cast(
+            subprocess.CompletedProcess[tuple[str, ...]],
+            subprocess.CompletedProcess(
+                command,
+                returncode=returncode,
+                stdout=(
+                    self.stdout[returncode_index]
+                    if returncode_index < len(self.stdout)
+                    else None
+                ),
+                stderr=(
+                    self.stderr[returncode_index]
+                    if returncode_index < len(self.stderr)
+                    else None
+                ),
+            ),
+        )
