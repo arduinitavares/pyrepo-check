@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from pyrepo_check.config import ProjectConfig
+from pyrepo_check.config import ProjectConfig, TestShortcut as ConfigTestShortcut
 from pyrepo_check.planning import (
     PlannedCheck,
     PlanningFacts,
@@ -32,12 +32,14 @@ def make_config(
     ruff_targets: tuple[str, ...] = ("src", "tests"),
     bandit_targets: tuple[str, ...] = ("src",),
     frozen: bool = False,
+    test_shortcuts: tuple[ConfigTestShortcut, ...] = (),
 ) -> ProjectConfig:
     return ProjectConfig(
         root=root,
         ruff_targets=ruff_targets,
         bandit_targets=bandit_targets,
         frozen=frozen,
+        test_shortcuts=test_shortcuts,
     )
 
 
@@ -47,6 +49,134 @@ def command_names(plan: RunPlan) -> tuple[str, ...]:
 
 def commands(plan: RunPlan) -> tuple[tuple[str, ...], ...]:
     return tuple(check.command for check in plan.checks)
+
+
+@pytest.mark.parametrize("frozen", (False, True))
+def test_plans_named_pytest_shortcut_with_exact_configured_tokens(
+    tmp_path: Path,
+    frozen: bool,
+) -> None:
+    shortcut = ConfigTestShortcut("unit", ("tests/unit", "-m", "not slow", "tests/unit"))
+    plan = plan_run(
+        RunRequest(
+            root=tmp_path,
+            positionals=("pytest",),
+            all_selected=False,
+            no_frozen=False,
+            output_format="json",
+            test_shortcut="unit",
+        ),
+        make_config(tmp_path, frozen=frozen, test_shortcuts=(shortcut,)),
+        PlanningFacts(frozenset()),
+    )
+    prefix = ("uv", "run", "--frozen", "python", "-m") if frozen else (
+        "uv", "run", "python", "-m"
+    )
+
+    assert plan.mode == "focused"
+    assert plan.targets == ()
+    assert plan.test_shortcut == "unit"
+    assert plan.pytest_args == ("tests/unit", "-m", "not slow", "tests/unit")
+    assert plan.planned_test_scope == "partial"
+    assert plan.checks[0].command == (*prefix, "pytest", *plan.pytest_args)
+
+
+@pytest.mark.parametrize(
+    ("positionals", "all_selected"),
+    (
+        (("pytest", "tests/a.py"), False),
+        (("pytest", "ruff"), False),
+        ((), False),
+        (("tests/a.py",), False),
+        (("pytest",), True),
+    ),
+)
+def test_shortcut_conflicts_are_rejected_before_name_lookup(
+    tmp_path: Path,
+    positionals: tuple[str, ...],
+    all_selected: bool,
+) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, positionals, all_selected, False, test_shortcut="unknown"),
+            make_config(tmp_path, test_shortcuts=(ConfigTestShortcut("unit", ("tests/unit",)),)),
+            PlanningFacts(frozenset(("tests/a.py",))),
+        )
+
+    assert raised.value.code == "invalid_arguments"
+    assert str(raised.value) == (
+        "--shortcut requires an explicit pytest-only run with no direct targets or --all."
+    )
+    assert raised.value.hint == "Use: pyrepo-check pytest --shortcut NAME"
+
+
+def test_repeated_pytest_allows_named_shortcut(tmp_path: Path) -> None:
+    plan = plan_run(
+        RunRequest(tmp_path, ("pytest", "pytest"), False, False, test_shortcut="unit"),
+        make_config(tmp_path, test_shortcuts=(ConfigTestShortcut("unit", ("tests/unit",)),)),
+        PlanningFacts(frozenset()),
+    )
+
+    assert command_names(plan) == ("pytest",)
+    assert plan.pytest_args == ("tests/unit",)
+
+
+def test_unknown_shortcut_lists_sorted_configured_names(tmp_path: Path) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, ("pytest",), False, False, test_shortcut="smoke"),
+            make_config(
+                tmp_path,
+                test_shortcuts=(
+                    ConfigTestShortcut("unit", ("tests/unit",)),
+                    ConfigTestShortcut("cli", ("tests/test_cli.py",)),
+                    ConfigTestShortcut("integration", ("-m", "integration")),
+                ),
+            ),
+            PlanningFacts(frozenset()),
+        )
+
+    assert raised.value.code == "unknown_test_shortcut"
+    assert str(raised.value) == "Unknown Test Shortcut: smoke"
+    assert raised.value.hint == "Available Test Shortcuts: cli, integration, unit"
+
+
+def test_unknown_shortcut_reports_empty_configuration(tmp_path: Path) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, ("pytest",), False, False, test_shortcut="smoke"),
+            make_config(tmp_path),
+            PlanningFacts(frozenset()),
+        )
+
+    assert raised.value.code == "unknown_test_shortcut"
+    assert raised.value.hint == "No Test Shortcuts are configured."
+
+
+@pytest.mark.parametrize(
+    ("positionals", "shortcut", "expected_args", "expected_scope"),
+    (
+        (("ruff",), None, None, "not_selected"),
+        (("pytest",), None, (), "complete"),
+        (("pytest", "tests/test_cli.py::test_name"), None, ("tests/test_cli.py::test_name",), "partial"),
+        (("pytest",), "unit", ("tests/unit",), "partial"),
+    ),
+)
+def test_plans_authoritative_pytest_scope_metadata(
+    tmp_path: Path,
+    positionals: tuple[str, ...],
+    shortcut: str | None,
+    expected_args: tuple[str, ...] | None,
+    expected_scope: str,
+) -> None:
+    plan = plan_run(
+        RunRequest(tmp_path, positionals, False, False, test_shortcut=shortcut),
+        make_config(tmp_path, test_shortcuts=(ConfigTestShortcut("unit", ("tests/unit",)),)),
+        PlanningFacts(frozenset()),
+    )
+
+    assert plan.pytest_args == expected_args
+    assert plan.planned_test_scope == expected_scope
 
 
 def test_builds_legacy_frozen_command_matrix(tmp_path: Path) -> None:

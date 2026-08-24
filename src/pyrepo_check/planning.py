@@ -18,10 +18,13 @@ CheckName = Literal[
 ]
 RunMode = Literal["focused", "strict_aggregate"]
 OutputFormat = Literal["terminal", "json"]
+PlannedTestScope = Literal["not_selected", "partial", "complete"]
 PlanningErrorCode = Literal[
     "invalid_arguments",
     "invalid_project_config",
+    "invalid_test_shortcut",
     "unknown_check",
+    "unknown_test_shortcut",
     "unknown_target",
     "internal_planning_error",
 ]
@@ -64,6 +67,7 @@ class RunRequest:
     all_selected: bool
     no_frozen: bool
     output_format: OutputFormat = "terminal"
+    test_shortcut: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,9 @@ class RunPlan:
     targets: tuple[str, ...]
     checks: tuple[PlannedCheck, ...]
     output_format: OutputFormat = "terminal"
+    test_shortcut: str | None = None
+    pytest_args: tuple[str, ...] | None = None
+    planned_test_scope: PlannedTestScope = "not_selected"
 
 
 def plan_run(
@@ -92,6 +99,12 @@ def plan_run(
     facts: PlanningFacts,
 ) -> RunPlan:
     requested, targets = _split_positionals(request.positionals)
+    shortcut_args = _resolve_test_shortcut(
+        request,
+        config,
+        requested=requested,
+        targets=targets,
+    )
     if targets and not requested and not request.all_selected:
         missing = tuple(
             target for target in targets if target not in facts.existing_positionals
@@ -112,18 +125,74 @@ def plan_run(
         requested = TARGET_DEFAULT_CHECKS
 
     strict_all = not targets and (request.all_selected or not request.positionals)
-    available = build_checks(config, targets=targets, strict_all=strict_all)
+    available = build_checks(
+        config,
+        targets=targets,
+        strict_all=strict_all,
+        pytest_args=shortcut_args,
+    )
     selected = select_checks(
         available,
         requested=requested,
         all_selected=request.all_selected,
     )
+    pytest_selected = any(check.name == "pytest" for check in selected)
+    if not pytest_selected:
+        planned_pytest_args = None
+        planned_test_scope: PlannedTestScope = "not_selected"
+    elif shortcut_args is not None:
+        planned_pytest_args = shortcut_args
+        planned_test_scope = "partial"
+    elif targets:
+        planned_pytest_args = targets
+        planned_test_scope = "partial"
+    else:
+        planned_pytest_args = ()
+        planned_test_scope = "complete"
     return RunPlan(
         mode="strict_aggregate" if strict_all else "focused",
         targets=targets,
         checks=selected,
         output_format=request.output_format,
+        test_shortcut=request.test_shortcut if shortcut_args is not None else None,
+        pytest_args=planned_pytest_args,
+        planned_test_scope=planned_test_scope,
     )
+
+
+def _resolve_test_shortcut(
+    request: RunRequest,
+    config: ProjectConfig,
+    *,
+    requested: tuple[CheckName, ...],
+    targets: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    name = request.test_shortcut
+    if name is None:
+        return None
+
+    if request.all_selected or targets or set(requested) != {"pytest"}:
+        raise PlanningFailure(
+            "invalid_arguments",
+            "--shortcut requires an explicit pytest-only run with no direct targets or --all.",
+            hint="Use: pyrepo-check pytest --shortcut NAME",
+        )
+
+    shortcuts = {shortcut.name: shortcut.pytest_args for shortcut in config.test_shortcuts}
+    try:
+        return shortcuts[name]
+    except KeyError as error:
+        available = sorted(shortcuts)
+        hint = (
+            "Available Test Shortcuts: " + ", ".join(available)
+            if available
+            else "No Test Shortcuts are configured."
+        )
+        raise PlanningFailure(
+            "unknown_test_shortcut",
+            f"Unknown Test Shortcut: {name}",
+            hint=hint,
+        ) from error
 
 
 def _split_positionals(
@@ -142,9 +211,13 @@ def build_checks(
     *,
     targets: Sequence[str] = (),
     strict_all: bool = False,
+    pytest_args: Sequence[str] | None = None,
 ) -> dict[str, PlannedCheck]:
     prefix = _uv_python_prefix(config)
     explicit_targets = tuple(targets)
+    effective_pytest_args = (
+        explicit_targets if pytest_args is None else tuple(pytest_args)
+    )
     strict_targets = (".",) if strict_all and not explicit_targets else ()
     ruff_targets = explicit_targets or strict_targets or config.ruff_targets
     bandit_targets = explicit_targets or strict_targets or config.bandit_targets
@@ -204,7 +277,7 @@ def build_checks(
         ),
         "pytest": PlannedCheck(
             name="pytest",
-            command=(*prefix, "pytest", *explicit_targets),
+            command=(*prefix, "pytest", *effective_pytest_args),
             cwd=config.root,
         ),
     }
