@@ -9,6 +9,25 @@ editable global tool, then run it from any Python project root.
 uv tool install --editable /Users/aaat/projects/pyrepo-check
 ```
 
+## Agent Skill
+
+The repository includes a focused usage skill at
+[`.agents/skills/pyrepo-check/SKILL.md`](.agents/skills/pyrepo-check/SKILL.md).
+Codex discovers it automatically while working inside this checkout.
+
+To make the skill available while agents work in other repositories, run the
+following from this repository root:
+
+```bash
+mkdir -p "$HOME/.agents/skills"
+ln -s "$PWD/.agents/skills/pyrepo-check" \
+  "$HOME/.agents/skills/pyrepo-check"
+```
+
+The skill teaches agents which focused checks to choose, how to run one pytest
+test, and when the strict `--all` gate is still required. The CLI `--help`
+output remains the source of truth for supported commands.
+
 ## Usage
 
 ```bash
