@@ -87,6 +87,11 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
         "\n==> bandit: uv run python -m bandit -c pyproject.toml -r .\n",
         "\n==> pytest: uv run python -m pytest\n",
     ]
+    assert capsys.readouterr().out == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: annotations: Could not start process: FileNotFoundError: uv\n"
+        "    passed: ruff, ty, bandit, pytest\n"
+    )
 
 
 def test_runner_value_error_is_not_a_planning_error(tmp_path: Path) -> None:
@@ -127,19 +132,47 @@ def test_help_surface_is_unchanged(
 
     output = capsys.readouterr()
     assert captured.value.code == 0
-    assert output.out == """usage: pyrepo-check [-h] [--all] [--root ROOT] [--no-frozen] [checks ...]
+    assert output.out == """usage: pyrepo-check [-h] [--all] [--root ROOT] [--no-frozen]
+                    [--format {terminal,json}]
+                    [checks ...]
 
 Run Python repository quality checks.
 
 positional arguments:
-  checks       Optional check names and target paths. Checks: ruff,
-               annotations, annotations-fix, ty, bandit, pytest.
+  checks                Optional check names and target paths. Checks: ruff,
+                        annotations, annotations-fix, ty, bandit, pytest.
 
 options:
-  -h, --help   show this help message and exit
-  --all        Run all checks.
-  --root ROOT  Project root to check. Defaults to the current working
-               directory.
-  --no-frozen  Run uv without --frozen even when uv.lock exists.
+  -h, --help            show this help message and exit
+  --all                 Run all checks.
+  --root ROOT           Project root to check. Defaults to the current working
+                        directory.
+  --no-frozen           Run uv without --frozen even when uv.lock exists.
+  --format {terminal,json}
+                        Output terminal diagnostics or one JSON document.
 """
     assert output.err == ""
+
+
+def test_format_defaults_to_terminal() -> None:
+    assert parse_args([]).format == "terminal"
+
+
+def test_json_format_is_public_syntax_before_checks() -> None:
+    args = parse_args(["--format", "json", "ty"])
+
+    assert args.format == "json"
+    assert args.checks == ["ty"]
+
+
+def test_invalid_format_remains_argparse_owned(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as captured:
+        parse_args(["--format", "xml"])
+
+    output = capsys.readouterr()
+    assert captured.value.code == 2
+    assert output.out == ""
+    assert "invalid choice: 'xml'" in output.err
+    assert "choose from terminal, json" in output.err

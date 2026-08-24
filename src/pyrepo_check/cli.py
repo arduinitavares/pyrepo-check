@@ -5,10 +5,26 @@ from pathlib import Path
 import argparse
 import subprocess  # nosec B404
 import sys
+from typing import cast
 
 from pyrepo_check.config import collect_existing_positionals, load_project_config
-from pyrepo_check.execution import ProcessRunner, execute_plan
-from pyrepo_check.planning import PlanningFacts, RunRequest, plan_run
+from pyrepo_check.execution import ExecutionResult, ProcessRunner, execute_plan
+from pyrepo_check.planning import (
+    OutputFormat,
+    PlanningErrorCode,
+    PlanningFacts,
+    PlanningFailure,
+    RunRequest,
+    plan_run,
+)
+from pyrepo_check.reporting import (
+    build_planning_error_report,
+    build_run_report,
+    render_terminal,
+    select_exit_code,
+    serialize_json,
+    validate_report_v1,
+)
 
 
 CHECK_HELP = "ruff, annotations, annotations-fix, ty, bandit, pytest"
@@ -28,6 +44,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run uv without --frozen even when uv.lock exists.",
     )
     parser.add_argument(
+        "--format",
+        choices=("terminal", "json"),
+        default="terminal",
+        help="Output terminal diagnostics or one JSON document.",
+    )
+    parser.add_argument(
         "checks",
         nargs="*",
         help=f"Optional check names and target paths. Checks: {CHECK_HELP}.",
@@ -41,15 +63,33 @@ def main(
     runner: ProcessRunner = subprocess.run,
 ) -> int:
     args = parse_args(argv)
+    output_format = cast(OutputFormat, args.format)
     request = RunRequest(
         root=Path(args.root),
         positionals=tuple(args.checks),
         all_selected=args.all,
         no_frozen=args.no_frozen,
+        output_format=output_format,
     )
 
     try:
         config = load_project_config(request.root, no_frozen=request.no_frozen)
+    except ValueError as error:
+        return _write_planning_error(
+            "invalid_project_config",
+            str(error),
+            hint=None,
+            output_format=output_format,
+        )
+    except Exception as error:
+        return _write_planning_error(
+            "internal_planning_error",
+            str(error),
+            hint=None,
+            output_format=output_format,
+        )
+
+    try:
         facts = PlanningFacts(
             existing_positionals=collect_existing_positionals(
                 config.root,
@@ -57,12 +97,83 @@ def main(
             )
         )
         plan = plan_run(request, config, facts)
-    except ValueError as error:
-        print(error, file=sys.stderr)
+    except PlanningFailure as error:
+        return _write_planning_error(
+            error.code,
+            str(error),
+            hint=error.hint,
+            output_format=output_format,
+        )
+    except Exception as error:
+        return _write_planning_error(
+            "internal_planning_error",
+            str(error),
+            hint=None,
+            output_format=output_format,
+        )
+
+    execution = execute_plan(plan, runner=runner)
+    try:
+        report = build_run_report(config.root, plan, execution)
+        validate_report_v1(report)
+        rendered = (
+            serialize_json(report)
+            if output_format == "json"
+            else render_terminal(report)
+        )
+        exit_code = select_exit_code(report)
+    except Exception as error:
+        _write_reporting_fallback(error)
+        return _fallback_exit_code(execution)
+
+    if output_format == "json":
+        sys.stdout.buffer.write(cast(bytes, rendered))
+    else:
+        sys.stdout.write(cast(str, rendered))
+    return exit_code
+
+
+def _write_planning_error(
+    code: PlanningErrorCode,
+    message: str,
+    *,
+    hint: str | None,
+    output_format: OutputFormat,
+) -> int:
+    try:
+        report = build_planning_error_report(code, message, hint=hint)
+        validate_report_v1(report)
+        rendered = (
+            serialize_json(report)
+            if output_format == "json"
+            else render_terminal(report)
+        )
+        exit_code = select_exit_code(report)
+    except Exception as error:
+        _write_reporting_fallback(error)
         return 2
 
-    result = execute_plan(plan, runner=runner)
-    return result.exit_code
+    if output_format == "json":
+        sys.stdout.buffer.write(cast(bytes, rendered))
+    else:
+        sys.stderr.write(cast(str, rendered))
+    return exit_code
+
+
+def _write_reporting_fallback(error: Exception) -> None:
+    print(f"pyrepo-check: internal reporting error: {error}", file=sys.stderr)
+
+
+def _fallback_exit_code(execution: ExecutionResult) -> int:
+    first_positive = next(
+        (
+            check.returncode
+            for check in execution.checks
+            if check.returncode is not None and check.returncode > 0
+        ),
+        None,
+    )
+    return first_positive if first_positive is not None else 2
 
 
 if __name__ == "__main__":
