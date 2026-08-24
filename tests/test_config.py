@@ -181,6 +181,7 @@ def test_rejects_invalid_test_shortcut_grammar_or_targets(
 
 def test_rejects_absolute_test_shortcut_target(tmp_path: Path) -> None:
     absolute_target = tmp_path / "test_absolute.py"
+    absolute_target.write_text("", encoding="utf-8")
     _write_test_shortcuts(tmp_path, {"unit": [str(absolute_target)]})
 
     with pytest.raises(InvalidTestShortcutError):
