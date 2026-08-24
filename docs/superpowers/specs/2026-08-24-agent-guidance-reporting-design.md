@@ -94,9 +94,12 @@ Milestone A must preserve all current observable behavior:
 - Existing `uv run` and `--frozen` selection remains unchanged.
 
 Milestone B adds a compact terminal summary, while existing tool diagnostics
-and exit semantics remain available. Milestone C instruments pytest for
-reporting and coverage, but must preserve pytest selection and run it only
-once.
+and positive nonzero exit-code precedence remain available. Milestone B also
+classifies negative child return codes as signal termination: the signal is
+reported as incomplete/error evidence, later checks continue, and final exit
+selection follows the report rules below instead of returning the negative
+value directly. Milestone C instruments pytest for reporting and coverage, but
+must preserve pytest selection and run it only once.
 
 ## Target architecture
 
@@ -947,6 +950,9 @@ Overall status uses this precedence:
 
 ### Pytest result and exit matrix
 
+Milestone B leaves `pytest` null because structured pytest evidence begins in
+Milestone C; selected pytest execution remains visible in `selection.checks`,
+`selection.pytest_args`, and the pytest `CheckResult`. From Milestone C onward,
 `pytest` is null exactly when pytest was not selected. Otherwise its status is
 independent from coverage. A valid coverage artifact may coexist with failed
 tests, and a passed pytest session may coexist with a coverage error or failed
@@ -1224,12 +1230,14 @@ the intended contract.
 ### Milestone B tests: reporting
 
 - Assert terminal rendering independently from execution.
-- Assert the exact version-1 JSON keys, status vocabulary, deterministic order,
-  nested types/nullability, and serialization of captured output.
+- Assert the exact Milestone B subset of version-1 JSON keys, status
+  vocabulary, deterministic order, nested types/nullability, `pytest: null`,
+  `coverage: null`, and serialization of captured output.
 - Prove JSON stdout is one parseable document even when checks write arbitrary
   output.
-- Prove bounded capture, invalid UTF-8 replacement, ANSI removal, deterministic
-  sorting, planning-error envelopes, and version rejection.
+- Prove bounded retained output, invalid UTF-8 replacement, ANSI removal,
+  deterministic sorting, planning-error envelopes, and producer-side version
+  validation. A general consumer/parser API is not part of this milestone.
 - Add the deliberate spawn-error continuation behavior and prove later checks
   still run while overall evidence becomes incomplete/error.
 - Prove rendering errors fail without emitting partial JSON.
