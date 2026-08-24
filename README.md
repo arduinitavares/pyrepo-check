@@ -47,6 +47,8 @@ pyrepo-check ruff annotations ty bandit api.py
 pyrepo-check --all api.py
 pyrepo-check --format json ty
 pyrepo-check --format json --all
+pyrepo-check pytest --shortcut unit
+pyrepo-check --format json pytest --shortcut unit
 ```
 
 No arguments behaves the same as `--all`.
@@ -80,9 +82,10 @@ pyrepo-check --format json --all
 
 Use `--format json` when an agent needs a machine-readable result. Its stdout
 is exactly one versioned JSON document followed by a newline; native tool
-stdout and stderr are captured inside that document. In schema version 1, the
-top-level `pytest` and `coverage` sections are explicitly `null`. The selected
-pytest process is still listed in `selection.checks` and `checks`.
+stdout and stderr are captured inside that document. In C1, JSON reports the
+selected `test_shortcut`, its exact `pytest_args`, and a partial planned test
+scope. The top-level `pytest` and `coverage` evidence sections remain `null`;
+the selected pytest process is still listed in `selection.checks` and `checks`.
 
 The CLI keeps the first positive tool exit code in planned execution order.
 Checks continue after ordinary failures. If execution has only spawn or
@@ -97,6 +100,11 @@ Each project can optionally configure focused-check paths in its
 [tool.pyrepo-check]
 ruff_targets = ["src/cartola", "src/tests", "scripts"]
 bandit_targets = ["src/cartola"]
+
+[tool.pyrepo-check.test-shortcuts]
+unit = ["tests/unit"]
+integration = ["-m", "integration"]
+cli = ["tests/test_cli.py", "-k", "json"]
 ```
 
 When a project has `uv.lock`, `pyrepo-check` runs checks through
@@ -105,6 +113,33 @@ When a project has `uv.lock`, `pyrepo-check` runs checks through
 
 Configured targets apply to focused commands like `pyrepo-check ruff` and
 `pyrepo-check annotations`. They do not narrow the no-argument or `--all` gate.
+
+### Test Shortcuts
+
+A Test Shortcut is a repository-owned safe name for a repeatable pytest subset.
+Run one only with explicit pytest:
+
+```bash
+pyrepo-check pytest --shortcut unit
+pyrepo-check --format json pytest --shortcut unit
+```
+
+A shortcut cannot be combined with `--all`, another check, or direct pytest
+targets. Definitions accept existing project-relative test paths or node IDs,
+plus at most one `-m` pair and one `-k` pair. Definitions are validated eagerly,
+so an invalid configured shortcut blocks execution even when it is not selected.
+Invalid or unknown shortcut requests are planning errors: they run zero
+processes and exit with code `2`.
+
+Direct test paths and node IDs remain supported and are preferable for one-off
+tests:
+
+```bash
+pyrepo-check pytest tests/test_cli.py::test_invalid_shortcut_config_renders_typed_planning_error_without_spawning
+```
+
+Skill synchronization is intentionally deferred until after Milestone D; do not
+copy this C1 guidance into repository or installed skill files yet.
 
 ## Type Annotation Enforcement
 

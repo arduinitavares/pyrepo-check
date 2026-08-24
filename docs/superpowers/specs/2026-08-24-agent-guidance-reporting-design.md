@@ -1,6 +1,6 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Milestones A-B implemented and verified; Milestones C-D designed and not implemented
+**Status:** Milestones A-B and C1 implemented and verified; C2-C3 and D designed and not implemented
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
@@ -9,14 +9,18 @@
 
 As of 2026-08-24, the prior research, design specification, Agent Skill, README
 guidance, repository cleanup, and Milestones A-B implementation are merged and
-pushed on `main`. Test Shortcuts, structured pytest evidence, coverage execution,
-and repository coverage adoption remain unimplemented.
+pushed on `main`. C1 Test Shortcuts are implemented and verified. Structured
+pytest evidence, coverage execution, and repository coverage adoption remain
+unimplemented. Skill synchronization is explicitly deferred until after
+Milestone D.
 
-| Milestone | Delivery status | Verification evidence |
+| Milestone | State | Evidence |
 | --- | --- | --- |
 | A | Implemented and verified | Planner/executor extraction and compatibility coverage. |
 | B | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
-| C | Designed; not implemented | Test Shortcuts, structured pytest evidence, and coverage. |
+| C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
+| C2 — structured pytest evidence | Designed; not implemented | No pytest preflight/plugin or structured result exists. |
+| C3 — coverage execution and guidance | Designed; not implemented | No coverage preflight/execution/result exists. |
 | D | Designed; not implemented | Repository coverage adoption. |
 
 ## Problem
@@ -954,15 +958,14 @@ Overall status uses this precedence:
 
 ### Pytest result and exit matrix
 
-Milestone B leaves `pytest` null because structured pytest evidence begins in
-Milestone C; selected pytest execution remains visible in `selection.checks`,
-`selection.pytest_args`, and the pytest `CheckResult`. From Milestone C onward,
-`pytest` is null exactly when pytest was not selected. Otherwise its status is
-independent from coverage. A valid coverage artifact may coexist with failed
-tests, and a passed pytest session may coexist with a coverage error or failed
-threshold. When a spawn or coverage preflight error prevents pytest from
-starting, `pytest` is still present with status `error`, `evidence: null`, and
-`not_started` error.
+Milestones B and C1 leave top-level `pytest` null; selected pytest execution
+remains visible in `selection.checks`, `selection.pytest_args`, and the pytest
+`CheckResult`. From C2 onward, a selected pytest run requires a pytest result;
+`pytest` is null exactly when pytest was not selected. Its status is independent
+from coverage. A valid coverage artifact may coexist with failed tests, and a
+passed pytest session may coexist with a coverage error or failed threshold.
+When a spawn or coverage preflight error prevents pytest from starting, `pytest`
+is still present with status `error`, `evidence: null`, and `not_started` error.
 
 `evidence` is non-null only when one finalized, schema-valid plugin artifact
 passes writer/session cardinality and subprocess-exit reconciliation. It may
@@ -1053,6 +1056,8 @@ the six members of `evidence.counts` sum to `evidence.collected`.
 
 ### Coverage result
 
+Through C1, `coverage` is null and
+`selection.planned_coverage_scope` is `not_requested`. From C3 onward,
 `coverage` is null exactly when `selection.planned_coverage_scope` is
 `not_requested` or `unavailable`. The unavailable case also adds the
 `coverage_not_configured` advisory. When coverage is planned, its status means:
@@ -1330,7 +1335,9 @@ worktree files are never included.
 | --- | --- | --- |
 | A — planning and execution extraction | Implemented and verified | Pure planner tests, executor tests, compatibility tests, and strict gate pass. |
 | B — Agent Report and JSON | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
-| C — Test Shortcuts, pytest evidence, coverage | Designed; not implemented | No shortcut parser, pytest evidence plugin, or coverage execution exists. |
+| C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
+| C2 — structured pytest evidence | Designed; not implemented | No pytest preflight/plugin or structured result exists. |
+| C3 — coverage execution and guidance | Designed; not implemented | No coverage preflight/execution/result exists. |
 | D — repository coverage adoption | Designed; not implemented | No locked Coverage.py dependency or native coverage policy exists. |
 
 ## Acceptance criteria
