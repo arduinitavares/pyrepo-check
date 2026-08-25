@@ -546,17 +546,19 @@ complete-scope guidance without becoming strict-gate evidence.
 ### Temporary artifacts and cleanup
 
 One owner-only OS temporary directory per invocation contains only the unique
-pytest plugin, pytest JSON, `.coverage`, any rejected `.coverage.*` shards, the
-validated `report-input/coverage-data` snapshot, and coverage JSON. It is
-outside the consumer root, so the feature needs no consumer `.gitignore`
-entry.
+pytest plugin, per-process pytest writer markers, pytest JSON, `.coverage`, any
+rejected `.coverage.*` shards, the validated `report-input/coverage-data`
+snapshot, and coverage JSON. It is outside the consumer root, so the feature
+needs no consumer `.gitignore` entry.
 
-After artifacts are parsed into the Agent Report, the executor removes the
-exact directory in a `finally` path. Cleanup failure is an execution error and
-makes the run incomplete. An uncatchable process kill may leave an OS-temp
-directory; later runs never reuse or broadly scavenge it. No cleanup operation
-may target the consumer root, a glob, or a directory not created by the current
-invocation.
+After exact regular artifacts and writer markers are copied into immutable
+execution observations, the executor removes the exact directory in a
+`finally` path before reporting. Reporting validates only those immutable
+snapshots and never reopens a run-owned path. Cleanup failure is recorded in
+the execution observation, is an execution error, and makes the run
+incomplete. An uncatchable process kill may leave an OS-temp directory; later
+runs never reuse or broadly scavenge it. No cleanup operation may target the
+consumer root, a glob, or a directory not created by the current invocation.
 
 ## Agent Report contract
 
