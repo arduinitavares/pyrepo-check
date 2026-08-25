@@ -775,6 +775,103 @@ def test_rejected_run_directory_cleanup_failure_is_reported(
         original_rmdir(directory)
 
 
+def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_directories: list[Path] = []
+    original_mkdtemp = tempfile.mkdtemp
+    original_rmdir = pytest_execution.os.rmdir
+
+    def create_candidate(
+        *,
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+    ) -> str:
+        if not created_directories:
+            run_directory = tmp_path / "rejected-run-directory"
+            run_directory.mkdir()
+        else:
+            run_directory = Path(original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir))
+        created_directories.append(run_directory)
+        return str(run_directory)
+
+    def deny_rejected_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if Path(os.fsdecode(path)) == created_directories[0]:
+            raise PermissionError("rejected candidate cleanup denied")
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rejected_rmdir)
+
+    try:
+        with pytest.raises(
+            OSError,
+            match="cleanup failed: PermissionError: rejected candidate cleanup denied",
+        ):
+            pytest_execution._create_run_directory(tmp_path)
+    finally:
+        for directory in created_directories:
+            if directory.exists():
+                original_rmdir(directory)
+
+    assert created_directories == [tmp_path / "rejected-run-directory"]
+
+
+def test_open_run_directory_closes_descriptor_when_identity_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = tmp_path / "run-directory"
+    run_directory.mkdir()
+    record = pytest_execution._RunDirectory(
+        run_directory,
+        pytest_execution._directory_identity(run_directory),
+    )
+    opened: list[int] = []
+    closed: list[int] = []
+    original_open = pytest_execution.os.open
+    original_close = pytest_execution.os.close
+
+    def tracked_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: int,
+        **kwargs: int | None,
+    ) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def deny_fstat(_descriptor: int) -> os.stat_result:
+        raise PermissionError("directory identity denied")
+
+    def tracked_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(pytest_execution.os, "open", tracked_open)
+    monkeypatch.setattr(pytest_execution.os, "fstat", deny_fstat)
+    monkeypatch.setattr(pytest_execution.os, "close", tracked_close)
+
+    try:
+        with pytest.raises(PermissionError, match="directory identity denied"):
+            pytest_execution._open_run_directory(record)
+    finally:
+        for descriptor in opened:
+            if descriptor not in closed:
+                original_close(descriptor)
+        run_directory.rmdir()
+
+    assert len(opened) == 1
+    assert closed == opened
+
+
 def test_cleanup_does_not_delete_replaced_run_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -810,3 +907,125 @@ def test_cleanup_does_not_delete_replaced_run_directory(
     assert observation.pytest is not None
     assert observation.pytest.cleanup_error is not None
     assert "identity mismatch" in observation.pytest.cleanup_error
+
+
+def test_cleanup_does_not_traverse_replacement_after_identity_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced_directory = tmp_path / "displaced-run-directory"
+    replacement_file = run_directory / "replacement"
+    original_verify = pytest_execution._verify_directory_identity
+    replaced = False
+
+    def replace_after_verification(path: Path, identity: tuple[int, int]) -> None:
+        nonlocal replaced
+        original_verify(path, identity)
+        if path == run_directory and not replaced:
+            replaced = True
+            path.rename(displaced_directory)
+            path.mkdir()
+            replacement_file.write_text("do not delete")
+
+    monkeypatch.setattr(
+        pytest_execution,
+        "_verify_directory_identity",
+        replace_after_verification,
+    )
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output, env
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+        )
+
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+        assert replaced
+        assert replacement_file.exists()
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced_directory, ignore_errors=True)
+
+    assert observation.pytest is not None
+    assert observation.pytest.cleanup_error is not None
+    assert "identity mismatch" in observation.pytest.cleanup_error
+
+
+def test_cleanup_preserves_inner_descriptor_relative_deletion_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    original_unlink = pytest_execution.os.unlink
+    original_rmdir = pytest_execution.os.rmdir
+    descriptor_relative_failure = False
+    top_level_removals: list[Path] = []
+
+    def deny_plugin_unlink(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal descriptor_relative_failure
+        if os.fsdecode(path) == f"{PYTEST_PLUGIN_MODULE}.py":
+            descriptor_relative_failure = dir_fd is not None
+            raise PermissionError("plugin deletion denied")
+        original_unlink(path, dir_fd=dir_fd)
+
+    def track_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if dir_fd is None:
+            top_level_removals.append(Path(os.fsdecode(path)))
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "unlink", deny_plugin_unlink)
+    monkeypatch.setattr(pytest_execution.os, "rmdir", track_rmdir)
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output, env
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+        )
+
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+    finally:
+        monkeypatch.setattr(pytest_execution.os, "unlink", original_unlink)
+        monkeypatch.setattr(pytest_execution.os, "rmdir", original_rmdir)
+        shutil.rmtree(run_directory, ignore_errors=True)
+
+    assert descriptor_relative_failure
+    assert run_directory not in top_level_removals
+    assert observation.pytest is not None
+    assert observation.pytest.cleanup_error == "PermissionError: plugin deletion denied"

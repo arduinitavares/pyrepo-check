@@ -305,11 +305,15 @@ def _create_run_directory(consumer_root: Path) -> _RunDirectory:
         except OSError as error:
             cleanup_error = _remove_empty_created_run_directory(run_directory, identity)
             last_error = _with_cleanup_error(error, cleanup_error)
+            if cleanup_error is not None:
+                raise last_error
             continue
         if identity is None:
             error = OSError("created run directory identity is unavailable")
             cleanup_error = _remove_empty_created_run_directory(run_directory, identity)
             last_error = _with_cleanup_error(error, cleanup_error)
+            if cleanup_error is not None:
+                raise last_error
             continue
         return _RunDirectory(run_directory, identity)
     if last_error is not None:
@@ -402,13 +406,60 @@ def _marker_id(name: str) -> str | None:
 
 
 def _remove_run_directory(run_directory: _RunDirectory, *, consumer_root: Path) -> None:
-    resolved_run_directory = run_directory.path.resolve(strict=True)
-    if _is_within(resolved_run_directory, consumer_root.resolve()):
-        raise OSError("refusing to remove consumer root or its contents")
-    if not shutil.rmtree.avoids_symlink_attacks:
-        raise OSError("symlink-safe recursive removal is unavailable")
-    _verify_directory_identity(run_directory.path, run_directory.identity)
-    shutil.rmtree(run_directory.path)
+    descriptor = _open_run_directory(run_directory)
+    try:
+        resolved_run_directory = run_directory.path.resolve(strict=True)
+        if _is_within(resolved_run_directory, consumer_root.resolve()):
+            raise OSError("refusing to remove consumer root or its contents")
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise OSError("symlink-safe recursive removal is unavailable")
+        _verify_directory_identity(run_directory.path, run_directory.identity)
+        try:
+            shutil.rmtree(
+                ".",
+                dir_fd=descriptor,
+                onexc=_retain_open_run_directory,
+            )
+        except _RecursiveCleanupFailure as failure:
+            raise failure.error from failure
+        _verify_directory_identity(run_directory.path, run_directory.identity)
+        os.rmdir(run_directory.path)
+    finally:
+        os.close(descriptor)
+
+
+def _open_run_directory(run_directory: _RunDirectory) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    if type(no_follow) is not int or type(directory_only) is not int:
+        raise OSError("safe directory opening is unavailable")
+    descriptor = os.open(
+        run_directory.path,
+        os.O_RDONLY | no_follow | directory_only,
+    )
+    try:
+        os.set_inheritable(descriptor, False)
+        identity = _status_identity(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if identity != run_directory.identity:
+        os.close(descriptor)
+        raise OSError("run directory identity mismatch")
+    return descriptor
+
+
+def _retain_open_run_directory(
+    function: Callable[..., object],
+    path: str,
+    error: BaseException,
+) -> None:
+    if function is os.rmdir and path == "." and isinstance(error, OSError):
+        if error.errno == errno.EINVAL:
+            return
+    if isinstance(error, OSError):
+        raise _RecursiveCleanupFailure(error)
+    raise error
 
 
 def _remove_empty_created_run_directory(
@@ -429,6 +480,10 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     file_status = os.lstat(path)
     if not stat.S_ISDIR(file_status.st_mode):
         raise OSError("run directory is not a directory")
+    return _status_identity(file_status)
+
+
+def _status_identity(file_status: os.stat_result) -> tuple[int, int]:
     return file_status.st_dev, file_status.st_ino
 
 
@@ -447,6 +502,14 @@ def _with_cleanup_error(error: OSError, cleanup_error: OSError | None) -> OSErro
 
 class _UnsafePathError(OSError):
     """Raised when descriptor-safe regular-file reading is unavailable or fails."""
+
+
+class _RecursiveCleanupFailure(Exception):
+    """Carry an inner cleanup error past shutil's root-path error rewriting."""
+
+    def __init__(self, error: OSError) -> None:
+        super().__init__(str(error))
+        self.error = error
 
 
 def _read_regular_file(path: Path) -> bytes:
