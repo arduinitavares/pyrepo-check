@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -449,6 +450,46 @@ def test_coverage_json_accepts_paths_that_resolve_to_the_measured_file(
     )
 
     assert files[0].path == "src/alpha.py"
+
+
+@pytest.mark.parametrize("alias_kind", ("hardlink", "case_alias"))
+def test_coverage_json_rejects_distinct_keys_for_the_same_measured_file(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    """Different in-root names for one inode must not double-count evidence."""
+    root = _coverage_project(tmp_path)
+    document = _coverage_json_document()
+    alias = root / "src" / "zero-alias.py"
+    if alias_kind == "hardlink":
+        os.link(root / "src" / "zero.py", alias)
+    else:
+        alias = root / "src" / "ZERO.py"
+        if not alias.exists() or not os.path.samefile(alias, root / "src" / "zero.py"):
+            pytest.skip()
+
+    document["files"][str(alias.relative_to(root))] = deepcopy(
+        document["files"]["src/zero.py"]
+    )
+    document["totals"]["covered_lines"] += 1
+    document["totals"]["num_statements"] += 1
+
+    with pytest.raises(ValueError, match="duplicate measured file"):
+        validate_coverage_json(
+            _coverage_json_bytes(document),
+            project_root=root,
+            coverage_version="7.15.2",
+        )
+
+
+def test_coverage_json_rejects_a_valid_utf16_document(tmp_path: Path) -> None:
+    root = _coverage_project(tmp_path)
+
+    with pytest.raises(UnicodeDecodeError):
+        validate_coverage_json(
+            json.dumps(_coverage_json_document(), separators=(",", ":")).encode("utf-16"),
+            project_root=root,
+            coverage_version="7.15.2",
+        )
 
 
 @pytest.mark.parametrize(
@@ -982,6 +1023,50 @@ def test_coverage_result_rejects_non_threshold_json_exit(
     assert result is not None
     assert result.error is not None
     assert result.error.code == "generation_failed"
+
+
+@pytest.mark.parametrize("content", (None, b'{"meta":'))
+def test_coverage_result_ordinary_json_exit_precedes_missing_or_invalid_snapshot(
+    tmp_path: Path, content: bytes | None
+) -> None:
+    root = _coverage_project(tmp_path)
+    observation = _coverage_observation(content=content or b'{"meta":')
+    if content is None:
+        observation = replace(
+            observation,
+            artifact=replace(observation.artifact, content=None),
+        )
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        replace(observation, json_exit_code=1),
+    )
+
+    assert result is not None
+    assert result.error == CoverageError(
+        "generation_failed", "coverage JSON generation exited with code 1"
+    )
+
+
+def test_coverage_result_eligible_exit_two_still_requires_snapshot_content(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+    observation = _coverage_observation()
+    observation = replace(
+        observation,
+        artifact=replace(observation.artifact, content=None),
+        json_exit_code=2,
+    )
+
+    result = build_coverage_result(root, _plan(), _pytest_result(), observation)
+
+    assert result is not None
+    assert result.error == CoverageError(
+        "artifact_invalid", "coverage JSON snapshot has no content"
+    )
 
 
 def test_coverage_result_treats_invalid_exit_two_json_as_artifact_invalid(

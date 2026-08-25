@@ -188,6 +188,25 @@ def test_bounded_json_rejects_non_finite_constants_with_stable_diagnostic(
         artifact_safety.load_bounded_json(payload)
 
 
+@pytest.mark.parametrize("number", ("1e999", "-1e999"))
+def test_bounded_json_rejects_overflow_numbers_in_ignored_members(number: str) -> None:
+    """An overflow float must not survive in data the caller will ignore."""
+    with pytest.raises(ValueError, match="non-finite"):
+        artifact_safety.load_bounded_json(f'{{"ignored":{number}}}'.encode())
+
+
+def test_bounded_json_rejects_utf16_json() -> None:
+    """Evidence bytes are an explicitly UTF-8 boundary, not auto-detected JSON."""
+    with pytest.raises(UnicodeDecodeError):
+        artifact_safety.load_bounded_json('{"ignored":1}'.encode("utf-16"))
+
+
+def test_bounded_json_rejects_duplicate_raw_object_members() -> None:
+    """Duplicate members make the immutable evidence document ambiguous."""
+    with pytest.raises(ValueError, match="duplicate JSON object member"):
+        artifact_safety.load_bounded_json(b'{"ignored":1,"ignored":2}')
+
+
 @pytest.mark.parametrize(("size", "accepted"), ((8, True), (9, False)))
 def test_digest_regular_file_respects_exact_size_boundary(
     tmp_path: Path,

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -136,13 +137,36 @@ def load_bounded_json(content: bytes, *, max_nesting: int = _MAX_JSON_NESTING) -
         elif byte in {ord("}"), ord("]")}:
             depth -= 1
     try:
-        return json.loads(content, parse_constant=_reject_json_constant)
+        return json.loads(
+            content.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            parse_float=_reject_non_finite_number,
+            object_pairs_hook=_reject_duplicate_json_members,
+        )
     except RecursionError as error:
         raise ValueError("JSON parsing exceeded the recursion limit") from error
 
 
 def _reject_json_constant(constant: str) -> Never:
     raise ValueError(f"JSON constant {constant} is not permitted")
+
+
+def _reject_non_finite_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"JSON number {value} is non-finite")
+    return number
+
+
+def _reject_duplicate_json_members(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError(f"duplicate JSON object member {name!r} is not permitted")
+        result[name] = value
+    return result
 
 
 def digest_regular_file(

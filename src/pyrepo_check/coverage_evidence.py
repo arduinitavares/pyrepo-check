@@ -139,6 +139,7 @@ def validate_coverage_json(
 
     normalized_files: list[CoverageFile] = []
     normalized_paths: set[str] = set()
+    measured_file_identities: set[tuple[int, int]] = set()
     statement_covered = 0
     statement_missing = 0
     branch_covered = 0
@@ -146,10 +147,13 @@ def validate_coverage_json(
     for raw_path, raw_record in files.items():
         if not isinstance(raw_path, str) or not raw_path:
             raise ValueError("coverage JSON file keys must be non-empty strings")
-        normalized_path = _normalize_measured_path(raw_path, root)
+        normalized_path, identity = _normalize_measured_path(raw_path, root)
         if normalized_path in normalized_paths:
             raise ValueError("coverage JSON contains duplicate normalized file paths")
+        if identity in measured_file_identities:
+            raise ValueError("coverage JSON contains duplicate measured file identities")
         normalized_paths.add(normalized_path)
+        measured_file_identities.add(identity)
 
         record = _object(raw_record, f"coverage file {raw_path!r}")
         summary = _member_object(record, "summary", f"coverage file {raw_path!r}")
@@ -240,15 +244,6 @@ def build_coverage_result(
     if observation is None:
         raise AssertionError("validated coverage observation is unavailable")
 
-    artifact = observation.artifact
-    if artifact.content is None:
-        return _coverage_error_result(
-            configured=configured,
-            threshold_value=threshold_value,
-            coverage_version=coverage_version,
-            error=CoverageError("artifact_invalid", "coverage JSON snapshot has no content"),
-        )
-
     policy = coverage_gate_policy(plan, pytest_result, True)
     exit_code = observation.json_exit_code
     threshold_exit = exit_code == 2 and configured and policy.gate_eligible
@@ -265,6 +260,15 @@ def build_coverage_result(
                     else f"coverage JSON generation exited with code {exit_code}"
                 ),
             ),
+        )
+
+    artifact = observation.artifact
+    if artifact.content is None:
+        return _coverage_error_result(
+            configured=configured,
+            threshold_value=threshold_value,
+            coverage_version=coverage_version,
+            error=CoverageError("artifact_invalid", "coverage JSON snapshot has no content"),
         )
 
     try:
@@ -392,7 +396,7 @@ def _coverage_error_result(
     )
 
 
-def _normalize_measured_path(raw_path: str, root: Path) -> str:
+def _normalize_measured_path(raw_path: str, root: Path) -> tuple[str, tuple[int, int]]:
     try:
         candidate = Path(raw_path)
         resolved = (candidate if candidate.is_absolute() else root / candidate).resolve(
@@ -403,7 +407,11 @@ def _normalize_measured_path(raw_path: str, root: Path) -> str:
         raise ValueError(f"coverage JSON file path is invalid: {raw_path!r}") from error
     if not resolved.is_file():
         raise ValueError(f"coverage JSON file path is not a regular file: {raw_path!r}")
-    return relative.as_posix()
+    try:
+        status = resolved.stat()
+    except OSError as error:
+        raise ValueError(f"coverage JSON file path is invalid: {raw_path!r}") from error
+    return relative.as_posix(), (status.st_dev, status.st_ino)
 
 
 def _summary_counts(summary: dict[object, object], name: str) -> dict[str, int]:
