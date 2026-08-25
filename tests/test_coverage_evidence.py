@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 import json
@@ -23,6 +24,7 @@ from pyrepo_check.coverage_evidence import (
     FileStatementCoverage,
     build_coverage_result,
     coverage_gate_policy,
+    validate_coverage_result,
     validate_coverage_json,
 )
 from pyrepo_check.coverage_execution import (
@@ -774,6 +776,57 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
         "src/gamma.py",
         "src/zero.py",
     )
+    validate_coverage_result(result)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda result: replace(result, coverage_version=1),
+        lambda result: replace(result, evidence_complete=1),
+        lambda result: replace(result, gate_eligible=0),
+        lambda result: replace(result, totals=CoverageTotals(CoverageCounts(True, 5), result.totals.branches)),
+        lambda result: replace(result, totals=CoverageTotals(CoverageCounts(6, 5), result.totals.branches)),
+        lambda result: replace(result, threshold=replace(result.threshold, value=float("nan"))),
+        lambda result: replace(result, threshold=replace(result.threshold, passed=False)),
+        lambda result: replace(result, files=tuple(reversed(result.files))),
+        lambda result: replace(
+            result, files=(replace(result.files[0], path="src/../alpha.py"), *result.files[1:])
+        ),
+        lambda result: replace(
+            result,
+            files=(
+                replace(
+                    result.files[0],
+                    statements=replace(result.files[0].statements, missing_lines=(4, 2)),
+                ),
+                *result.files[1:],
+            ),
+        ),
+    ),
+    ids=(
+        "version-type",
+        "evidence-bool",
+        "eligible-bool",
+        "count-bool",
+        "totals-do-not-match-files",
+        "threshold-nan",
+        "evaluated-passed",
+        "file-order",
+        "noncanonical-path",
+        "missing-lines-order",
+    ),
+)
+def test_public_coverage_model_rejects_noncanonical_values(
+    tmp_path: Path,
+    mutate: Callable[[CoverageResult], CoverageResult],
+) -> None:
+    root = _coverage_project(tmp_path)
+    result = build_coverage_result(root, _plan(), _pytest_result(), _coverage_observation())
+    assert result is not None
+
+    with pytest.raises(ValueError):
+        validate_coverage_result(mutate(result))
 
 
 def test_coverage_result_builds_native_threshold_failure_from_exit_two(

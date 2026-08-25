@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -107,6 +108,211 @@ class CoverageGatePolicy:
     gate_eligible: bool
     skipped_reason: CoverageThresholdSkipReason | None
     force_fail_under_zero: bool
+
+
+def validate_coverage_result(result: CoverageResult) -> None:
+    """Validate the schema-v1 public coverage model at its ownership boundary."""
+    if not isinstance(result, CoverageResult):
+        raise ValueError("coverage must be a CoverageResult")
+    if result.status not in {"passed", "failed", "guidance", "error"}:
+        raise ValueError("unknown coverage status")
+    if result.scope not in {"partial", "complete"}:
+        raise ValueError("unknown coverage scope")
+    if type(result.evidence_complete) is not bool:
+        raise ValueError("coverage evidence_complete must be boolean")
+    if result.coverage_version is not None and not isinstance(result.coverage_version, str):
+        raise ValueError("coverage_version must be null or a string")
+    if type(result.gate_eligible) is not bool:
+        raise ValueError("coverage gate_eligible must be boolean")
+    _validate_coverage_threshold(result.threshold)
+    if result.totals is not None:
+        _validate_coverage_totals(result.totals)
+    if not isinstance(result.files, tuple):
+        raise ValueError("coverage files must be a tuple")
+    for file in result.files:
+        _validate_coverage_file(file)
+    if tuple(sorted(result.files, key=_coverage_file_sort_key)) != result.files:
+        raise ValueError("coverage files must use deterministic order")
+    if len({file.path for file in result.files}) != len(result.files):
+        raise ValueError("coverage file paths must be unique")
+    if result.totals is not None:
+        observed_totals = (
+            sum(file.statements.covered for file in result.files),
+            sum(file.statements.missing for file in result.files),
+            sum(file.branches.covered for file in result.files),
+            sum(file.branches.missing for file in result.files),
+        )
+        declared_totals = (
+            result.totals.statements.covered,
+            result.totals.statements.missing,
+            result.totals.branches.covered,
+            result.totals.branches.missing,
+        )
+        if observed_totals != declared_totals:
+            raise ValueError("coverage totals must equal the sum of coverage files")
+    if result.error is not None:
+        _validate_coverage_error(result.error)
+
+    threshold = result.threshold
+    if result.status == "error":
+        if (
+            result.scope != "partial"
+            or result.evidence_complete
+            or result.gate_eligible
+            or result.totals is not None
+            or result.files
+            or result.error is None
+            or threshold.evaluated
+            or threshold.passed is not None
+            or threshold.skipped_reason != "evidence_error"
+        ):
+            raise ValueError("coverage error result has inconsistent evidence")
+        return
+    if result.totals is None or result.error is not None or not result.evidence_complete:
+        raise ValueError("valid coverage result requires complete totals without an error")
+    if result.status in {"passed", "failed"}:
+        if result.scope != "complete" or not result.gate_eligible:
+            raise ValueError("gating coverage result must be complete and eligible")
+        if result.status == "passed":
+            valid_threshold = (
+                threshold.configured
+                and threshold.evaluated
+                and threshold.passed is True
+                and threshold.skipped_reason is None
+            ) or (
+                not threshold.configured
+                and not threshold.evaluated
+                and threshold.passed is None
+                and threshold.skipped_reason == "not_configured"
+            )
+            if not valid_threshold:
+                raise ValueError("passed coverage threshold is inconsistent")
+        elif (
+            not threshold.configured
+            or not threshold.evaluated
+            or threshold.passed is not False
+            or threshold.skipped_reason is not None
+        ):
+            raise ValueError("failed coverage threshold is inconsistent")
+        return
+    if result.gate_eligible or threshold.evaluated or threshold.passed is not None:
+        raise ValueError("guidance coverage cannot evaluate a threshold")
+    if threshold.skipped_reason in {None, "evidence_error", "not_configured"}:
+        raise ValueError("guidance coverage requires a non-error skip reason")
+
+
+def _validate_coverage_threshold(threshold: CoverageThreshold) -> None:
+    if not isinstance(threshold, CoverageThreshold):
+        raise ValueError("coverage threshold must be a CoverageThreshold")
+    if type(threshold.configured) is not bool or type(threshold.evaluated) is not bool:
+        raise ValueError("coverage threshold flags must be boolean")
+    if threshold.configured:
+        value = threshold.value
+        if (
+            type(value) not in {int, float}
+            or not math.isfinite(cast(int | float, value))
+        ):
+            raise ValueError("configured coverage threshold must be finite numeric")
+    elif threshold.value is not None:
+        raise ValueError("unconfigured coverage threshold must be null")
+    if threshold.evaluated:
+        if type(threshold.passed) is not bool or threshold.skipped_reason is not None:
+            raise ValueError("evaluated coverage threshold must have a boolean result")
+    elif threshold.passed is not None or threshold.skipped_reason not in {
+        "evidence_error",
+        "not_configured",
+        "focused_run",
+        "partial_run",
+        "pytest_failed",
+        "pytest_incomplete",
+        "no_tests_collected",
+    }:
+        raise ValueError("unevaluated coverage threshold must have one skip reason")
+
+
+def _validate_coverage_totals(totals: CoverageTotals) -> None:
+    if not isinstance(totals, CoverageTotals):
+        raise ValueError("coverage totals must be a CoverageTotals")
+    _validate_coverage_counts(totals.statements, "coverage statement totals")
+    _validate_coverage_counts(totals.branches, "coverage branch totals")
+
+
+def _validate_coverage_counts(counts: CoverageCounts, field: str) -> None:
+    if not isinstance(counts, CoverageCounts):
+        raise ValueError(f"{field} must be CoverageCounts")
+    for value in (counts.covered, counts.missing):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{field} counts must be non-negative integers")
+
+
+def _validate_coverage_file(file: CoverageFile) -> None:
+    if not isinstance(file, CoverageFile):
+        raise ValueError("coverage file must be a CoverageFile")
+    if (
+        not isinstance(file.path, str)
+        or not file.path
+        or file.path.startswith("./")
+        or file.path.startswith("/")
+        or "\\" in file.path
+        or any(part in {".", ".."} for part in file.path.split("/"))
+    ):
+        raise ValueError("coverage file path must be project-relative POSIX text")
+    if not isinstance(file.statements, FileStatementCoverage):
+        raise ValueError("coverage statements must be FileStatementCoverage")
+    _validate_coverage_counts(
+        CoverageCounts(file.statements.covered, file.statements.missing), "coverage statements"
+    )
+    if (
+        not isinstance(file.statements.missing_lines, tuple)
+        or any(type(line) is not int or line <= 0 for line in file.statements.missing_lines)
+        or tuple(sorted(file.statements.missing_lines)) != file.statements.missing_lines
+        or len(set(file.statements.missing_lines)) != len(file.statements.missing_lines)
+        or len(file.statements.missing_lines) != file.statements.missing
+    ):
+        raise ValueError("coverage missing lines must be unique positive ordered integers")
+    if not isinstance(file.branches, FileBranchCoverage):
+        raise ValueError("coverage branches must be FileBranchCoverage")
+    _validate_coverage_counts(
+        CoverageCounts(file.branches.covered, file.branches.missing), "coverage branches"
+    )
+    arcs = file.branches.missing_arcs
+    if (
+        not isinstance(arcs, tuple)
+        or any(
+            not isinstance(arc, tuple)
+            or len(arc) != 2
+            or any(type(endpoint) is not int or endpoint == 0 for endpoint in arc)
+            for arc in arcs
+        )
+        or tuple(sorted(arcs)) != arcs
+        or len(set(arcs)) != len(arcs)
+        or len(arcs) != file.branches.missing
+    ):
+        raise ValueError("coverage missing arcs must be unique ordered integer pairs")
+
+
+def _coverage_file_sort_key(file: CoverageFile) -> tuple[int, str]:
+    return (-(file.statements.missing + file.branches.missing), file.path)
+
+
+def _validate_coverage_error(error: CoverageError) -> None:
+    if not isinstance(error, CoverageError):
+        raise ValueError("coverage error must be a CoverageError")
+    if error.code not in {
+        "unsupported_python",
+        "module_unavailable",
+        "unsupported_version",
+        "preflight_invalid",
+        "spawn_failed",
+        "terminated_by_signal",
+        "unsupported_parallelism",
+        "data_missing",
+        "unexpected_parallel_data",
+        "generation_failed",
+        "artifact_missing",
+        "artifact_invalid",
+    } or not isinstance(error.message, str):
+        raise ValueError("invalid coverage error")
 
 
 def validate_coverage_json(

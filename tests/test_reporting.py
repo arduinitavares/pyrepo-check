@@ -20,6 +20,7 @@ from pyrepo_check.execution import (
 )
 from pyrepo_check.planning import (
     CheckName,
+    CoverageExecutionPlan,
     OutputFormat,
     PlannedCheck,
     PlannedTestScope,
@@ -32,6 +33,22 @@ from pyrepo_check.pytest_execution import (
     PytestExecutionObservation,
     PytestPreflightObservation,
     PytestPreflightRecord,
+)
+from pyrepo_check.coverage_execution import (
+    CoverageArtifactObservation,
+    CoverageExecutionObservation,
+    CoveragePreflightObservation,
+    CoveragePreflightRecord,
+)
+from pyrepo_check.coverage_evidence import (
+    CoverageCounts,
+    CoverageError,
+    CoverageFile,
+    CoverageResult,
+    CoverageThreshold,
+    CoverageTotals,
+    FileBranchCoverage,
+    FileStatementCoverage,
 )
 from pyrepo_check.pytest_evidence import (
     CollectionIssue,
@@ -49,6 +66,7 @@ from pyrepo_check.reporting import (
     CheckResult,
     PlanningError,
     PlanningErrorReportV1,
+    PlannedCoverageScope,
     ProcessResult,
     ReportingError,
     RunReportV1,
@@ -119,6 +137,7 @@ def run_plan(
     test_shortcut: str | None = None,
     pytest_args: tuple[str, ...] | None = None,
     planned_test_scope: PlannedTestScope | None = None,
+    planned_coverage_scope: PlannedCoverageScope = "not_requested",
 ) -> RunPlan:
     pytest_selected = any(check.name == "pytest" for check in checks)
     if pytest_args is None:
@@ -135,7 +154,264 @@ def run_plan(
         test_shortcut=test_shortcut,
         pytest_args=pytest_args,
         planned_test_scope=planned_test_scope,
+        planned_coverage_scope=planned_coverage_scope,
     )
+
+
+def coverage_result() -> CoverageResult:
+    return CoverageResult(
+        status="passed",
+        scope="complete",
+        evidence_complete=True,
+        coverage_version="7.15.2",
+        gate_eligible=True,
+        threshold=CoverageThreshold(True, 90, True, True, None),
+        totals=CoverageTotals(CoverageCounts(4, 1), CoverageCounts(1, 1)),
+        files=(
+            CoverageFile(
+                "src/example.py",
+                FileStatementCoverage(4, 1, (7,)),
+                FileBranchCoverage(1, 1, ((7, 8),)),
+            ),
+        ),
+        error=None,
+    )
+
+
+def coverage_execution_observation(content: bytes) -> CoverageExecutionObservation:
+    return CoverageExecutionObservation(
+        preflight=CoveragePreflightObservation(
+            "supported", CoveragePreflightRecord((3, 13, 15), True, "7.15.2"), None
+        ),
+        artifact=CoverageArtifactObservation("snapshot", content, None),
+        json_exit_code=0,
+    )
+
+
+def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src" / "example.py"
+    source.parent.mkdir()
+    source.write_text("one = 1\ntwo = 2\n")
+    check = pytest_planned_check(tmp_path)
+    assert check.pytest is not None
+    coverage_plan = CoverageExecutionPlan(
+        check.pytest.consumer_python, tmp_path / "pyproject.toml", 90
+    )
+    check = replace(check, pytest=replace(check.pytest, coverage=coverage_plan))
+    coverage_json = {
+        "meta": {"format": 3, "version": "7.15.2", "branch_coverage": True},
+        "files": {
+            str(source): {
+                "summary": {
+                    "covered_lines": 4,
+                    "missing_lines": 1,
+                    "num_statements": 5,
+                    "covered_branches": 1,
+                    "missing_branches": 1,
+                    "num_branches": 2,
+                },
+                "missing_lines": [7],
+                "missing_branches": [[7, 8]],
+            }
+        },
+        "totals": {
+            "covered_lines": 4,
+            "missing_lines": 1,
+            "num_statements": 5,
+            "covered_branches": 1,
+            "missing_branches": 1,
+            "num_branches": 2,
+        },
+    }
+    primary_observation = executed_check(check, 0)
+    coverage_preflight_process = ExecutedProcess(
+        role="coverage_preflight",
+        command=("coverage", "preflight"),
+        cwd=tmp_path,
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+    coverage_json_process = ExecutedProcess(
+        role="coverage_json",
+        command=("coverage", "json"),
+        cwd=tmp_path,
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan(
+            (check,),
+            mode="strict_aggregate",
+            planned_coverage_scope="complete",
+        ),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(
+                        primary_observation.processes[0],
+                        coverage_preflight_process,
+                        primary_observation.processes[1],
+                        coverage_json_process,
+                    ),
+                    pytest=primary_observation.pytest,
+                    coverage=coverage_execution_observation(
+                        reporting.json.dumps(coverage_json).encode()
+                    ),
+                ),
+            ),
+            0,
+        ),
+    )
+
+    assert report.coverage == coverage_result()
+    assert tuple(report.selection.__dataclass_fields__) == (
+        "checks",
+        "targets",
+        "test_shortcut",
+        "pytest_args",
+        "planned_test_scope",
+        "planned_coverage_scope",
+    )
+    assert tuple(report.__dataclass_fields__) == (
+        "schema_version",
+        "kind",
+        "project_root",
+        "mode",
+        "overall_status",
+        "complete",
+        "selection",
+        "checks",
+        "pytest",
+        "coverage",
+        "advisories",
+    )
+    assert render_terminal(report) == (
+        "\n==> pyrepo-check summary: passed (complete)\n"
+        "    coverage: src/example.py (80.00% lines, 50.00% branches)\n"
+        "    coverage: missing lines: 7\n"
+        "    coverage: missing branches: 7->8\n"
+        "    passed: pytest\n"
+    )
+    payload = reporting.json.loads(serialize_json(report))
+    assert list(payload["coverage"]) == [
+        "status",
+        "scope",
+        "evidence_complete",
+        "coverage_version",
+        "gate_eligible",
+        "threshold",
+        "totals",
+        "files",
+        "error",
+    ]
+    assert payload["coverage"]["files"][0]["branches"]["missing_arcs"] == [[7, 8]]
+    assert report.coverage is not None
+    threshold_failure = replace(
+        report.coverage,
+        status="failed",
+        threshold=replace(report.coverage.threshold, passed=False),
+    )
+    threshold_process = replace(report.checks[0].processes[-1], exit_code=2)
+    threshold_check = replace(
+        report.checks[0], processes=(*report.checks[0].processes[:-1], threshold_process)
+    )
+    threshold_report = replace(
+        report,
+        overall_status="failed",
+        checks=(threshold_check,),
+        coverage=threshold_failure,
+    )
+
+    assert threshold_report.checks[0].status == "passed"
+    assert validate_report_v1(threshold_report) is None
+    assert select_exit_code(threshold_report) == 2
+
+
+def test_unavailable_coverage_is_null_and_adds_its_exact_advisory(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="unavailable"),
+        ExecutionResult((executed_check(check, 0),), 0),
+    )
+
+    assert report.coverage is None
+    assert report.advisories == (
+        Advisory(
+            "coverage_not_configured",
+            "Coverage guidance is unavailable because native Coverage.py configuration is absent.",
+            None,
+        ),
+    )
+    assert validate_report_v1(report) is None
+
+
+def test_coverage_preflight_failure_owns_the_pytest_check_before_primary(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    assert check.pytest is not None
+    check = replace(
+        check,
+        pytest=replace(
+            check.pytest,
+            coverage=CoverageExecutionPlan(
+                check.pytest.consumer_python, tmp_path / "pyproject.toml", 90
+            ),
+        ),
+    )
+    pytest_preflight = pytest_preflight_process(check)
+    coverage_preflight = ExecutedProcess(
+        role="coverage_preflight",
+        command=("coverage", "preflight"),
+        cwd=tmp_path,
+        returncode=1,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"missing", 0),
+        spawn_error=None,
+    )
+    coverage = CoverageExecutionObservation(
+        CoveragePreflightObservation("preflight_invalid", None, "coverage probe failed"),
+        CoverageArtifactObservation("not_attempted", None, None),
+    )
+    pytest_observation = PytestExecutionObservation(
+        PytestPreflightObservation(
+            "supported", PytestPreflightRecord((3, 13, 15), True, (8, 4, 2)), None
+        ),
+        PytestArtifactObservation("not_attempted", None, (), None),
+        None,
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="complete"),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    check,
+                    (pytest_preflight, coverage_preflight),
+                    pytest_observation,
+                    coverage,
+                ),
+            ),
+            1,
+        ),
+    )
+
+    assert report.checks[0].error == CheckError(
+        "coverage_preflight_failed", "coverage probe failed"
+    )
+    assert report.coverage is not None
+    assert report.coverage.error == CoverageError("preflight_invalid", "coverage probe failed")
+    assert validate_report_v1(report) is None
 
 
 def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> None:

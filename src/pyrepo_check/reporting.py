@@ -7,6 +7,12 @@ import re
 from typing import Literal, cast
 
 from pyrepo_check.config import TEST_SHORTCUT_NAME_PATTERN
+from pyrepo_check.coverage_evidence import (
+    CoverageCounts,
+    CoverageResult,
+    build_coverage_result,
+    validate_coverage_result,
+)
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
@@ -235,7 +241,7 @@ class RunReportV1:
     selection: Selection
     checks: tuple[CheckResult, ...]
     pytest: PytestResult | None
-    coverage: None
+    coverage: CoverageResult | None
     advisories: tuple[Advisory, ...]
 
 
@@ -276,6 +282,7 @@ def build_run_report(
         if any(planned.name == "pytest" for planned in plan.checks)
         else None
     )
+    coverage = _build_coverage_result(project_root, plan, pytest_result, pytest_observation)
     checks = tuple(
         _build_check_result(
             planned,
@@ -287,12 +294,17 @@ def build_run_report(
     )
     statuses = {check.status for check in checks}
     if (
-        not _run_complete(checks, pytest_result)
+        not _run_complete(checks, pytest_result, coverage)
         or "error" in statuses
         or (pytest_result is not None and pytest_result.status == "error")
+        or (coverage is not None and coverage.status == "error")
     ):
         overall_status: OverallStatus = "error"
-    elif "failed" in statuses or (pytest_result is not None and pytest_result.status == "failed"):
+    elif (
+        "failed" in statuses
+        or (pytest_result is not None and pytest_result.status == "failed")
+        or (coverage is not None and coverage.status == "failed")
+    ):
         overall_status = "failed"
     else:
         overall_status = "passed"
@@ -303,19 +315,19 @@ def build_run_report(
         project_root=str(project_root.resolve()),
         mode=plan.mode,
         overall_status=overall_status,
-        complete=_run_complete(checks, pytest_result),
+        complete=_run_complete(checks, pytest_result, coverage),
         selection=Selection(
             checks=tuple(check.name for check in plan.checks),
             targets=plan.targets,
             test_shortcut=plan.test_shortcut,
             pytest_args=plan.pytest_args,
             planned_test_scope=plan.planned_test_scope,
-            planned_coverage_scope="not_requested",
+            planned_coverage_scope=plan.planned_coverage_scope,
         ),
         checks=checks,
         pytest=pytest_result,
-        coverage=None,
-        advisories=_build_advisories(checks, pytest_result),
+        coverage=coverage,
+        advisories=_build_advisories(checks, pytest_result, coverage, plan.planned_coverage_scope),
     )
 
 
@@ -352,6 +364,11 @@ def render_terminal(report: AgentReportV1) -> str:
             lines.append("    error: pytest evidence is incomplete.")
         else:
             lines.append(f"    error: pytest evidence: {report.pytest.error.message}")
+    if report.coverage is not None and report.coverage.status == "error":
+        if report.coverage.error is None:
+            lines.append("    error: coverage evidence is incomplete.")
+        else:
+            lines.append(f"    error: coverage evidence: {report.coverage.error.message}")
     for check in report.checks:
         if check.status != "error":
             continue
@@ -370,6 +387,10 @@ def render_terminal(report: AgentReportV1) -> str:
         and (pytest_check is None or pytest_check.status != "failed")
     ):
         _append_failed_line(lines, "pytest", report.pytest.exit_code)
+    if report.coverage is not None and report.coverage.status == "failed":
+        _append_failed_line(lines, "coverage", None)
+    if report.coverage is not None and report.coverage.totals is not None:
+        _append_coverage_gaps(lines, report.coverage)
     if report.pytest is not None and report.pytest.evidence is not None:
         for outcome in report.pytest.evidence.special_outcomes:
             reason = f" ({outcome.reason})" if outcome.reason else ""
@@ -389,6 +410,31 @@ def _append_failed_line(lines: list[str], name: str, exit_code: int | None) -> N
         lines.append(f"    failed: {name}")
     else:
         lines.append(f"    failed: {name} (exit {exit_code})")
+
+
+def _append_coverage_gaps(lines: list[str], coverage: CoverageResult) -> None:
+    for file in coverage.files:
+        line_percentage = _coverage_percentage(file.statements.covered, file.statements.missing)
+        branch_percentage = _coverage_percentage(file.branches.covered, file.branches.missing)
+        lines.append(
+            f"    coverage: {file.path} ({line_percentage} lines, {branch_percentage} branches)"
+        )
+        if file.statements.missing_lines:
+            lines.append(
+                "    coverage: missing lines: "
+                + ", ".join(str(line) for line in file.statements.missing_lines)
+            )
+        if file.branches.missing_arcs:
+            lines.append(
+                "    coverage: missing branches: "
+                + ", ".join(f"{source}->{destination}" for source, destination in file.branches.missing_arcs)
+            )
+
+
+def _coverage_percentage(covered: int, missing: int) -> str:
+    total = covered + missing
+    percentage = 100.0 if total == 0 else covered * 100 / total
+    return f"{percentage:.2f}%"
 
 
 def _is_duplicate_pytest_result_error(
@@ -464,7 +510,7 @@ def _report_payload(report: AgentReportV1) -> dict[str, object]:
         "selection": _selection_payload(report.selection),
         "checks": [_check_result_payload(check) for check in report.checks],
         "pytest": _pytest_result_payload(report.pytest),
-        "coverage": report.coverage,
+        "coverage": _coverage_result_payload(report.coverage),
         "advisories": [_advisory_payload(advisory) for advisory in report.advisories],
     }
 
@@ -591,6 +637,56 @@ def _pytest_error_payload(error: PytestError | None) -> dict[str, object] | None
     return {"code": error.code, "message": error.message}
 
 
+def _coverage_result_payload(result: CoverageResult | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    return {
+        "status": result.status,
+        "scope": result.scope,
+        "evidence_complete": result.evidence_complete,
+        "coverage_version": result.coverage_version,
+        "gate_eligible": result.gate_eligible,
+        "threshold": {
+            "configured": result.threshold.configured,
+            "value": result.threshold.value,
+            "evaluated": result.threshold.evaluated,
+            "passed": result.threshold.passed,
+            "skipped_reason": result.threshold.skipped_reason,
+        },
+        "totals": (
+            None
+            if result.totals is None
+            else {
+                "statements": _coverage_counts_payload(result.totals.statements),
+                "branches": _coverage_counts_payload(result.totals.branches),
+            }
+        ),
+        "files": [
+            {
+                "path": file.path,
+                "statements": {
+                    "covered": file.statements.covered,
+                    "missing": file.statements.missing,
+                    "missing_lines": list(file.statements.missing_lines),
+                },
+                "branches": {
+                    "covered": file.branches.covered,
+                    "missing": file.branches.missing,
+                    "missing_arcs": [list(arc) for arc in file.branches.missing_arcs],
+                },
+            }
+            for file in result.files
+        ],
+        "error": (
+            None if result.error is None else {"code": result.error.code, "message": result.error.message}
+        ),
+    }
+
+
+def _coverage_counts_payload(counts: CoverageCounts) -> dict[str, object]:
+    return {"covered": counts.covered, "missing": counts.missing}
+
+
 def _first_positive_exit_code(processes: tuple[ProcessResult, ...]) -> int | None:
     for process in processes:
         if process.exit_code is not None and process.exit_code > 0:
@@ -628,9 +724,6 @@ def _validate_run_report(report: RunReportV1) -> None:
         _invalid("project_root must be a string")
     if not Path(report.project_root).is_absolute():
         _invalid("project_root must be absolute")
-    if report.coverage is not None:
-        _invalid("coverage must be null before coverage execution")
-
     pytest_selected = _validate_selection(report.selection)
     selection = report.selection
     if not isinstance(report.checks, tuple):
@@ -647,19 +740,30 @@ def _validate_run_report(report: RunReportV1) -> None:
         _validate_pytest_result(report.pytest, selection)
 
     statuses = {
-        _validate_check_result(check, report.pytest if check.name == "pytest" else None)
+        _validate_check_result(
+            check,
+            report.pytest if check.name == "pytest" else None,
+            selection=selection,
+            coverage=report.coverage if check.name == "pytest" else None,
+        )
         for check in report.checks
     }
-    _validate_advisories(report.advisories, report.checks, report.pytest)
+    _validate_coverage_projection(selection, report.coverage)
+    _validate_advisories(report.advisories, report.checks, report.pytest, report.coverage, selection)
 
-    expected_complete = _run_complete(report.checks, report.pytest)
+    expected_complete = _run_complete(report.checks, report.pytest, report.coverage)
     if (
         not expected_complete
         or "error" in statuses
         or (report.pytest is not None and report.pytest.status == "error")
+        or (report.coverage is not None and report.coverage.status == "error")
     ):
         expected_status: OverallStatus = "error"
-    elif "failed" in statuses or (report.pytest is not None and report.pytest.status == "failed"):
+    elif (
+        "failed" in statuses
+        or (report.pytest is not None and report.pytest.status == "failed")
+        or (report.coverage is not None and report.coverage.status == "failed")
+    ):
         expected_status = "failed"
     else:
         expected_status = "passed"
@@ -701,9 +805,6 @@ def _validate_selection(selection: Selection) -> bool:
         _invalid("unknown planned test scope")
     if selection.planned_coverage_scope not in _PLANNED_COVERAGE_SCOPES:
         _invalid("unknown planned coverage scope")
-    if selection.planned_coverage_scope != "not_requested":
-        _invalid("planned_coverage_scope must be not_requested before coverage planning")
-
     pytest_selected = "pytest" in selection.checks
     if not pytest_selected:
         if selection.test_shortcut is not None:
@@ -712,6 +813,8 @@ def _validate_selection(selection: Selection) -> bool:
             _invalid("pytest_args must be null when pytest is not selected")
         if selection.planned_test_scope != "not_selected":
             _invalid("planned_test_scope must be not_selected when pytest is not selected")
+        if selection.planned_coverage_scope != "not_requested":
+            _invalid("planned coverage requires pytest selection")
     elif selection.test_shortcut is not None:
         if selection.checks != ("pytest",):
             _invalid("test_shortcut requires a pytest-only selection")
@@ -730,7 +833,26 @@ def _validate_selection(selection: Selection) -> bool:
     return pytest_selected
 
 
-def _validate_check_result(check: CheckResult, pytest_result: PytestResult | None) -> CheckStatus:
+def _validate_coverage_projection(
+    selection: Selection, coverage: CoverageResult | None
+) -> None:
+    expected_null = selection.planned_coverage_scope in {"not_requested", "unavailable"}
+    if (coverage is None) != expected_null:
+        _invalid("coverage nullability contradicts planned coverage scope")
+    if coverage is not None:
+        try:
+            validate_coverage_result(coverage)
+        except ValueError as error:
+            _invalid(f"invalid coverage result: {error}")
+
+
+def _validate_check_result(
+    check: CheckResult,
+    pytest_result: PytestResult | None,
+    *,
+    selection: Selection,
+    coverage: CoverageResult | None,
+) -> CheckStatus:
     if not isinstance(check, CheckResult):
         _invalid("check must be a CheckResult")
     if check.name not in _CHECK_NAMES:
@@ -741,7 +863,7 @@ def _validate_check_result(check: CheckResult, pytest_result: PytestResult | Non
         _invalid("check processes must be a tuple")
     _validate_check_error(check.error)
     if check.name == "pytest":
-        return _validate_pytest_check_result(check, pytest_result)
+        return _validate_pytest_check_result(check, pytest_result, selection, coverage)
     if not check.processes:
         if (
             check.status != "error"
@@ -778,21 +900,26 @@ def _validate_check_result(check: CheckResult, pytest_result: PytestResult | Non
     return expected_status
 
 
-def _validate_pytest_check_result(check: CheckResult, result: PytestResult | None) -> CheckStatus:
+def _validate_pytest_check_result(
+    check: CheckResult,
+    result: PytestResult | None,
+    selection: Selection,
+    coverage: CoverageResult | None,
+) -> CheckStatus:
     if result is None:
         _invalid("pytest check requires a pytest result")
         return check.status
     processes = check.processes
-    if len(processes) > 2:
-        _invalid("pytest processes must be preflight then optional primary")
     for process in processes:
         _validate_process_result(process)
     preflight = processes[0] if processes else None
-    primary = processes[1] if len(processes) == 2 else None
+    coverage_preflight = next(
+        (process for process in processes if process.role == "coverage_preflight"), None
+    )
+    primary = next((process for process in processes if process.role == "primary"), None)
     if preflight is not None and preflight.role != "pytest_preflight":
         _invalid("pytest processes must start with pytest_preflight")
-    if primary is not None and primary.role != "primary":
-        _invalid("pytest processes must be preflight then optional primary")
+    _validate_pytest_process_order(processes, coverage_planned=coverage is not None)
     _validate_pytest_execution_shape(result, preflight, primary)
 
     if check.error is not None and check.error.code == "cleanup_failed":
@@ -800,12 +927,45 @@ def _validate_pytest_check_result(check: CheckResult, result: PytestResult | Non
             _invalid("cleanup failure requires pytest check error")
         return "error"
     expected_error = _expected_pytest_check_error(result)
+    if (
+        selection.planned_coverage_scope in {"partial", "complete"}
+        and primary is None
+        and coverage_preflight is not None
+        and (
+            coverage_preflight.outcome != "exited"
+            or coverage_preflight.exit_code != 0
+        )
+    ):
+        expected_error = "coverage_preflight_failed"
     if expected_error is None:
         if check.status != result.status or check.error is not None:
             _invalid("pytest check must match successful pytest evidence")
     elif check.status != "error" or check.error is None or check.error.code != expected_error:
         _invalid("pytest check error contradicts pytest evidence")
     return check.status
+
+
+def _validate_pytest_process_order(
+    processes: tuple[ProcessResult, ...], *, coverage_planned: bool
+) -> None:
+    roles = tuple(process.role for process in processes)
+    allowed = (
+        {
+            (),
+            ("pytest_preflight",),
+            ("pytest_preflight", "primary"),
+        }
+        if not coverage_planned
+        else {
+            (),
+            ("pytest_preflight",),
+            ("pytest_preflight", "coverage_preflight"),
+            ("pytest_preflight", "coverage_preflight", "primary"),
+            ("pytest_preflight", "coverage_preflight", "primary", "coverage_json"),
+        }
+    )
+    if roles not in allowed:
+        _invalid("pytest processes use an invalid attempted-command order")
 
 
 def _expected_pytest_check_error(result: PytestResult) -> CheckErrorCode | None:
@@ -1248,6 +1408,8 @@ def _validate_advisories(
     advisories: tuple[Advisory, ...],
     checks: tuple[CheckResult, ...],
     pytest_result: PytestResult | None,
+    coverage: CoverageResult | None,
+    selection: Selection,
 ) -> None:
     if not isinstance(advisories, tuple):
         _invalid("advisories must be a tuple")
@@ -1265,7 +1427,9 @@ def _validate_advisories(
         _invalid("advisories must be unique by code and message")
     if tuple(sorted(advisories, key=lambda item: (item.code, item.message))) != advisories:
         _invalid("advisories must use code then message order")
-    if advisories != _build_advisories(checks, pytest_result):
+    if advisories != _build_advisories(
+        checks, pytest_result, coverage, selection.planned_coverage_scope
+    ):
         _invalid("advisories must exactly match report evidence")
 
 
@@ -1316,14 +1480,21 @@ def strip_terminal_sequences(text: str) -> str:
         cursor = terminator_start + (1 if terminator_start == bel_end else 2)
 
 
-def _run_complete(checks: tuple[CheckResult, ...], pytest_result: PytestResult | None) -> bool:
+def _run_complete(
+    checks: tuple[CheckResult, ...],
+    pytest_result: PytestResult | None,
+    coverage: CoverageResult | None,
+) -> bool:
     return all(check.status != "error" for check in checks) and (
         pytest_result is None or pytest_result.complete
-    )
+    ) and (coverage is None or coverage.evidence_complete)
 
 
 def _build_advisories(
-    checks: tuple[CheckResult, ...], pytest_result: PytestResult | None
+    checks: tuple[CheckResult, ...],
+    pytest_result: PytestResult | None,
+    coverage: CoverageResult | None = None,
+    planned_coverage_scope: PlannedCoverageScope = "not_requested",
 ) -> tuple[Advisory, ...]:
     advisories: list[Advisory] = []
     for check in checks:
@@ -1355,6 +1526,22 @@ def _build_advisories(
                         hint=None,
                     )
                 )
+    if planned_coverage_scope == "unavailable":
+        advisories.append(
+            Advisory(
+                "coverage_not_configured",
+                "Coverage guidance is unavailable because native Coverage.py configuration is absent.",
+                None,
+            )
+        )
+    if coverage is not None and coverage.threshold.configured and not coverage.threshold.evaluated:
+        advisories.append(
+            Advisory(
+                "coverage_threshold_not_applied",
+                "Configured coverage threshold was not applied to this run.",
+                None,
+            )
+        )
     unique = {(advisory.code, advisory.message): advisory for advisory in advisories}
     return tuple(sorted(unique.values(), key=lambda advisory: (advisory.code, advisory.message)))
 
@@ -1457,11 +1644,34 @@ def _project_pytest_processes(observation: ExecutedCheck) -> tuple[ExecutedProce
         raise ReportingError("pytest execution process order must start with preflight")
     if processes[0].role != "pytest_preflight":
         raise ReportingError("pytest execution process order must start with preflight")
-    if len(processes) == 1:
+    roles = tuple(process.role for process in processes)
+    if roles in {
+        ("pytest_preflight",),
+        ("pytest_preflight", "primary"),
+        ("pytest_preflight", "coverage_preflight"),
+        ("pytest_preflight", "coverage_preflight", "primary"),
+        ("pytest_preflight", "coverage_preflight", "primary", "coverage_json"),
+    }:
         return processes
-    if len(processes) == 2 and processes[1].role == "primary":
-        return processes
-    raise ReportingError("pytest execution process order must be preflight then primary")
+    raise ReportingError("pytest execution process order is invalid")
+
+
+def _build_coverage_result(
+    project_root: Path,
+    plan: RunPlan,
+    pytest_result: PytestResult | None,
+    observation: ExecutedCheck | None,
+) -> CoverageResult | None:
+    if plan.planned_coverage_scope in {"not_requested", "unavailable"}:
+        return None
+    if pytest_result is None:
+        raise ReportingError("planned coverage requires pytest selection")
+    return build_coverage_result(
+        project_root.resolve(),
+        plan,
+        pytest_result,
+        observation.coverage if observation is not None else None,
+    )
 
 
 def _build_pytest_result(plan: RunPlan, observation: ExecutedCheck | None) -> PytestResult:
@@ -1494,6 +1704,15 @@ def _pytest_check_error(
     )
     if cleanup_error is not None:
         return CheckError("cleanup_failed", f"Could not clean up pytest evidence: {cleanup_error}")
+    if _coverage_preflight_prevented_primary(observation):
+        if observation is None or observation.coverage is None:
+            raise AssertionError("coverage preflight observation is unavailable")
+        coverage = observation.coverage
+        return CheckError(
+            "coverage_preflight_failed",
+            coverage.preflight.diagnostic
+            or f"coverage preflight: {coverage.preflight.classification}",
+        )
     if result.error is None:
         return None
     if result.status != "error":
@@ -1517,6 +1736,14 @@ def _pytest_check_error(
     }:
         return CheckError("pytest_preflight_failed", result.error.message)
     return CheckError("pytest_evidence_error", result.error.message)
+
+
+def _coverage_preflight_prevented_primary(observation: ExecutedCheck | None) -> bool:
+    if observation is None or observation.coverage is None:
+        return False
+    if any(process.role == "primary" for process in observation.processes):
+        return False
+    return observation.coverage.preflight.classification != "supported"
 
 
 def _build_process_result(
