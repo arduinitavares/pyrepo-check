@@ -95,75 +95,6 @@ def test_cleanup_budget_accepts_exact_boundaries_and_rejects_one_over() -> None:
     assert deadline_error.value.message == "cleanup duration limit exceeded (5000000000 ns)"
 
 
-@pytest.mark.parametrize(
-    ("limit", "filename"),
-    (
-        (128 * 1024 * 1024, "artifact.json"),
-        (4 * 1024, "pytest-writer-one.json"),
-    ),
-    ids=("artifact", "writer-marker"),
-)
-def test_secure_regular_file_reader_accepts_exact_cap_and_rejects_one_over(
-    tmp_path: Path,
-    limit: int,
-    filename: str,
-) -> None:
-    exact = tmp_path / filename
-    with exact.open("wb") as file:
-        file.truncate(limit)
-    assert len(pytest_execution._read_regular_file(exact, max_bytes=limit)) == limit
-
-    oversized = tmp_path / f"oversized-{filename}"
-    with oversized.open("wb") as file:
-        file.truncate(limit + 1)
-    with pytest.raises(pytest_execution._BoundedReadError, match="exceeds"):
-        pytest_execution._read_regular_file(oversized, max_bytes=limit)
-
-
-def test_sparse_oversized_file_is_rejected_before_any_read(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    artifact = tmp_path / "artifact.json"
-    with artifact.open("wb") as file:
-        file.truncate(pytest_execution._MAX_ARTIFACT_BYTES + 1)
-
-    def forbidden_read(_descriptor: int, _size: int) -> bytes:
-        raise AssertionError("oversized sparse file must not be read")
-
-    monkeypatch.setattr(pytest_execution.os, "read", forbidden_read)
-    with pytest.raises(pytest_execution._BoundedReadError, match="exceeds"):
-        pytest_execution._read_regular_file(
-            artifact,
-            max_bytes=pytest_execution._MAX_ARTIFACT_BYTES,
-        )
-
-
-def test_regular_file_growth_after_fstat_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    marker = tmp_path / "marker.json"
-    marker.write_bytes(b"x" * pytest_execution._MAX_WRITER_MARKER_BYTES)
-    original_read = pytest_execution.os.read
-    grown = False
-
-    def grow_before_first_read(descriptor: int, size: int) -> bytes:
-        nonlocal grown
-        if not grown:
-            grown = True
-            with marker.open("ab") as file:
-                file.write(b"!")
-        return original_read(descriptor, size)
-
-    monkeypatch.setattr(pytest_execution.os, "read", grow_before_first_read)
-    with pytest.raises(pytest_execution._BoundedReadError, match="exceeds"):
-        pytest_execution._read_regular_file(
-            marker,
-            max_bytes=pytest_execution._MAX_WRITER_MARKER_BYTES,
-        )
-
-
 def test_fifo_artifact_is_rejected_promptly_with_exact_diagnostic(tmp_path: Path) -> None:
     artifact = tmp_path / "artifact.json"
     _MKFIFO(artifact)
@@ -194,50 +125,6 @@ def test_fifo_writer_marker_is_rejected_promptly_with_exact_diagnostic(
         "writer marker is malformed: pytest-writer-blocked.json: "
         "path is not a regular file: pytest-writer-blocked.json"
     )
-
-
-@pytest.mark.parametrize(
-    ("payload", "accepted"),
-    (
-        (b"[" * 64 + b"0" + b"]" * 64, True),
-        (b"[" * 65 + b"0" + b"]" * 65, False),
-        (b'{"value":"[[[\\\"{[]}\\\"]]]"}', True),
-    ),
-    ids=("depth-64", "depth-65", "braces-and-escapes-in-string"),
-)
-def test_json_nesting_limit_respects_strings_and_escapes(
-    payload: bytes,
-    accepted: bool,
-) -> None:
-    if accepted:
-        pytest_execution._load_bounded_json(payload)
-    else:
-        with pytest.raises(ValueError, match="nesting"):
-            pytest_execution._load_bounded_json(payload)
-
-
-def test_bounded_json_converts_recursion_error_to_invalid_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def recurse(_payload: bytes, **_kwargs: object) -> object:
-        raise RecursionError("too deep")
-
-    monkeypatch.setattr(pytest_execution.json, "loads", recurse)
-    with pytest.raises(ValueError, match="recursion"):
-        pytest_execution._load_bounded_json(b"{}")
-
-
-@pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))
-def test_bounded_json_rejects_non_finite_constants_with_stable_diagnostic(
-    constant: str,
-) -> None:
-    payload = f'{{"ignored":{constant}}}'.encode()
-
-    with pytest.raises(
-        ValueError,
-        match=rf"^JSON constant {constant} is not permitted$",
-    ):
-        pytest_execution._load_bounded_json(payload)
 
 
 @pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))

@@ -14,8 +14,16 @@ import sys
 import tempfile
 import time
 from types import MappingProxyType, ModuleType
-from typing import Literal, Never, Protocol, cast
+from typing import Literal, Protocol, cast
 
+from pyrepo_check.artifact_safety import (
+    _BoundedReadError,
+    _MAX_JSON_NESTING as _ARTIFACT_MAX_JSON_NESTING,
+    _READ_CHUNK_BYTES,
+    _UnsafePathError,
+    read_regular_file as _read_regular_file,
+    load_bounded_json as _load_bounded_json,
+)
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
@@ -34,9 +42,8 @@ else:
 
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 _MAX_WRITER_MARKER_BYTES = 4 * 1024
-_MAX_JSON_NESTING = 64
+_MAX_JSON_NESTING = _ARTIFACT_MAX_JSON_NESTING
 _MAX_WRITER_DIRECTORY_ENTRIES = 1024
-_READ_CHUNK_BYTES = 64 * 1024
 _MAX_CLEANUP_ENTRIES = 4096
 _MAX_CLEANUP_DEPTH = 64
 _MAX_CLEANUP_DURATION_NS = 5_000_000_000
@@ -1607,90 +1614,6 @@ def _with_cleanup_error(error: OSError, cleanup_error: OSError | None) -> OSErro
     return OSError(
         f"{error}; cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
     )
-
-
-class _UnsafePathError(OSError):
-    """Raised when descriptor-safe regular-file reading is unavailable or fails."""
-
-
-class _BoundedReadError(OSError):
-    """Raised when a regular evidence file exceeds its byte budget."""
-
-
-def _read_regular_file(
-    path: Path,
-    *,
-    max_bytes: int,
-    dir_fd: int | None = None,
-) -> bytes:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
-    if type(no_follow) is not int or type(non_blocking) is not int:
-        raise _UnsafePathError("safe no-follow file opening is unavailable")
-    try:
-        if dir_fd is None:
-            descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
-        else:
-            descriptor = os.open(
-                path.name,
-                os.O_RDONLY | no_follow | non_blocking,
-                dir_fd=dir_fd,
-            )
-    except OSError as error:
-        if error.errno == errno.ELOOP:
-            raise _UnsafePathError(f"path is not a regular file: {path.name}") from error
-        raise
-    try:
-        file_status = os.fstat(descriptor)
-        if not stat.S_ISREG(file_status.st_mode):
-            raise _UnsafePathError(f"path is not a regular file: {path.name}")
-        if file_status.st_size > max_bytes:
-            raise _BoundedReadError(f"{path.name} exceeds the {max_bytes}-byte limit")
-        content = bytearray()
-        while len(content) <= max_bytes:
-            remaining = max_bytes + 1 - len(content)
-            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, remaining))
-            if not chunk:
-                break
-            content.extend(chunk)
-        if len(content) > max_bytes:
-            raise _BoundedReadError(f"{path.name} exceeds the {max_bytes}-byte limit")
-        return bytes(content)
-    finally:
-        os.close(descriptor)
-
-
-def _load_bounded_json(content: bytes) -> object:
-    depth = 0
-    in_string = False
-    escaped = False
-    for byte in content:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif byte == ord("\\"):
-                escaped = True
-            elif byte == ord('"'):
-                in_string = False
-            continue
-        if byte == ord('"'):
-            in_string = True
-        elif byte in {ord("{"), ord("[")}:
-            depth += 1
-            if depth > _MAX_JSON_NESTING:
-                raise ValueError(
-                    f"JSON nesting exceeds the {_MAX_JSON_NESTING}-level limit"
-                )
-        elif byte in {ord("}"), ord("]")}:
-            depth -= 1
-    try:
-        return json.loads(content, parse_constant=_reject_json_constant)
-    except RecursionError as error:
-        raise ValueError("JSON parsing exceeded the recursion limit") from error
-
-
-def _reject_json_constant(constant: str) -> Never:
-    raise ValueError(f"JSON constant {constant} is not permitted")
 
 
 def _platform_capability_error() -> str | None:

@@ -9,9 +9,9 @@ import math
 from types import MappingProxyType
 from typing import Literal, cast
 
+from pyrepo_check.artifact_safety import load_bounded_json as _load_bounded_json
 from pyrepo_check.execution import ExecutedCheck, ExecutedProcess
 from pyrepo_check.planning import RunPlan
-from pyrepo_check.pytest_execution import _load_bounded_json
 
 
 PytestErrorCode = Literal[
