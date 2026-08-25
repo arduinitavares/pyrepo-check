@@ -36,7 +36,9 @@ from pyrepo_check.pytest_execution import (
 )
 from pyrepo_check.coverage_execution import (
     CoverageArtifactObservation,
+    CoverageArtifactState,
     CoverageExecutionObservation,
+    CoveragePreflightClassification,
     CoveragePreflightObservation,
     CoveragePreflightRecord,
 )
@@ -319,6 +321,230 @@ def build_coverage_report(
                 ),
             ),
             coverage_json_exit_code or 0,
+        ),
+    )
+
+
+def coverage_primary_process(check: PlannedCheck) -> ExecutedProcess:
+    return ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+
+
+def coverage_stage_preflight(
+    classification: CoveragePreflightClassification,
+    *,
+    version: str | None = "7.15.2",
+    diagnostic: str = "coverage stage diagnostic",
+) -> CoveragePreflightObservation:
+    record: CoveragePreflightRecord | None
+    if classification == "module_unavailable":
+        record = CoveragePreflightRecord((3, 13, 15), False, None)
+    elif classification == "unsupported_python":
+        record = CoveragePreflightRecord((3, 13, 14), True, version)
+    elif classification in {"supported", "unsupported_version"}:
+        record = CoveragePreflightRecord((3, 13, 15), True, version)
+    else:
+        record = None
+    return CoveragePreflightObservation(classification, record, diagnostic)
+
+
+def coverage_stage_observation(
+    *,
+    preflight: CoveragePreflightClassification = "supported",
+    artifact: CoverageArtifactState = "not_attempted",
+    version: str | None = "7.15.2",
+    json_exit_code: int | None = None,
+) -> CoverageExecutionObservation:
+    return CoverageExecutionObservation(
+        coverage_stage_preflight(preflight, version=version),
+        CoverageArtifactObservation(artifact, None, f"{artifact} diagnostic"),
+        json_exit_code,
+    )
+
+
+def unstarted_pytest_observation() -> PytestExecutionObservation:
+    return replace(
+        finalized_pytest_execution_observation(),
+        artifact=PytestArtifactObservation("not_attempted", None, (), None),
+    )
+
+
+def failed_pytest_preflight_observation() -> PytestExecutionObservation:
+    return PytestExecutionObservation(
+        PytestPreflightObservation("preflight_invalid", None, "pytest preflight failed"),
+        PytestArtifactObservation("not_attempted", None, (), None),
+        None,
+    )
+
+
+def unsupported_parallelism_pytest_observation() -> PytestExecutionObservation:
+    observation = finalized_pytest_execution_observation()
+    assert observation.artifact.content is not None
+    document = cast(dict[str, Any], reporting.json.loads(observation.artifact.content))
+    flags = cast(dict[str, Any], document["flags"])
+    flags["unsupported_parallelism"] = True
+    return replace(
+        observation,
+        artifact=replace(
+            observation.artifact,
+            content=reporting.json.dumps(document).encode(),
+        ),
+    )
+
+
+def build_coverage_error_stage_report(tmp_path: Path, case: str) -> RunReportV1:
+    check = coverage_enabled_pytest_check(tmp_path)
+    pytest_preflight = pytest_preflight_process(check)
+    coverage_preflight = coverage_process(check, "coverage_preflight")
+    primary = coverage_primary_process(check)
+    processes: tuple[ExecutedProcess, ...]
+    pytest_observation: PytestExecutionObservation
+    coverage_observation: CoverageExecutionObservation | None
+
+    if case == "setup-without-process":
+        processes = ()
+        pytest_observation = PytestExecutionObservation(
+            PytestPreflightObservation("not_started", None, "pytest setup prevented preflight"),
+            PytestArtifactObservation("not_attempted", None, (), None),
+            None,
+        )
+        coverage_observation = None
+    elif case == "setup-after-pytest-preflight":
+        processes = (pytest_preflight,)
+        pytest_observation = unstarted_pytest_observation()
+        coverage_observation = None
+    elif case.startswith("typed-"):
+        classifications = {
+            "typed-unsupported-python": "unsupported_python",
+            "typed-module-unavailable": "module_unavailable",
+            "typed-stable-unsupported-version": "unsupported_version",
+            "typed-untrusted-unsupported-version": "unsupported_version",
+            "typed-preflight-invalid": "preflight_invalid",
+        }
+        classification = cast(CoveragePreflightClassification, classifications[case])
+        version = (
+            "7.14.9"
+            if case == "typed-stable-unsupported-version"
+            else None
+            if case == "typed-untrusted-unsupported-version"
+            else "7.15.2"
+        )
+        processes = (pytest_preflight, coverage_preflight)
+        pytest_observation = unstarted_pytest_observation()
+        coverage_observation = coverage_stage_observation(
+            preflight=classification,
+            version=version,
+        )
+    elif case == "coverage-preflight-spawn":
+        processes = (
+            pytest_preflight,
+            coverage_process(
+                check,
+                "coverage_preflight",
+                None,
+                spawn_error="coverage preflight did not start",
+            ),
+        )
+        pytest_observation = unstarted_pytest_observation()
+        coverage_observation = coverage_stage_observation(preflight="spawn_failed")
+    elif case == "coverage-preflight-signal":
+        processes = (pytest_preflight, coverage_process(check, "coverage_preflight", -9))
+        pytest_observation = unstarted_pytest_observation()
+        coverage_observation = coverage_stage_observation(preflight="terminated_by_signal")
+    elif case == "pytest-preflight-failed-coverage-supported":
+        processes = (
+            replace(pytest_preflight, returncode=1),
+            coverage_preflight,
+        )
+        pytest_observation = failed_pytest_preflight_observation()
+        coverage_observation = coverage_stage_observation(artifact="data_missing")
+    elif case == "data-missing-without-primary":
+        processes = (pytest_preflight, coverage_preflight)
+        pytest_observation = unstarted_pytest_observation()
+        coverage_observation = coverage_stage_observation(artifact="data_missing")
+    elif case == "data-missing-after-primary":
+        processes = (pytest_preflight, coverage_preflight, primary)
+        pytest_observation = finalized_pytest_execution_observation()
+        coverage_observation = coverage_stage_observation(artifact="data_missing")
+    elif case == "unsupported-parallelism":
+        processes = (pytest_preflight, coverage_preflight, primary)
+        pytest_observation = unsupported_parallelism_pytest_observation()
+        coverage_observation = coverage_stage_observation(artifact="unsupported_parallelism")
+    elif case == "unexpected-parallel-before-json":
+        processes = (pytest_preflight, coverage_preflight, primary)
+        pytest_observation = finalized_pytest_execution_observation()
+        coverage_observation = coverage_stage_observation(artifact="unexpected_parallel_data")
+    elif case == "coverage-json-spawn":
+        processes = (
+            pytest_preflight,
+            coverage_preflight,
+            primary,
+            coverage_process(
+                check,
+                "coverage_json",
+                None,
+                spawn_error="coverage JSON did not start",
+            ),
+        )
+        pytest_observation = finalized_pytest_execution_observation()
+        coverage_observation = coverage_stage_observation(
+            artifact="spawn_failed",
+            json_exit_code=None,
+        )
+    elif case == "coverage-json-signal":
+        processes = (
+            pytest_preflight,
+            coverage_preflight,
+            primary,
+            coverage_process(check, "coverage_json", -9),
+        )
+        pytest_observation = finalized_pytest_execution_observation()
+        coverage_observation = coverage_stage_observation(
+            artifact="terminated_by_signal",
+            json_exit_code=-9,
+        )
+    else:
+        artifact, json_exit_code = {
+            "generation-failed": ("generation_failed", 1),
+            "artifact-missing-zero": ("artifact_missing", 0),
+            "artifact-invalid-zero": ("artifact_invalid", 0),
+            "artifact-missing-threshold": ("artifact_missing", 2),
+            "artifact-invalid-threshold": ("artifact_invalid", 2),
+            "unexpected-parallel-after-json": ("unexpected_parallel_data", 0),
+        }[case]
+        processes = (
+            pytest_preflight,
+            coverage_preflight,
+            primary,
+            coverage_process(check, "coverage_json", json_exit_code),
+        )
+        pytest_observation = finalized_pytest_execution_observation()
+        coverage_observation = coverage_stage_observation(
+            artifact=cast(CoverageArtifactState, artifact),
+            json_exit_code=json_exit_code,
+        )
+
+    return build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="complete"),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    check,
+                    processes,
+                    pytest_observation,
+                    coverage_observation,
+                ),
+            ),
+            0,
         ),
     )
 
@@ -837,6 +1063,154 @@ def test_report_validation_recomputes_coverage_context_and_process_invariants(
         wrong_coverage_json_exit,
         primary_after_failed_coverage_preflight,
         failed_with_zero_json_exit,
+    ):
+        with pytest.raises(ReportingError, match=r"^invalid report:"):
+            validate_report_v1(invalid)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    (
+        ("setup-without-process", "preflight_invalid"),
+        ("setup-after-pytest-preflight", "preflight_invalid"),
+        ("typed-unsupported-python", "unsupported_python"),
+        ("typed-module-unavailable", "module_unavailable"),
+        ("typed-stable-unsupported-version", "unsupported_version"),
+        ("typed-untrusted-unsupported-version", "unsupported_version"),
+        ("typed-preflight-invalid", "preflight_invalid"),
+        ("coverage-preflight-spawn", "spawn_failed"),
+        ("coverage-preflight-signal", "terminated_by_signal"),
+        ("pytest-preflight-failed-coverage-supported", "data_missing"),
+        ("data-missing-without-primary", "data_missing"),
+        ("data-missing-after-primary", "data_missing"),
+        ("unsupported-parallelism", "unsupported_parallelism"),
+        ("unexpected-parallel-before-json", "unexpected_parallel_data"),
+        ("coverage-json-spawn", "spawn_failed"),
+        ("coverage-json-signal", "terminated_by_signal"),
+        ("generation-failed", "generation_failed"),
+        ("artifact-missing-zero", "artifact_missing"),
+        ("artifact-invalid-zero", "artifact_invalid"),
+        ("artifact-missing-threshold", "artifact_missing"),
+        ("artifact-invalid-threshold", "artifact_invalid"),
+        ("unexpected-parallel-after-json", "unexpected_parallel_data"),
+    ),
+)
+def test_report_validation_accepts_every_coverage_error_stage(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    report = build_coverage_error_stage_report(tmp_path, case)
+
+    assert report.coverage is not None
+    assert report.coverage.error is not None
+    assert report.coverage.error.code == expected_code
+    validate_report_v1(report)
+
+
+def test_report_validation_rejects_combined_coverage_error_stage_defects(
+    tmp_path: Path,
+) -> None:
+    generation_failed = build_coverage_error_stage_report(
+        tmp_path / "generation", "generation-failed"
+    )
+    artifact_invalid = build_coverage_error_stage_report(
+        tmp_path / "artifact", "artifact-invalid-zero"
+    )
+    coverage_json_spawn = build_coverage_error_stage_report(
+        tmp_path / "spawn", "coverage-json-spawn"
+    )
+    unsupported_parallelism = build_coverage_error_stage_report(
+        tmp_path / "parallel", "unsupported-parallelism"
+    )
+    strict_artifact_exit_two = build_coverage_error_stage_report(
+        tmp_path / "strict-threshold", "artifact-invalid-threshold"
+    )
+    successful_json = build_coverage_report(tmp_path / "json").checks[0].processes[-1]
+
+    generation_check = generation_failed.checks[0]
+    generation_json = generation_check.processes[-1]
+    generation_without_json = replace(
+        generation_failed,
+        checks=(replace(generation_check, processes=generation_check.processes[:-1]),),
+    )
+    generation_with_zero_exit = replace(
+        generation_failed,
+        checks=(
+            replace(
+                generation_check,
+                processes=(
+                    *generation_check.processes[:-1],
+                    replace(generation_json, exit_code=0),
+                ),
+            ),
+        ),
+    )
+    generation_with_signal = replace(
+        generation_failed,
+        checks=(
+            replace(
+                generation_check,
+                processes=(
+                    *generation_check.processes[:-1],
+                    replace(
+                        generation_json,
+                        outcome="signaled",
+                        exit_code=None,
+                        signal=9,
+                        error_message="Process terminated by signal 9.",
+                    ),
+                ),
+            ),
+        ),
+    )
+    artifact_check = artifact_invalid.checks[0]
+    artifact_after_exit_one = replace(
+        artifact_invalid,
+        checks=(
+            replace(
+                artifact_check,
+                processes=(
+                    *artifact_check.processes[:-1],
+                    replace(artifact_check.processes[-1], exit_code=1),
+                ),
+            ),
+        ),
+    )
+    spawn_check = coverage_json_spawn.checks[0]
+    spawn_with_all_exited = replace(
+        coverage_json_spawn,
+        checks=(
+            replace(
+                spawn_check,
+                processes=(
+                    *spawn_check.processes[:-1],
+                    replace(
+                        spawn_check.processes[-1],
+                        outcome="exited",
+                        exit_code=0,
+                        signal=None,
+                        error_message=None,
+                    ),
+                ),
+            ),
+        ),
+    )
+    parallel_check = unsupported_parallelism.checks[0]
+    parallel_with_successful_json = replace(
+        unsupported_parallelism,
+        checks=(replace(parallel_check, processes=(*parallel_check.processes, successful_json)),),
+    )
+    focused_artifact_exit_two = replace(strict_artifact_exit_two, mode="focused")
+
+    for invalid in (
+        generation_without_json,
+        generation_with_zero_exit,
+        generation_with_signal,
+        artifact_after_exit_one,
+        spawn_with_all_exited,
+        parallel_with_successful_json,
+        focused_artifact_exit_two,
     ):
         with pytest.raises(ReportingError, match=r"^invalid report:"):
             validate_report_v1(invalid)

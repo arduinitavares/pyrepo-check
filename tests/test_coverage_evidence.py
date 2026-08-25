@@ -1047,6 +1047,7 @@ def test_coverage_result_maps_every_preflight_and_artifact_error(
             preflight=preflight,
             artifact=artifact,
             diagnostic=f"{expected_code} diagnostic",
+            version="7.14.9" if preflight == "unsupported_version" else "7.15.2",
         ),
     )
 
@@ -1062,9 +1063,100 @@ def test_coverage_result_maps_every_preflight_and_artifact_error(
     assert result.files == ()
     assert result.error == CoverageError(expected_code, f"{expected_code} diagnostic")
     assert result.coverage_version == (
-        "7.15.2" if preflight in {"supported", "unsupported_version"} else None
+        "7.14.9"
+        if preflight == "unsupported_version"
+        else "7.15.2"
+        if preflight == "supported"
+        else None
     )
     validate_coverage_result(result)
+
+
+@pytest.mark.parametrize(
+    "version",
+    ("7.15.2rc1", "7.15.2.dev0", "7.15.2.post1", "7.15.2+local"),
+)
+def test_coverage_result_keeps_untrusted_unsupported_version_as_unsupported(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(
+            preflight="unsupported_version",
+            artifact="not_attempted",
+            version=version,
+            diagnostic="unsupported coverage version",
+        ),
+    )
+
+    assert result is not None
+    assert result.error == CoverageError("unsupported_version", "unsupported coverage version")
+    assert result.coverage_version is None
+    validate_coverage_result(result)
+
+
+def test_coverage_result_retains_only_stable_out_of_range_unsupported_version(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(
+            preflight="unsupported_version",
+            artifact="not_attempted",
+            version="7.14.9",
+            diagnostic="unsupported coverage version",
+        ),
+    )
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == "unsupported_version"
+    assert result.coverage_version == "7.14.9"
+    validate_coverage_result(result)
+
+    with pytest.raises(ValueError):
+        validate_coverage_result(replace(result, coverage_version="7.15.2"))
+
+
+@pytest.mark.parametrize("version", ("7.14.9", "8.0.0", "0.0"))
+def test_public_coverage_model_rejects_non_supported_success_version(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    root = _coverage_project(tmp_path)
+    result = build_coverage_result(root, _plan(), _pytest_result(), _coverage_observation())
+
+    assert result is not None
+    with pytest.raises(ValueError):
+        validate_coverage_result(replace(result, coverage_version=version))
+
+
+@pytest.mark.parametrize("version", (None, "7.14.9", "8.0.0"))
+def test_public_coverage_model_requires_supported_version_after_supported_preflight(
+    tmp_path: Path,
+    version: str | None,
+) -> None:
+    root = _coverage_project(tmp_path)
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(artifact="data_missing", diagnostic="coverage data missing"),
+    )
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == "data_missing"
+    with pytest.raises(ValueError):
+        validate_coverage_result(replace(result, coverage_version=version))
 
 
 @pytest.mark.parametrize(

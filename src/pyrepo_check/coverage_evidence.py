@@ -129,6 +129,10 @@ def validate_coverage_result(result: CoverageResult) -> None:
         raise ValueError("coverage evidence_complete must be boolean")
     if result.coverage_version is not None and not isinstance(result.coverage_version, str):
         raise ValueError("coverage_version must be null or a string")
+    if result.coverage_version is not None and not is_stable_coverage_version(
+        result.coverage_version
+    ):
+        raise ValueError("coverage_version must be a stable release version")
     if type(result.gate_eligible) is not bool:
         raise ValueError("coverage gate_eligible must be boolean")
     _validate_coverage_threshold(result.threshold)
@@ -178,8 +182,8 @@ def validate_coverage_result(result: CoverageResult) -> None:
         return
     if result.totals is None or result.error is not None or not result.evidence_complete:
         raise ValueError("valid coverage result requires complete totals without an error")
-    if not _is_stable_coverage_version(result.coverage_version):
-        raise ValueError("valid coverage result requires a trusted stable version")
+    if not is_supported_coverage_version(result.coverage_version):
+        raise ValueError("valid coverage result requires a trusted supported version")
     if result.status in {"passed", "failed"}:
         if result.scope != "complete" or not result.gate_eligible:
             raise ValueError("gating coverage result must be complete and eligible")
@@ -331,19 +335,37 @@ def _validate_coverage_error(error: CoverageError) -> None:
 def _validate_error_coverage_version(result: CoverageResult) -> None:
     if result.error is None:
         raise AssertionError("coverage error result must have an error")
+    version = result.coverage_version
     if result.error.code == "unsupported_version":
-        if not _is_stable_coverage_version(result.coverage_version):
-            raise ValueError("unsupported coverage version requires a trusted stable version")
+        if version is not None and is_supported_coverage_version(version):
+            raise ValueError("unsupported coverage version cannot be a supported version")
     elif result.error.code in {
         "unsupported_python",
         "module_unavailable",
         "preflight_invalid",
-    } and result.coverage_version is not None:
-        raise ValueError("untrusted coverage preflight cannot have a version")
+    }:
+        if version is not None:
+            raise ValueError("untrusted coverage preflight cannot have a version")
+    elif result.error.code in {"spawn_failed", "terminated_by_signal"}:
+        if version is not None and not is_supported_coverage_version(version):
+            raise ValueError("coverage process error version must be supported")
+    elif not is_supported_coverage_version(version):
+        raise ValueError("post-preflight coverage error requires a supported version")
 
 
-def _is_stable_coverage_version(value: object) -> bool:
+def is_stable_coverage_version(value: object) -> bool:
     return isinstance(value, str) and _STABLE_COVERAGE_VERSION.fullmatch(value) is not None
+
+
+def is_supported_coverage_version(value: object) -> bool:
+    """Return whether a stable Coverage.py version is in the supported range."""
+    if not isinstance(value, str):
+        return False
+    match = _STABLE_COVERAGE_VERSION.fullmatch(value)
+    if match is None:
+        return False
+    major, minor, patch = (int(piece or "0") for piece in match.groups())
+    return (7, 15, 0) <= (major, minor, patch) < (8, 0, 0)
 
 
 def validate_coverage_json(
@@ -475,7 +497,7 @@ def build_coverage_result(
         return _coverage_error_result(
             configured=configured,
             threshold_value=threshold_value,
-            coverage_version=coverage_version,
+            coverage_version=_coverage_error_version(coverage_version, observed_error),
             error=observed_error,
         )
     if observation is None:
@@ -579,7 +601,7 @@ def _trusted_coverage_version(
     if record is None:
         return None
     version = record.coverage_version
-    return version if _is_stable_coverage_version(version) else None
+    return version if is_stable_coverage_version(version) else None
 
 
 def _coverage_observation_error(
@@ -591,22 +613,26 @@ def _coverage_observation_error(
             "coverage execution setup prevented the coverage preflight",
         )
     preflight = observation.preflight
-    if preflight.classification != "supported":
-        if preflight.classification == "unsupported_version" and _trusted_coverage_version(
-            observation
-        ) is None:
-            return CoverageError(
-                "preflight_invalid",
-                "unsupported coverage preflight has no trusted stable version",
-            )
+    if preflight.classification == "unsupported_version":
         return CoverageError(
             cast(CoverageErrorCode, preflight.classification),
             preflight.diagnostic or f"coverage preflight: {preflight.classification}",
         )
-    if _trusted_coverage_version(observation) is None:
+    if preflight.classification != "supported":
+        return CoverageError(
+            cast(CoverageErrorCode, preflight.classification),
+            preflight.diagnostic or f"coverage preflight: {preflight.classification}",
+        )
+    coverage_version = _trusted_coverage_version(observation)
+    if coverage_version is None:
         return CoverageError(
             "preflight_invalid",
             "supported coverage preflight has no trusted version",
+        )
+    if not is_supported_coverage_version(coverage_version):
+        return CoverageError(
+            "unsupported_version",
+            f"coverage preflight reported unsupported version {coverage_version}",
         )
     artifact = observation.artifact
     if artifact.state == "snapshot":
@@ -618,6 +644,33 @@ def _coverage_observation_error(
         code,
         artifact.diagnostic or f"coverage evidence: {code}",
     )
+
+
+def _coverage_error_version(
+    coverage_version: str | None,
+    error: CoverageError,
+) -> str | None:
+    if error.code == "unsupported_version":
+        return (
+            coverage_version
+            if coverage_version is not None
+            and not is_supported_coverage_version(coverage_version)
+            else None
+        )
+    if error.code in {"spawn_failed", "terminated_by_signal"} or error.code in {
+        "unsupported_parallelism",
+        "data_missing",
+        "unexpected_parallel_data",
+        "generation_failed",
+        "artifact_missing",
+        "artifact_invalid",
+    }:
+        return (
+            coverage_version
+            if is_supported_coverage_version(coverage_version)
+            else None
+        )
+    return None
 
 
 def _coverage_error_result(

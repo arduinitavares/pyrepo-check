@@ -12,6 +12,7 @@ from pyrepo_check.coverage_evidence import (
     CoverageResult,
     build_coverage_result,
     coverage_gate_policy_for_context,
+    is_supported_coverage_version,
     validate_coverage_result,
 )
 from pyrepo_check.execution import (
@@ -174,6 +175,13 @@ _COVERAGE_PREPRIMARY_ERROR_CODES = frozenset(
         "preflight_invalid",
     )
 )
+_COVERAGE_PREFLIGHT_ROLES: tuple[ProcessRole, ...] = (
+    "pytest_preflight",
+    "coverage_preflight",
+)
+_COVERAGE_PRIMARY_ROLES: tuple[ProcessRole, ...] = (*_COVERAGE_PREFLIGHT_ROLES, "primary")
+_COVERAGE_COMPLETE_ROLES: tuple[ProcessRole, ...] = (*_COVERAGE_PRIMARY_ROLES, "coverage_json")
+_COVERAGE_PREJSON_ARTIFACT_ERROR_CODES = frozenset(("data_missing", "unexpected_parallel_data"))
 
 
 class ReportingError(RuntimeError):
@@ -936,6 +944,13 @@ def _validate_coverage_report_context(
     if coverage.status == "error":
         if policy.skipped_reason != "evidence_error":
             _invalid("coverage error must be backed by incomplete evidence")
+        _validate_coverage_error_processes(
+            mode,
+            selection,
+            pytest_result,
+            coverage,
+            pytest_check,
+        )
         return
     if coverage.threshold.skipped_reason != policy.skipped_reason:
         _invalid("coverage threshold skip reason contradicts report context")
@@ -953,24 +968,141 @@ def _validate_complete_coverage_processes(
     pytest_check: CheckResult,
     coverage: CoverageResult,
 ) -> None:
-    expected_roles = (
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-        "coverage_json",
-    )
-    if tuple(process.role for process in pytest_check.processes) != expected_roles:
+    if tuple(process.role for process in pytest_check.processes) != _COVERAGE_COMPLETE_ROLES:
         _invalid("complete coverage requires every attempted coverage process")
     coverage_preflight = pytest_check.processes[1]
     if coverage_preflight.outcome != "exited" or coverage_preflight.exit_code != 0:
         _invalid("coverage primary requires a successful coverage preflight")
     coverage_json = pytest_check.processes[-1]
     expected_exit_code = 2 if coverage.status == "failed" else 0
-    if (
-        coverage_json.outcome != "exited"
-        or coverage_json.exit_code != expected_exit_code
-    ):
+    if coverage_json.outcome != "exited" or coverage_json.exit_code != expected_exit_code:
         _invalid("coverage JSON process contradicts coverage result")
+
+
+def _validate_coverage_error_processes(
+    mode: RunMode,
+    selection: Selection,
+    pytest_result: PytestResult,
+    coverage: CoverageResult,
+    pytest_check: CheckResult,
+) -> None:
+    error = coverage.error
+    if error is None:
+        _invalid("coverage error result requires an error")
+        return
+    roles = tuple(process.role for process in pytest_check.processes)
+    if roles in {(), ("pytest_preflight",)}:
+        if error.code != "preflight_invalid" or coverage.coverage_version is not None:
+            _invalid("coverage setup error contradicts attempted processes")
+        return
+
+    if roles == _COVERAGE_PREFLIGHT_ROLES:
+        coverage_preflight = pytest_check.processes[-1]
+        if error.code in _COVERAGE_PREPRIMARY_ERROR_CODES:
+            if coverage_preflight.outcome != "exited":
+                _invalid("typed coverage preflight error requires an exited preflight")
+            return
+        if error.code in {"spawn_failed", "terminated_by_signal"}:
+            expected_outcome: ProcessOutcome = (
+                "spawn_failed" if error.code == "spawn_failed" else "signaled"
+            )
+            if (
+                coverage_preflight.outcome != expected_outcome
+                or coverage.coverage_version is not None
+            ):
+                _invalid("coverage preflight process contradicts coverage error")
+            return
+        if error.code in _COVERAGE_PREJSON_ARTIFACT_ERROR_CODES:
+            _validate_supported_prejson_coverage_error(coverage, coverage_preflight)
+            return
+        _invalid("coverage error requires a later attempted process")
+        return
+
+    if roles == _COVERAGE_PRIMARY_ROLES:
+        coverage_preflight = pytest_check.processes[1]
+        if (
+            error.code in _COVERAGE_PREJSON_ARTIFACT_ERROR_CODES
+            or error.code == "unsupported_parallelism"
+        ):
+            _validate_supported_prejson_coverage_error(coverage, coverage_preflight)
+            return
+        _invalid("coverage error contradicts primary and JSON process evidence")
+        return
+
+    if roles != _COVERAGE_COMPLETE_ROLES:
+        _invalid("coverage error uses an invalid attempted-command order")
+        return
+
+    coverage_preflight = pytest_check.processes[1]
+    coverage_json = pytest_check.processes[-1]
+    if (
+        coverage_preflight.outcome != "exited"
+        or coverage_preflight.exit_code != 0
+        or not is_supported_coverage_version(coverage.coverage_version)
+    ):
+        _invalid("post-JSON coverage error requires a supported coverage preflight")
+    if error.code in {"spawn_failed", "terminated_by_signal"}:
+        expected_outcome = "spawn_failed" if error.code == "spawn_failed" else "signaled"
+        if coverage_json.outcome != expected_outcome:
+            _invalid("coverage JSON process contradicts coverage error")
+        return
+    if error.code == "generation_failed":
+        if (
+            coverage_json.outcome != "exited"
+            or coverage_json.exit_code is None
+            or coverage_json.exit_code <= 0
+        ):
+            _invalid("coverage generation failure requires a positive JSON exit")
+        return
+    if error.code in {"artifact_missing", "artifact_invalid"}:
+        if coverage_json.outcome != "exited":
+            _invalid("coverage artifact error requires an exited JSON process")
+        if coverage_json.exit_code == 0:
+            return
+        if coverage_json.exit_code != 2 or not _coverage_threshold_exit_two_is_eligible(
+            mode,
+            selection,
+            pytest_result,
+            coverage,
+        ):
+            _invalid("coverage artifact error contradicts the JSON exit")
+        return
+    if error.code == "unexpected_parallel_data":
+        if coverage_json.outcome != "exited":
+            _invalid("post-JSON parallel-data error requires an exited JSON process")
+        return
+    _invalid("coverage error contradicts complete process evidence")
+
+
+def _validate_supported_prejson_coverage_error(
+    coverage: CoverageResult,
+    coverage_preflight: ProcessResult,
+) -> None:
+    if (
+        coverage_preflight.outcome != "exited"
+        or coverage_preflight.exit_code != 0
+        or not is_supported_coverage_version(coverage.coverage_version)
+    ):
+        _invalid("post-preflight coverage error requires a supported coverage preflight")
+
+
+def _coverage_threshold_exit_two_is_eligible(
+    mode: RunMode,
+    selection: Selection,
+    pytest_result: PytestResult,
+    coverage: CoverageResult,
+) -> bool:
+    return (
+        coverage.threshold.configured
+        and coverage_gate_policy_for_context(
+            mode=mode,
+            targets=selection.targets,
+            test_shortcut=selection.test_shortcut,
+            pytest_result=pytest_result,
+            evidence_complete=True,
+            configured=coverage.threshold.configured,
+        ).gate_eligible
+    )
 
 
 def _validate_check_result(
