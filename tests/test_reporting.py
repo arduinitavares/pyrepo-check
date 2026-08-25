@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, replace
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -1997,7 +1998,7 @@ def test_validation_rejects_not_started_pytest_version_without_matching_prefligh
 
 @pytest.mark.parametrize(
     "boundary",
-    ("run-directory", "plugin-copy", "plugin-chmod", "writer-directory", "environment"),
+    ("run-directory", "plugin-copy", "writer-directory", "environment"),
 )
 def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
     tmp_path: Path,
@@ -2016,29 +2017,30 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
             fail_run_directory,
         )
     elif boundary == "plugin-copy":
-        def fail_copy(_source: Path, _destination: Path) -> None:
+        def fail_copy(
+            _source: Path,
+            _destination_name: str,
+            *,
+            run_descriptor: int,
+        ) -> None:
+            del run_descriptor
             raise PermissionError("plugin copy denied")
 
-        monkeypatch.setattr(pytest_execution.shutil, "copyfile", fail_copy)
-    elif boundary == "plugin-chmod":
-        def fail_chmod(_path: Path, _mode: int) -> None:
-            raise PermissionError("plugin chmod denied")
-
-        monkeypatch.setattr(pytest_execution.os, "chmod", fail_chmod)
+        monkeypatch.setattr(pytest_execution, "_copy_plugin_source", fail_copy)
     elif boundary == "writer-directory":
-        original_mkdir = Path.mkdir
+        original_mkdir = pytest_execution.os.mkdir
 
         def fail_writer_directory(
-            path: Path,
+            path: str | bytes | os.PathLike[str],
             mode: int = 0o777,
-            parents: bool = False,
-            exist_ok: bool = False,
+            *,
+            dir_fd: int | None = None,
         ) -> None:
-            if path.name == "writers":
+            if os.fsdecode(path) == "writers":
                 raise PermissionError("writer directory denied")
-            original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+            original_mkdir(path, mode=mode, dir_fd=dir_fd)
 
-        monkeypatch.setattr(Path, "mkdir", fail_writer_directory)
+        monkeypatch.setattr(pytest_execution.os, "mkdir", fail_writer_directory)
     else:
         def fail_environment(
             _run_directory: Path,

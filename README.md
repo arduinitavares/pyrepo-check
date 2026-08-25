@@ -164,24 +164,35 @@ FIFO or other non-regular path fails closed instead of waiting for a writer.
 
 Structured pytest evidence requires descriptor-safe no-follow file opening and
 bounded descriptor-relative recursive removal. Cleanup validates the complete
-tree before deletion, then removes it with streaming descriptor-relative
-operations. Each pass accepts at most 4,096 entries and depth 64; the complete
-cleanup has a five-second monotonic deadline. A single kernel call cannot be
-interrupted by that deadline. Supported platforms must also prove that an
-opened directory was unlinked after `rmdir`: Linux uses zero link count, while
-Darwin pairs link-count inspection with `F_GETPATH` device/inode verification.
-Unsupported or unproven platforms fail closed before pytest
+tree before deletion, then atomically moves each manifest-matched leaf into a
+fresh owner-only sibling quarantine. The moved device, inode, and exact type
+must still match before cleanup unlinks it from the quarantine descriptor.
+Symlinks, FIFOs, sockets, and devices are never opened or followed. Each pass
+accepts at most 4,096 entries and depth 64; the complete cleanup has a
+five-second monotonic deadline. A single kernel call cannot be interrupted by
+that deadline. Supported platforms must provide descriptor-relative `mkdir`
+and `rename` and must prove that an opened directory was unlinked after
+`rmdir`: Linux uses zero link count, while Darwin uses a missing absolute
+`F_GETPATH` target. Unsupported or unproven platforms fail closed before pytest
 starts; pyrepo-check does not fall back to path-based cleanup.
 
+Plugin and writer preparation is bound to a securely opened run-directory
+descriptor. The recorded parent and run identities are reverified before and
+after preparation, before preflight, after preflight, and after primary pytest
+before artifact snapshot. A failed gate preserves real process observations
+without trusting a same-path replacement.
+
 Cleanup failure keeps an already-captured pytest snapshot but makes the check
-an incomplete `cleanup_failed` error. The diagnostic names the retained run
-directory only when its device and inode were reverified through the recorded
-parent directory descriptor and the lexical parent and child paths still name
-those recorded identities at observation time. This is a best-effort current
-path observation, not a permanent path guarantee. A validation failure leaves
-the tree untouched;
-a race or I/O failure during the deletion pass can leave the verified root
-partially emptied for manual inspection.
+an incomplete `cleanup_failed` error. The diagnostic reports retained run and
+quarantine paths separately, and only while descriptor-relative and lexical
+observations still name their recorded identities. These are best-effort
+current observations, not permanent location guarantees. A validation failure
+leaves the run tree untouched; a race or I/O failure during deletion can leave
+the verified run root partially emptied and can retain quarantined content for
+manual inspection. Portable Python cannot unlink by inode. Final unlink assumes
+exclusive host control of the fresh private quarantine between its identity
+check and unlink; same-UID discovery or mutation cannot be eliminated with the
+standard library.
 
 ## Project Configuration
 

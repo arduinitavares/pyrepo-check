@@ -578,6 +578,7 @@ Structured pytest evidence requires descriptor-safe no-follow file opening and
 bounded descriptor-relative recursive removal. Platform preflight requires
 integer `O_DIRECTORY`, `O_NOFOLLOW`, and `O_NONBLOCK` flags; fd-based
 `scandir`; descriptor-relative `open`, `stat`, `unlink`, and `rmdir`; and
+`mkdir` and `rename`; effective-UID inspection; and
 `stat(..., follow_symlinks=False)`. The platform must also have a proven
 post-`rmdir` unlink check: Linux zero-link semantics, or Darwin link-count plus
 an absolute `F_GETPATH` lexical target that is missing at the no-follow stat.
@@ -596,6 +597,20 @@ before plugin preparation or process spawn. A same-path parent replacement
 fails setup; safe cleanup may retain the new run path and reports that cleanup
 failure with the setup error.
 
+Execution also retains a private verified-run context. It securely opens the
+recorded parent and then the run basename descriptor-relatively, verifies both
+recorded identities and the run device, marks both descriptors
+non-inheritable, and closes them on every path. Plugin preparation creates an
+exclusive no-follow mode-0600 file relative to the run descriptor and copies
+the trusted plugin source in bounded chunks with complete-write handling. The
+mode-0700 writer directory is also created relative to that descriptor. Run
+identity gates execute immediately before and after preparation, immediately
+before preflight, after the real preflight is recorded and before primary, and
+after the real primary is recorded before artifact snapshot. Before-process
+failure remains typed `not_started`; post-preflight failure retains its real
+process and uses `preflight_invalid`; post-primary failure retains both real
+processes and rejects the artifact path without snapshotting a replacement.
+
 Cleanup uses two iterative streaming DFS passes. The first pass validates the
 complete tree without deletion and returns an immutable manifest. Every
 non-root entry is keyed by its parent directory's device/inode plus entry name;
@@ -607,6 +622,18 @@ substitutions, and validated entries missing during deletion fail closed as an
 unsafe tree. Additions after an iterator has passed remain untraversed and make
 descriptor-relative removal fail with a retained root.
 
+After opening the verified temporary parent, cleanup creates one fresh random
+mode-0700 sibling quarantine descriptor-relatively. It verifies the
+quarantine's root device, effective-UID ownership, exact private permissions,
+no-follow directory identity, and non-inheritable descriptor. Its random name
+is host-only: it is not added to child environments or ordinary diagnostics.
+For each manifest-matched non-directory leaf, deletion atomically renames the
+source name into that quarantine under another fresh host-only name. A
+no-follow stat there must still match the manifest device, inode, and exact
+type. Only then is the manifest key consumed and the leaf immediately unlinked
+from the quarantine descriptor. A mismatch or deadline after rename preserves
+the moved entry and quarantine. No leaf type is opened or followed.
+
 Each pass accepts exactly 4,096 non-root entries and depth 64 with root at depth
 0; the immutable manifest is therefore bounded to 4,096 entries. The whole
 cleanup shares a five-second monotonic deadline. Deadline checks run between
@@ -617,17 +644,34 @@ is `rmdir(run_basename, dir_fd=verified_parent_fd)`. Each directory descriptor
 stays open through its descriptor-relative `rmdir`; cleanup then verifies that
 the opened inode was actually unlinked. A replacement basename removed during
 a race is diagnosed as an unsafe tree rather than reported as successful.
+Complete cleanup removes the empty quarantine descriptor-relatively while its
+descriptor remains held, with the same post-`rmdir` proof. Failure before any
+quarantined content gets a best-effort empty-quarantine removal within the
+remaining shared deadline. Quarantined or potentially quarantined content is
+never retried or unlinked after failure.
 
 Budget, unsafe-tree, and I/O failures project to the existing public
 `cleanup_failed` code while preserving any otherwise valid `PytestResult`.
-The diagnostic includes the exact retained path only after revalidating the
-recorded parent and root identities both through the parent descriptor and at
-the lexical parent and child paths at observation time. That path is a
-best-effort current observation, not a permanent location guarantee.
+The diagnostic reports exact retained run and quarantine paths separately,
+only after revalidating the recorded parent and relevant child identity both
+through the parent descriptor and at the lexical parent and child paths at
+observation time. Each path is a best-effort current observation, not a
+permanent location guarantee.
 Validation-pass failure
 leaves the tree untouched. A race or I/O failure during the deletion pass may
 leave that verified root partially emptied; cleanup never retries or traverses
 a replacement.
+
+Portable Python does not expose unlink-by-inode. Cleanup therefore assumes
+exclusive host control of the fresh private quarantine between the final
+identity stat and unlink. Random private names and mode-0700 ownership narrow
+the race, but portable standard-library code cannot eliminate discovery or
+mutation by another process running as the same UID. Likewise, child pytest
+still resolves the lexical `PYTHONPATH`, artifact, and writer paths after the
+last pre-spawn identity gate because non-inherited descriptors cannot bind
+those child lookups portably. The later run-identity gates, artifact snapshot,
+and cleanup fail closed; the design does not claim that every later replacement
+fails before spawn.
 
 ## Agent Report contract
 

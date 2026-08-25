@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess  # nosec B404
 import tempfile
 import threading
@@ -12,11 +13,12 @@ from typing import Callable, Never, TypeVar, cast
 
 import pytest
 
-from pyrepo_check.execution import CapturedBytes, execute_plan
+from pyrepo_check.execution import CapturedBytes, ExecutionResult, execute_plan
 from pyrepo_check.planning import OutputFormat, PlannedCheck, PytestExecutionPlan, RunPlan
 import pyrepo_check.pytest_execution as pytest_execution
 from pyrepo_check.pytest_execution import execute_pytest
 from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
+from pyrepo_check.reporting import build_run_report, validate_report_v1
 from tests.support import RecordingRunner
 
 
@@ -390,6 +392,8 @@ def test_missing_platform_capability_fails_before_temp_or_spawn(
         "_STAT_SUPPORTS_FOLLOW_SYMLINKS",
         "_UNLINK_SUPPORTS_DIR_FD",
         "_RMDIR_SUPPORTS_DIR_FD",
+        "_MKDIR_SUPPORTS_DIR_FD",
+        "_RENAME_SUPPORTS_DIR_FD",
         "_POST_RMDIR_UNLINK_PROOF",
     ),
 )
@@ -1471,6 +1475,361 @@ def test_cleanup_rejects_leaf_substituted_between_validation_and_deletion(
     assert observation.retained_path == run_directory
 
 
+@pytest.mark.parametrize("leaf_type", ("regular", "symlink", "fifo"))
+def test_cleanup_quarantines_leaf_replaced_immediately_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_type: str,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_text("keep")
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    leaf = run_directory / "leaf"
+    displaced = tmp_path / "displaced-leaf"
+
+    def create_leaf(path: Path, *, replacement: bool) -> None:
+        if leaf_type == "regular":
+            path.write_text("replacement" if replacement else "validated")
+        elif leaf_type == "symlink":
+            path.symlink_to(outside_sentinel if replacement else outside)
+        else:
+            _MKFIFO(path)
+
+    create_leaf(leaf, replacement=False)
+    original_rename = pytest_execution.os.rename
+    original_unlink = pytest_execution.os.unlink
+    quarantine_destination: tuple[str, int] | None = None
+    quarantine_unlinks: list[tuple[str, int | None]] = []
+    swapped = False
+
+    def swap_before_quarantine_rename(
+        source: str | bytes | os.PathLike[str],
+        destination: str | bytes | os.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal quarantine_destination, swapped
+        if os.fsdecode(source) == leaf.name and src_dir_fd is not None:
+            assert dst_dir_fd is not None
+            quarantine_destination = (os.fsdecode(destination), dst_dir_fd)
+            leaf.rename(displaced)
+            create_leaf(leaf, replacement=True)
+            swapped = True
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    def track_unlink(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        quarantine_unlinks.append((os.fsdecode(path), dir_fd))
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "rename", swap_before_quarantine_rename)
+    monkeypatch.setattr(pytest_execution.os, "unlink", track_unlink)
+
+    def cleanup() -> pytest_execution._CleanupObservation | None:
+        return pytest_execution._remove_run_directory(
+            _cleanup_record(run_directory),
+            consumer_root=consumer_root,
+        )
+    observation = (
+        _run_fifo_call_with_watchdog(cleanup, leaf)
+        if leaf_type == "fifo"
+        else cleanup()
+    )
+
+    assert swapped
+    assert quarantine_destination is not None
+    quarantine_name, quarantine_descriptor = quarantine_destination
+    assert observation is not None
+    assert observation.kind == "unsafe_tree"
+    assert observation.retained_run_path == run_directory
+    assert observation.retained_quarantine_path is not None
+    quarantined_leaf = observation.retained_quarantine_path / quarantine_name
+    assert quarantined_leaf.exists() or quarantined_leaf.is_symlink()
+    assert displaced.exists() or displaced.is_symlink()
+    assert not any(
+        name == quarantine_name and descriptor == quarantine_descriptor
+        for name, descriptor in quarantine_unlinks
+    )
+    assert outside_sentinel.read_text() == "keep"
+
+
+def test_cleanup_deadline_after_quarantine_rename_retains_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    (run_directory / "leaf").write_text("validated")
+    original_rename = pytest_execution.os.rename
+    renamed = False
+
+    def track_rename(
+        source: str | bytes | os.PathLike[str],
+        destination: str | bytes | os.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal renamed
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        renamed = True
+
+    monkeypatch.setattr(pytest_execution.os, "rename", track_rename)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+        clock_ns=lambda: 5_000_000_001 if renamed else 0,
+    )
+
+    assert observation is not None
+    assert observation.kind == "budget_exceeded"
+    assert observation.retained_quarantine_path is not None
+    assert tuple(observation.retained_quarantine_path.iterdir())
+
+
+def test_successful_leaf_cleanup_unlinks_only_from_quarantine_and_removes_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_text("keep")
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    (run_directory / "regular").write_text("delete")
+    (run_directory / "symlink").symlink_to(outside_sentinel)
+    _MKFIFO(run_directory / "fifo")
+    original_mkdir = pytest_execution.os.mkdir
+    original_rename = pytest_execution.os.rename
+    original_unlink = pytest_execution.os.unlink
+    quarantine_name: str | None = None
+    quarantine_moves: dict[str, int] = {}
+    quarantine_unlinks: list[tuple[str, int | None]] = []
+
+    def track_mkdir(
+        path: str | bytes | os.PathLike[str],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal quarantine_name
+        name = os.fsdecode(path)
+        if name.startswith(".pyrepo-check-quarantine-"):
+            quarantine_name = name
+            assert mode == 0o700
+            assert dir_fd is not None
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    def track_rename(
+        source: str | bytes | os.PathLike[str],
+        destination: str | bytes | os.PathLike[str],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        assert os.fsdecode(source) in {"regular", "symlink", "fifo"}
+        assert src_dir_fd is not None and dst_dir_fd is not None
+        quarantine_status = os.fstat(dst_dir_fd)
+        assert quarantine_status.st_dev == os.stat(run_directory.parent).st_dev
+        assert quarantine_status.st_uid == pytest_execution._effective_uid()
+        assert stat.S_IMODE(quarantine_status.st_mode) == 0o700
+        assert not os.get_inheritable(dst_dir_fd)
+        quarantine_moves[os.fsdecode(destination)] = dst_dir_fd
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    def track_unlink(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        name = os.fsdecode(path)
+        quarantine_unlinks.append((name, dir_fd))
+        assert quarantine_moves.get(name) == dir_fd
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "mkdir", track_mkdir)
+    monkeypatch.setattr(pytest_execution.os, "rename", track_rename)
+    monkeypatch.setattr(pytest_execution.os, "unlink", track_unlink)
+
+    observation = _run_fifo_call_with_watchdog(
+        lambda: pytest_execution._remove_run_directory(
+            _cleanup_record(run_directory),
+            consumer_root=consumer_root,
+        ),
+        run_directory / "fifo",
+    )
+
+    assert observation is None
+    assert len(quarantine_moves) == 3
+    assert len(quarantine_unlinks) == 3
+    assert quarantine_name is not None
+    assert not (tmp_path / quarantine_name).exists()
+    assert not run_directory.exists()
+    assert outside_sentinel.read_text() == "keep"
+
+
+def test_quarantine_open_identity_failure_retains_truthful_empty_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    (run_directory / "leaf").write_text("keep")
+    original_open = pytest_execution.os.open
+    original_fstat = pytest_execution.os.fstat
+    quarantine_descriptors: set[int] = set()
+
+    def track_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: int,
+        **kwargs: int | None,
+    ) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if os.fsdecode(path).startswith(".pyrepo-check-quarantine-"):
+            quarantine_descriptors.add(descriptor)
+        return descriptor
+
+    def replace_quarantine_identity(descriptor: int) -> os.stat_result:
+        file_status = original_fstat(descriptor)
+        if descriptor not in quarantine_descriptors:
+            return file_status
+        values = list(file_status)
+        values[1] = file_status.st_ino + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(pytest_execution.os, "open", track_open)
+    monkeypatch.setattr(pytest_execution.os, "fstat", replace_quarantine_identity)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+    )
+
+    assert observation is not None
+    assert observation.kind == "unsafe_tree"
+    assert observation.retained_run_path == run_directory
+    assert observation.retained_quarantine_path is not None
+    assert observation.retained_quarantine_path.parent == tmp_path
+    assert observation.retained_quarantine_path.is_dir()
+    assert not tuple(observation.retained_quarantine_path.iterdir())
+    assert (run_directory / "leaf").read_text() == "keep"
+    observation.retained_quarantine_path.rmdir()
+
+
+def test_quarantine_removal_error_reports_verified_retained_quarantine_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    (run_directory / "leaf").write_text("delete")
+    original_rmdir = pytest_execution.os.rmdir
+    quarantine_rmdir_calls = 0
+
+    def deny_quarantine_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal quarantine_rmdir_calls
+        if os.fsdecode(path).startswith(".pyrepo-check-quarantine-"):
+            quarantine_rmdir_calls += 1
+            raise PermissionError("quarantine removal denied")
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "rmdir", deny_quarantine_rmdir)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+    )
+
+    assert observation is not None
+    assert observation.kind == "io_failed"
+    assert observation.retained_run_path is None
+    assert observation.retained_quarantine_path is not None
+    assert quarantine_rmdir_calls == 1
+    assert observation.retained_quarantine_path.is_dir()
+    assert not tuple(observation.retained_quarantine_path.iterdir())
+    original_rmdir(observation.retained_quarantine_path)
+
+
+def test_quarantine_name_replacement_fails_closed_without_stale_path_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    (run_directory / "leaf").write_text("delete")
+    original_rmdir = pytest_execution.os.rmdir
+    displaced_quarantine: Path | None = None
+
+    def swap_quarantine_during_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal displaced_quarantine
+        name = os.fsdecode(path)
+        if name.startswith(".pyrepo-check-quarantine-"):
+            live_quarantine = tmp_path / name
+            displaced_quarantine = tmp_path / f"displaced-{name}"
+            live_quarantine.rename(displaced_quarantine)
+            live_quarantine.mkdir(mode=0o700)
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_quarantine_during_rmdir)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+    )
+
+    assert observation is not None
+    assert observation.kind == "unsafe_tree"
+    assert observation.retained_run_path is None
+    assert observation.retained_quarantine_path is None
+    assert displaced_quarantine is not None and displaced_quarantine.is_dir()
+    displaced_quarantine.rmdir()
+
+
 def test_cleanup_rejects_validated_entry_missing_during_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1635,7 +1994,7 @@ def test_cleanup_unlinks_symlink_without_touching_outside_and_never_uses_rmtree(
     (run_directory / "outside-link").symlink_to(outside, target_is_directory=True)
 
     monkeypatch.setattr(
-        pytest_execution.shutil,
+        shutil,
         "rmtree",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("production cleanup must not call shutil.rmtree")
@@ -2008,11 +2367,16 @@ def test_setup_failure_is_typed_not_started_and_the_created_run_directory_is_rem
 ) -> None:
     run_directory = safe_run_directory(tmp_path, monkeypatch)
 
-    def fail_copy(source: Path, destination: Path) -> None:
-        del source, destination
+    def fail_copy(
+        source: Path,
+        destination_name: str,
+        *,
+        run_descriptor: int,
+    ) -> None:
+        del source, destination_name, run_descriptor
         raise PermissionError("plugin copy denied")
 
-    monkeypatch.setattr(pytest_execution.shutil, "copyfile", fail_copy)
+    monkeypatch.setattr(pytest_execution, "_copy_plugin_source", fail_copy)
 
     observation = execute_pytest(pytest_check(tmp_path), output_format="json")
 
@@ -2021,6 +2385,420 @@ def test_setup_failure_is_typed_not_started_and_the_created_run_directory_is_rem
     assert observation.pytest.preflight.classification == "not_started"
     assert observation.pytest.artifact.state == "not_attempted"
     assert not run_directory.exists()
+
+
+def test_plugin_preparation_completes_partial_descriptor_writes(
+    tmp_path: Path,
+) -> None:
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    verified = pytest_execution._open_verified_run_directory(
+        _cleanup_record(run_directory)
+    )
+    original_write = pytest_execution.os.write
+
+    def partial_write(descriptor: int, content: bytes) -> int:
+        return original_write(descriptor, content[: max(1, len(content) // 3)])
+
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(pytest_execution.os, "write", partial_write)
+            _artifact_path, writer_directory = pytest_execution._prepare_run_directory(
+                verified,
+                "_pyrepo_check_pytest_partial_write",
+            )
+        plugin = run_directory / "_pyrepo_check_pytest_partial_write.py"
+        assert plugin.read_bytes() == Path(pytest_execution.__file__).with_name(
+            "_pytest_report_plugin.py"
+        ).read_bytes()
+        assert stat.S_IMODE(plugin.stat().st_mode) == 0o600
+        assert writer_directory.is_dir()
+        assert stat.S_IMODE(writer_directory.stat().st_mode) == 0o700
+    finally:
+        verified.close()
+        shutil.rmtree(run_directory, ignore_errors=True)
+
+
+@pytest.mark.parametrize("setup_failure", (False, True), ids=("success", "failure"))
+def test_verified_run_descriptors_close_on_all_execution_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setup_failure: bool,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    original_open_verified = pytest_execution._open_verified_run_directory
+    original_close = pytest_execution.os.close
+    verified_descriptors: set[int] = set()
+    closed: set[int] = set()
+
+    def track_open_verified(
+        record: pytest_execution._RunDirectory,
+    ) -> pytest_execution._VerifiedRunDirectory:
+        verified = original_open_verified(record)
+        verified_descriptors.update(
+            {verified.parent_descriptor, verified.descriptor}
+        )
+        return verified
+
+    def track_close(descriptor: int) -> None:
+        closed.add(descriptor)
+        original_close(descriptor)
+
+    def fail_copy(
+        source: Path,
+        destination_name: str,
+        *,
+        run_descriptor: int,
+    ) -> Never:
+        del source, destination_name, run_descriptor
+        raise PermissionError("plugin copy denied")
+
+    monkeypatch.setattr(
+        pytest_execution,
+        "_open_verified_run_directory",
+        track_open_verified,
+    )
+    monkeypatch.setattr(pytest_execution.os, "close", track_close)
+    if setup_failure:
+        monkeypatch.setattr(pytest_execution, "_copy_plugin_source", fail_copy)
+
+    observation = execute_pytest(
+        pytest_check(tmp_path),
+        output_format="json",
+        runner=lambda command, **_kwargs: completed(
+            command,
+            0,
+            stdout=preflight_document(
+                pytest_available=False,
+                pytest_version=None,
+            ),
+        ),
+    )
+
+    assert verified_descriptors
+    assert verified_descriptors <= closed
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == (
+        "not_started" if setup_failure else "module_unavailable"
+    )
+    assert not run_directory.exists()
+
+
+def test_run_swap_after_create_stops_before_preparation_or_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    record = _cleanup_record(run_directory)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+    replacement_sentinel = run_directory / "replacement-sentinel"
+    runner_calls: list[tuple[str, ...]] = []
+
+    def create_then_swap(_consumer_root: Path) -> pytest_execution._RunDirectory:
+        run_directory.rename(displaced)
+        run_directory.mkdir()
+        replacement_sentinel.write_text("keep")
+        return record
+
+    def runner(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        runner_calls.append(command)
+        return completed(command, 0, stdout=preflight_document())
+
+    monkeypatch.setattr(pytest_execution, "_create_run_directory", create_then_swap)
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+        assert replacement_sentinel.read_text() == "keep"
+        assert tuple(path.name for path in run_directory.iterdir()) == (
+            "replacement-sentinel",
+        )
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert runner_calls == []
+    assert observation.processes == ()
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "not_started"
+    assert observation.pytest.preflight.diagnostic == (
+        "OSError: run directory identity mismatch before preparation"
+    )
+    assert observation.pytest.artifact.state == "not_attempted"
+
+
+def test_run_swap_during_preparation_stays_fd_bound_and_post_gate_stops_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+    replacement_sentinel = run_directory / "replacement-sentinel"
+    original_write = pytest_execution.os.write
+    swapped = False
+    runner_calls: list[tuple[str, ...]] = []
+
+    def swap_on_first_plugin_write(descriptor: int, content: bytes) -> int:
+        nonlocal swapped
+        if not swapped:
+            run_directory.rename(displaced)
+            run_directory.mkdir()
+            replacement_sentinel.write_text("keep")
+            swapped = True
+        return original_write(descriptor, content)
+
+    def runner(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        runner_calls.append(command)
+        return completed(command, 0, stdout=preflight_document())
+
+    monkeypatch.setattr(pytest_execution.os, "write", swap_on_first_plugin_write)
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+        assert replacement_sentinel.read_text() == "keep"
+        assert tuple(path.name for path in run_directory.iterdir()) == (
+            "replacement-sentinel",
+        )
+        assert any(path.name.startswith("_pyrepo_check_pytest_") for path in displaced.iterdir())
+        assert (displaced / "writers").is_dir()
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert swapped
+    assert runner_calls == []
+    assert observation.processes == ()
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "not_started"
+    assert observation.pytest.preflight.diagnostic == (
+        "OSError: run directory identity mismatch after preparation"
+    )
+
+
+def test_run_swap_before_preflight_stops_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+    replacement_sentinel = run_directory / "replacement-sentinel"
+    original_environment = pytest_execution._isolated_environment
+    runner_calls: list[tuple[str, ...]] = []
+
+    def environment_then_swap(
+        run_path: Path,
+        artifact_path: Path,
+        writer_directory: Path,
+    ) -> dict[str, str]:
+        environment = original_environment(run_path, artifact_path, writer_directory)
+        run_directory.rename(displaced)
+        run_directory.mkdir()
+        replacement_sentinel.write_text("keep")
+        return environment
+
+    def runner(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        runner_calls.append(command)
+        return completed(command, 0, stdout=preflight_document())
+
+    monkeypatch.setattr(pytest_execution, "_isolated_environment", environment_then_swap)
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+        assert replacement_sentinel.read_text() == "keep"
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert runner_calls == []
+    assert observation.processes == ()
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "not_started"
+    assert observation.pytest.preflight.diagnostic == (
+        "OSError: run directory identity mismatch immediately before preflight"
+    )
+
+
+def test_run_swap_after_supported_preflight_retains_real_process_and_stops_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+    replacement_sentinel = run_directory / "replacement-sentinel"
+    calls = 0
+
+    def runner(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            run_directory.rename(displaced)
+            run_directory.mkdir()
+            replacement_sentinel.write_text("keep")
+        return completed(command, 0, stdout=preflight_document())
+
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+        assert replacement_sentinel.read_text() == "keep"
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert calls == 1
+    assert len(observation.processes) == 1
+    assert observation.processes[0].role == "pytest_preflight"
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "preflight_invalid"
+    assert observation.pytest.preflight.record is None
+    assert observation.pytest.preflight.diagnostic == (
+        "run directory identity mismatch after pytest preflight"
+    )
+    validation = validate_pytest_execution(observation)
+    assert isinstance(validation, PytestValidationFailure)
+    assert validation.code == "preflight_invalid"
+    plan = RunPlan(
+        mode="focused",
+        targets=("tests",),
+        checks=(observation.planned,),
+        output_format="json",
+        pytest_args=("tests",),
+        planned_test_scope="partial",
+    )
+    report = build_run_report(
+        tmp_path,
+        plan,
+        ExecutionResult((observation,), 2),
+    )
+    validate_report_v1(report)
+
+
+def test_run_swap_after_unsupported_preflight_still_applies_identity_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+
+    def runner(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        run_directory.rename(displaced)
+        run_directory.mkdir()
+        return completed(
+            command,
+            0,
+            stdout=preflight_document(pytest_version=[9, 0, 0]),
+        )
+
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert len(observation.processes) == 1
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "preflight_invalid"
+    assert observation.pytest.preflight.record is None
+    assert observation.pytest.preflight.diagnostic == (
+        "run directory identity mismatch after pytest preflight"
+    )
+
+
+def test_run_swap_inside_primary_retains_processes_without_snapshotting_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+    replacement_artifact = run_directory / "artifact.json"
+    calls = 0
+
+    def runner(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            run_directory.rename(displaced)
+            run_directory.mkdir()
+            replacement_artifact.write_bytes(b'"untrusted replacement"')
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if calls == 1 else b"",
+        )
+
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
+        assert replacement_artifact.read_bytes() == b'"untrusted replacement"'
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert calls == 2
+    assert [process.role for process in observation.processes] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "supported"
+    assert observation.pytest.artifact.state == "unsafe_path"
+    assert observation.pytest.artifact.content is None
+    assert observation.pytest.artifact.diagnostic == (
+        "run directory identity mismatch after pytest primary"
+    )
+    assert observation.pytest.cleanup_error is not None
+    validation = validate_pytest_execution(observation)
+    assert isinstance(validation, PytestValidationFailure)
+    assert validation.code == "artifact_invalid"
+    plan = RunPlan(
+        mode="focused",
+        targets=("tests",),
+        checks=(observation.planned,),
+        output_format="json",
+        pytest_args=("tests",),
+        planned_test_scope="partial",
+    )
+    report = build_run_report(
+        tmp_path,
+        plan,
+        ExecutionResult((observation,), 2),
+    )
+    validate_report_v1(report)
 
 
 def test_consumer_tmpdir_is_not_used_for_the_run_directory(
@@ -2143,9 +2921,12 @@ def test_parent_replacement_after_mkdtemp_stops_before_preparation_and_runner(
         replacement_run_directories.append(replacement)
         return str(replacement)
 
-    def track_prepare(run_directory: Path, plugin_module: str) -> tuple[Path, Path]:
-        prepared.append(run_directory)
-        return original_prepare(run_directory, plugin_module)
+    def track_prepare(
+        verified_run: pytest_execution._VerifiedRunDirectory,
+        plugin_module: str,
+    ) -> tuple[Path, Path]:
+        prepared.append(verified_run.run_directory.path)
+        return original_prepare(verified_run, plugin_module)
 
     def runner(
         command: tuple[str, ...],
@@ -2616,16 +3397,16 @@ def test_cleanup_preserves_inner_descriptor_relative_deletion_failure(
     descriptor_relative_failure = False
     top_level_removals: list[Path] = []
 
-    def deny_plugin_unlink(
+    def deny_quarantine_unlink(
         path: str | bytes | os.PathLike[str],
         *,
         dir_fd: int | None = None,
     ) -> None:
         nonlocal descriptor_relative_failure
         filename = os.fsdecode(path)
-        if filename.startswith("_pyrepo_check_pytest_") and filename.endswith(".py"):
+        if filename.startswith("leaf-"):
             descriptor_relative_failure = dir_fd is not None
-            raise PermissionError("plugin deletion denied")
+            raise PermissionError("quarantine deletion denied")
         original_unlink(path, dir_fd=dir_fd)
 
     def track_rmdir(
@@ -2637,7 +3418,7 @@ def test_cleanup_preserves_inner_descriptor_relative_deletion_failure(
             top_level_removals.append(Path(os.fsdecode(path)))
         original_rmdir(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(pytest_execution.os, "unlink", deny_plugin_unlink)
+    monkeypatch.setattr(pytest_execution.os, "unlink", deny_quarantine_unlink)
     monkeypatch.setattr(pytest_execution.os, "rmdir", track_rmdir)
 
     def runner(
@@ -2669,6 +3450,8 @@ def test_cleanup_preserves_inner_descriptor_relative_deletion_failure(
     assert descriptor_relative_failure
     assert run_directory not in top_level_removals
     assert observation.pytest is not None
-    assert observation.pytest.cleanup_error == (
-        f"PermissionError: plugin deletion denied; retained path: {run_directory}"
+    assert observation.pytest.cleanup_error is not None
+    assert observation.pytest.cleanup_error.startswith(
+        f"PermissionError: quarantine deletion denied; retained run path: {run_directory}; "
+        "retained quarantine path: "
     )

@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
 import stat
 import sys
 import tempfile
@@ -48,6 +47,8 @@ _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
 _STAT_SUPPORTS_FOLLOW_SYMLINKS = os.stat in os.supports_follow_symlinks
 _UNLINK_SUPPORTS_DIR_FD = os.unlink in os.supports_dir_fd
 _RMDIR_SUPPORTS_DIR_FD = os.rmdir in os.supports_dir_fd
+_MKDIR_SUPPORTS_DIR_FD = os.mkdir in os.supports_dir_fd
+_RENAME_SUPPORTS_DIR_FD = os.rename in os.supports_dir_fd
 _DARWIN_GETPATH_UNLINK_PROOF = (
     sys.platform == "darwin"
     and _fcntl is not None
@@ -128,6 +129,62 @@ class _RunDirectory:
     parent_identity: tuple[int, int]
 
 
+@dataclass
+class _VerifiedRunDirectory:
+    run_directory: _RunDirectory
+    parent_descriptor: int
+    descriptor: int
+
+    def verify(self, gate: str) -> None:
+        message = f"run directory identity mismatch {gate}"
+        try:
+            parent_status = os.fstat(self.parent_descriptor)
+            lexical_parent_status = os.stat(
+                self.run_directory.path.parent,
+                follow_symlinks=False,
+            )
+            relative_status = os.stat(
+                self.run_directory.path.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor_status = os.fstat(self.descriptor)
+            lexical_status = os.stat(
+                self.run_directory.path,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise OSError(message) from error
+        if (
+            _status_identity(parent_status) != self.run_directory.parent_identity
+            or not stat.S_ISDIR(parent_status.st_mode)
+            or _status_identity(lexical_parent_status)
+            != self.run_directory.parent_identity
+            or not stat.S_ISDIR(lexical_parent_status.st_mode)
+            or _status_identity(relative_status) != self.run_directory.identity
+            or not stat.S_ISDIR(relative_status.st_mode)
+            or _status_identity(descriptor_status) != self.run_directory.identity
+            or not stat.S_ISDIR(descriptor_status.st_mode)
+            or _status_identity(lexical_status) != self.run_directory.identity
+            or not stat.S_ISDIR(lexical_status.st_mode)
+        ):
+            raise OSError(message)
+
+    def close(self) -> None:
+        run_error: OSError | None = None
+        try:
+            os.close(self.descriptor)
+        except OSError as error:
+            run_error = error
+        try:
+            os.close(self.parent_descriptor)
+        except OSError:
+            if run_error is None:
+                raise
+        if run_error is not None:
+            raise run_error
+
+
 CleanupFailureKind = Literal["budget_exceeded", "unsafe_tree", "io_failed"]
 CleanupEntryType = Literal["directory", "symlink", "regular", "other"]
 CleanupManifestKey = tuple[tuple[int, int], str]
@@ -141,7 +198,13 @@ class _ScandirIterator(Iterator[os.DirEntry[str]], Protocol):
 class _CleanupObservation:
     kind: CleanupFailureKind
     message: str
-    retained_path: Path | None
+    retained_run_path: Path | None
+    retained_quarantine_path: Path | None
+
+    @property
+    def retained_path(self) -> Path | None:
+        """Compatibility alias for the original private cleanup observation."""
+        return self.retained_run_path
 
 
 class _CleanupFailure(OSError):
@@ -149,6 +212,17 @@ class _CleanupFailure(OSError):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+class _QuarantineSetupFailure(_CleanupFailure):
+    def __init__(
+        self,
+        kind: CleanupFailureKind,
+        message: str,
+        quarantine: _QuarantineDirectory,
+    ) -> None:
+        super().__init__(kind, message)
+        self.quarantine = quarantine
 
 
 @dataclass(frozen=True)
@@ -163,10 +237,22 @@ class _CleanupManifest:
 
 
 @dataclass
+class _QuarantineDirectory:
+    name: str
+    identity: tuple[int, int]
+    descriptor: int | None
+    may_contain_data: bool = False
+    ever_contained_data: bool = False
+    removed: bool = False
+    cleanup_allowed: bool = True
+
+
+@dataclass
 class _CleanupBudget:
     started_ns: int
     clock_ns: Callable[[], int]
     entries: int = 0
+    quarantine: _QuarantineDirectory | None = None
 
     def observe_entry(self, *, depth: int) -> None:
         self.entries += 1
@@ -250,17 +336,22 @@ def execute_pytest(
         )
 
     cleanup_error: str | None = None
+    verified_run: _VerifiedRunDirectory | None = None
     try:
+        verified_run = _open_verified_run_directory(run_directory)
+        verified_run.verify("before preparation")
         plugin_module = f"_pyrepo_check_pytest_{secrets.token_hex(16)}"
         artifact_path, writer_directory = _prepare_run_directory(
-            run_directory.path,
+            verified_run,
             plugin_module,
         )
+        verified_run.verify("after preparation")
         environment = _isolated_environment(
             run_directory.path,
             artifact_path,
             writer_directory,
         )
+        verified_run.verify("immediately before preflight")
         process = _run_preflight(
             command=(*pytest_plan.consumer_python, "-c", _PREFLIGHT_PROBE),
             cwd=check.cwd,
@@ -270,25 +361,44 @@ def execute_pytest(
         )
         preflight = _classify_preflight(process)
         processes.append(process)
-        if preflight.classification == "supported":
-            processes.append(
-                _run_primary(
-                    command=(
-                        *pytest_plan.consumer_python,
-                        "-m",
-                        "pytest",
-                        "-p",
-                        plugin_module,
-                        *pytest_plan.pytest_args,
-                    ),
-                    cwd=check.cwd,
-                    runner=runner,
-                    clock_ns=clock_ns,
-                    environment=environment,
-                    capture_output=output_format == "json",
-                )
+        try:
+            verified_run.verify("after pytest preflight")
+        except OSError as error:
+            preflight = PytestPreflightObservation(
+                "preflight_invalid",
+                None,
+                str(error),
             )
-            artifact = _snapshot_artifact(artifact_path, writer_directory)
+        else:
+            if preflight.classification == "supported":
+                processes.append(
+                    _run_primary(
+                        command=(
+                            *pytest_plan.consumer_python,
+                            "-m",
+                            "pytest",
+                            "-p",
+                            plugin_module,
+                            *pytest_plan.pytest_args,
+                        ),
+                        cwd=check.cwd,
+                        runner=runner,
+                        clock_ns=clock_ns,
+                        environment=environment,
+                        capture_output=output_format == "json",
+                    )
+                )
+                try:
+                    verified_run.verify("after pytest primary")
+                except OSError as error:
+                    artifact = PytestArtifactObservation(
+                        "unsafe_path",
+                        None,
+                        (),
+                        str(error),
+                    )
+                else:
+                    artifact = _snapshot_artifact(artifact_path, writer_directory)
     except OSError as error:
         preflight = PytestPreflightObservation(
             "not_started",
@@ -296,6 +406,12 @@ def execute_pytest(
             f"{type(error).__name__}: {error}",
         )
     finally:
+        if verified_run is not None:
+            try:
+                verified_run.close()
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = f"{type(error).__name__}: {error}"
         try:
             cleanup_observation = _remove_run_directory(
                 run_directory,
@@ -358,16 +474,47 @@ def _run_primary(
 
 
 def _prepare_run_directory(
-    run_directory: Path,
+    verified_run: _VerifiedRunDirectory,
     plugin_module: str,
 ) -> tuple[Path, Path]:
+    run_directory = verified_run.run_directory.path
     plugin_source = Path(__file__).with_name("_pytest_report_plugin.py")
     plugin_path = run_directory / f"{plugin_module}.py"
-    shutil.copyfile(plugin_source, plugin_path)
-    os.chmod(plugin_path, 0o600)
+    _copy_plugin_source(
+        plugin_source,
+        plugin_path.name,
+        run_descriptor=verified_run.descriptor,
+    )
     writer_directory = run_directory / "writers"
-    writer_directory.mkdir(mode=0o700)
+    os.mkdir(writer_directory.name, mode=0o700, dir_fd=verified_run.descriptor)
     return run_directory / "artifact.json", writer_directory
+
+
+def _copy_plugin_source(
+    source: Path,
+    destination_name: str,
+    *,
+    run_descriptor: int,
+) -> None:
+    no_follow = cast(int, getattr(os, "O_NOFOLLOW"))
+    descriptor = os.open(
+        destination_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+        0o600,
+        dir_fd=run_descriptor,
+    )
+    try:
+        os.set_inheritable(descriptor, False)
+        with source.open("rb") as plugin_source:
+            while chunk := plugin_source.read(_READ_CHUNK_BYTES):
+                written = 0
+                while written < len(chunk):
+                    count = os.write(descriptor, chunk[written:])
+                    if count <= 0:
+                        raise OSError("plugin copy made no forward progress")
+                    written += count
+    finally:
+        os.close(descriptor)
 
 
 def _create_run_directory(consumer_root: Path) -> _RunDirectory:
@@ -592,6 +739,7 @@ def _remove_run_directory(
 ) -> _CleanupObservation | None:
     parent_descriptor: int | None = None
     parent_verified = False
+    quarantine: _QuarantineDirectory | None = None
     observation: _CleanupObservation | None = None
     close_error: OSError | None = None
     started_ns = clock_ns()
@@ -603,6 +751,11 @@ def _remove_run_directory(
             )
         parent_descriptor = _open_verified_parent(run_directory)
         parent_verified = True
+        quarantine = _create_quarantine_directory(
+            parent_descriptor,
+            expected_device=run_directory.identity[0],
+            budget=_CleanupBudget(started_ns, clock_ns),
+        )
         manifest = _walk_cleanup_tree(
             parent_descriptor,
             run_directory.path.name,
@@ -610,15 +763,19 @@ def _remove_run_directory(
             budget=_CleanupBudget(started_ns, clock_ns),
             delete=False,
         )
+        deletion_budget = _CleanupBudget(
+            started_ns,
+            clock_ns,
+            quarantine=quarantine,
+        )
         _walk_cleanup_tree(
             parent_descriptor,
             run_directory.path.name,
             run_directory.identity,
-            budget=_CleanupBudget(started_ns, clock_ns),
+            budget=deletion_budget,
             delete=True,
             manifest=manifest,
         )
-        deletion_budget = _CleanupBudget(started_ns, clock_ns)
         _remove_verified_relative_directory(
             parent_descriptor,
             run_directory.path.name,
@@ -627,34 +784,113 @@ def _remove_run_directory(
             budget=deletion_budget,
             identity_mismatch_message="run directory identity mismatch before root removal",
         )
+        _remove_held_relative_directory(
+            parent_descriptor,
+            quarantine,
+            budget=deletion_budget,
+            identity_mismatch_message=(
+                "quarantine directory identity mismatch before removal"
+            ),
+        )
     except _CleanupFailure as error:
-        retained_path = _verified_retained_path(
+        if isinstance(error, _QuarantineSetupFailure):
+            quarantine = error.quarantine
+        cleanup_message = error.message
+        if (
+            quarantine is not None
+            and not quarantine.removed
+            and not quarantine.may_contain_data
+            and not quarantine.ever_contained_data
+            and quarantine.cleanup_allowed
+            and parent_descriptor is not None
+        ):
+            try:
+                _remove_held_relative_directory(
+                    parent_descriptor,
+                    quarantine,
+                    budget=_CleanupBudget(started_ns, clock_ns),
+                    identity_mismatch_message=(
+                        "quarantine directory identity mismatch before failure cleanup"
+                    ),
+                )
+            except OSError as cleanup_error:
+                cleanup_message = (
+                    f"{cleanup_message}; empty quarantine cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        retained_run_path = _verified_retained_path(
             run_directory,
             parent_descriptor if parent_verified else None,
         )
-        observation = _CleanupObservation(error.kind, error.message, retained_path)
-    except OSError as error:
-        retained_path = _verified_retained_path(
+        retained_quarantine_path = _verified_quarantine_path(
             run_directory,
+            quarantine,
+            parent_descriptor if parent_verified else None,
+        )
+        observation = _CleanupObservation(
+            error.kind,
+            cleanup_message,
+            retained_run_path,
+            retained_quarantine_path,
+        )
+    except OSError as error:
+        cleanup_message = f"{type(error).__name__}: {error}"
+        if (
+            quarantine is not None
+            and not quarantine.removed
+            and not quarantine.may_contain_data
+            and not quarantine.ever_contained_data
+            and quarantine.cleanup_allowed
+            and parent_descriptor is not None
+        ):
+            try:
+                _remove_held_relative_directory(
+                    parent_descriptor,
+                    quarantine,
+                    budget=_CleanupBudget(started_ns, clock_ns),
+                    identity_mismatch_message=(
+                        "quarantine directory identity mismatch before failure cleanup"
+                    ),
+                )
+            except OSError as cleanup_error:
+                cleanup_message = (
+                    f"{cleanup_message}; empty quarantine cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        retained_run_path = _verified_retained_path(
+            run_directory,
+            parent_descriptor if parent_verified else None,
+        )
+        retained_quarantine_path = _verified_quarantine_path(
+            run_directory,
+            quarantine,
             parent_descriptor if parent_verified else None,
         )
         observation = _CleanupObservation(
             "io_failed",
-            f"{type(error).__name__}: {error}",
-            retained_path,
+            cleanup_message,
+            retained_run_path,
+            retained_quarantine_path,
         )
     finally:
+        if quarantine is not None and quarantine.descriptor is not None:
+            try:
+                os.close(quarantine.descriptor)
+            except OSError as error:
+                close_error = error
         if parent_descriptor is not None:
             try:
                 os.close(parent_descriptor)
             except OSError as error:
-                close_error = error
+                if close_error is None:
+                    close_error = error
     if observation is not None:
         return observation
     if close_error is not None:
         return _CleanupObservation(
             "io_failed",
             f"{type(close_error).__name__}: {close_error}",
+            None,
             None,
         )
     return None
@@ -766,7 +1002,6 @@ def _walk_cleanup_tree(
                         "unsafe_tree",
                         f"cleanup entry identity or type mismatch: {entry.name}",
                     )
-                remaining.remove(key)
             else:
                 if key in manifest_entries:
                     raise _CleanupFailure(
@@ -775,6 +1010,8 @@ def _walk_cleanup_tree(
                     )
                 manifest_entries[key] = observed_entry
             if stat.S_ISDIR(child_status.st_mode):
+                if delete:
+                    remaining.remove(key)
                 child_identity = _status_identity(child_status)
                 child_descriptor, verified_status = _open_verified_relative_directory(
                     frame.descriptor,
@@ -801,8 +1038,21 @@ def _walk_cleanup_tree(
                 )
                 continue
             if delete:
-                budget.check_deadline()
-                os.unlink(entry.name, dir_fd=frame.descriptor)
+                quarantine = budget.quarantine
+                if quarantine is None:
+                    raise _CleanupFailure(
+                        "unsafe_tree",
+                        "cleanup leaf quarantine is unavailable",
+                    )
+                _quarantine_and_remove_leaf(
+                    frame.descriptor,
+                    entry.name,
+                    manifest.entries[key] if manifest is not None else observed_entry,
+                    key=key,
+                    remaining=remaining,
+                    quarantine=quarantine,
+                    budget=budget,
+                )
         if delete and remaining:
             raise _CleanupFailure(
                 "unsafe_tree",
@@ -823,6 +1073,126 @@ def _walk_cleanup_tree(
                 pass
 
 
+def _create_quarantine_directory(
+    parent_descriptor: int,
+    *,
+    expected_device: int,
+    budget: _CleanupBudget,
+) -> _QuarantineDirectory:
+    budget.check_deadline()
+    name = f".pyrepo-check-quarantine-{secrets.token_hex(16)}"
+    os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+    descriptor: int | None = None
+    quarantine: _QuarantineDirectory | None = None
+    try:
+        budget.check_deadline()
+        file_status = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        identity = _status_identity(file_status)
+        quarantine = _QuarantineDirectory(name, identity, None)
+        if (
+            not stat.S_ISDIR(file_status.st_mode)
+            or file_status.st_dev != expected_device
+            or file_status.st_uid != _effective_uid()
+            or stat.S_IMODE(file_status.st_mode) != 0o700
+        ):
+            quarantine.cleanup_allowed = False
+            raise _QuarantineSetupFailure(
+                "unsafe_tree",
+                "created quarantine directory is not private or trusted",
+                quarantine,
+            )
+        descriptor = os.open(
+            name,
+            _secure_directory_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+        quarantine.descriptor = descriptor
+        os.set_inheritable(descriptor, False)
+        budget.check_deadline()
+        verified_status = os.fstat(descriptor)
+        if (
+            _status_identity(verified_status) != identity
+            or not stat.S_ISDIR(verified_status.st_mode)
+            or verified_status.st_dev != expected_device
+            or verified_status.st_uid != _effective_uid()
+            or stat.S_IMODE(verified_status.st_mode) != 0o700
+        ):
+            quarantine.cleanup_allowed = False
+            raise _QuarantineSetupFailure(
+                "unsafe_tree",
+                "opened quarantine directory identity or privacy mismatch",
+                quarantine,
+            )
+        return quarantine
+    except _QuarantineSetupFailure:
+        raise
+    except BaseException as error:
+        if quarantine is not None:
+            quarantine.cleanup_allowed = False
+            raise _QuarantineSetupFailure(
+                "unsafe_tree",
+                f"could not securely open quarantine directory: {type(error).__name__}: {error}",
+                quarantine,
+            ) from error
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+        raise
+
+
+def _quarantine_and_remove_leaf(
+    source_descriptor: int,
+    source_name: str,
+    expected_entry: _CleanupManifestEntry,
+    *,
+    key: CleanupManifestKey,
+    remaining: set[CleanupManifestKey],
+    quarantine: _QuarantineDirectory,
+    budget: _CleanupBudget,
+) -> None:
+    if quarantine.descriptor is None:
+        raise _CleanupFailure(
+            "unsafe_tree",
+            "cleanup leaf quarantine descriptor is unavailable",
+        )
+    quarantine_name = f"leaf-{secrets.token_hex(16)}"
+    budget.check_deadline()
+    quarantine.may_contain_data = True
+    quarantine.ever_contained_data = True
+    os.rename(
+        source_name,
+        quarantine_name,
+        src_dir_fd=source_descriptor,
+        dst_dir_fd=quarantine.descriptor,
+    )
+    budget.check_deadline()
+    quarantined_status = os.stat(
+        quarantine_name,
+        dir_fd=quarantine.descriptor,
+        follow_symlinks=False,
+    )
+    quarantined_entry = _CleanupManifestEntry(
+        _status_identity(quarantined_status),
+        _cleanup_entry_type(quarantined_status.st_mode),
+    )
+    if quarantined_entry != expected_entry:
+        raise _CleanupFailure(
+            "unsafe_tree",
+            f"quarantined cleanup entry identity or type mismatch: {source_name}",
+        )
+    remaining.remove(key)
+    budget.check_deadline()
+    os.unlink(quarantine_name, dir_fd=quarantine.descriptor)
+    quarantine.may_contain_data = False
+    budget.check_deadline()
+
+
 def _open_verified_parent(run_directory: _RunDirectory) -> int:
     parent_identity = run_directory.parent_identity
     if parent_identity is None:
@@ -839,6 +1209,68 @@ def _open_verified_parent(run_directory: _RunDirectory) -> int:
             pass
         raise
     return descriptor
+
+
+def _open_verified_run_directory(
+    run_directory: _RunDirectory,
+) -> _VerifiedRunDirectory:
+    parent_descriptor = _open_verified_parent(run_directory)
+    run_descriptor: int | None = None
+    try:
+        run_descriptor = os.open(
+            run_directory.path.name,
+            _secure_directory_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+        os.set_inheritable(run_descriptor, False)
+        verified = _VerifiedRunDirectory(
+            run_directory,
+            parent_descriptor,
+            run_descriptor,
+        )
+        verified.verify("before preparation")
+    except BaseException:
+        if run_descriptor is not None:
+            try:
+                os.close(run_descriptor)
+            except BaseException:
+                pass
+        try:
+            os.close(parent_descriptor)
+        except BaseException:
+            pass
+        raise
+    return verified
+
+
+def _remove_held_relative_directory(
+    parent_descriptor: int,
+    directory: _QuarantineDirectory,
+    *,
+    budget: _CleanupBudget,
+    identity_mismatch_message: str,
+) -> None:
+    if directory.descriptor is None:
+        raise _CleanupFailure(
+            "unsafe_tree",
+            "quarantine directory descriptor is unavailable for removal",
+        )
+    budget.check_deadline()
+    _verify_relative_identity(
+        parent_descriptor,
+        directory.name,
+        directory.identity,
+        identity_mismatch_message,
+    )
+    budget.check_deadline()
+    os.rmdir(directory.name, dir_fd=parent_descriptor)
+    budget.check_deadline()
+    if _opened_directory_remains_linked(directory.descriptor):
+        raise _CleanupFailure(
+            "unsafe_tree",
+            f"directory remained linked after removal: {directory.name}",
+        )
+    directory.removed = True
 
 
 def _open_verified_relative_directory(
@@ -995,6 +1427,45 @@ def _verified_retained_path(
     return run_directory.path
 
 
+def _verified_quarantine_path(
+    run_directory: _RunDirectory,
+    quarantine: _QuarantineDirectory | None,
+    parent_descriptor: int | None,
+) -> Path | None:
+    if quarantine is None or quarantine.removed or parent_descriptor is None:
+        return None
+    try:
+        parent_identity = run_directory.parent_identity
+        if _status_identity(os.fstat(parent_descriptor)) != parent_identity:
+            return None
+        lexical_parent_status = os.stat(
+            run_directory.path.parent,
+            follow_symlinks=False,
+        )
+        if (
+            _status_identity(lexical_parent_status) != parent_identity
+            or not stat.S_ISDIR(lexical_parent_status.st_mode)
+        ):
+            return None
+        relative_status = os.stat(
+            quarantine.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        lexical_path = run_directory.path.parent / quarantine.name
+        lexical_status = os.stat(lexical_path, follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        _status_identity(relative_status) != quarantine.identity
+        or not stat.S_ISDIR(relative_status.st_mode)
+        or _status_identity(lexical_status) != quarantine.identity
+        or not stat.S_ISDIR(lexical_status.st_mode)
+    ):
+        return None
+    return lexical_path
+
+
 def _secure_directory_open_flags() -> int:
     directory_only = cast(int, getattr(os, "O_DIRECTORY"))
     no_follow = cast(int, getattr(os, "O_NOFOLLOW"))
@@ -1002,10 +1473,27 @@ def _secure_directory_open_flags() -> int:
     return os.O_RDONLY | directory_only | no_follow | non_blocking
 
 
+def _effective_uid() -> int:
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        raise _CleanupFailure(
+            "unsafe_tree",
+            "effective user identity is unavailable",
+        )
+    return cast(Callable[[], int], get_effective_uid)()
+
+
 def _cleanup_diagnostic(observation: _CleanupObservation) -> str:
     diagnostic = observation.message
-    if observation.retained_path is not None:
-        diagnostic = f"{diagnostic}; retained path: {observation.retained_path}"
+    if observation.retained_run_path is not None:
+        diagnostic = (
+            f"{diagnostic}; retained run path: {observation.retained_run_path}"
+        )
+    if observation.retained_quarantine_path is not None:
+        diagnostic = (
+            f"{diagnostic}; retained quarantine path: "
+            f"{observation.retained_quarantine_path}"
+        )
     return diagnostic
 
 
@@ -1167,6 +1655,9 @@ def _platform_capability_error() -> str | None:
         or not _STAT_SUPPORTS_FOLLOW_SYMLINKS
         or not _UNLINK_SUPPORTS_DIR_FD
         or not _RMDIR_SUPPORTS_DIR_FD
+        or not _MKDIR_SUPPORTS_DIR_FD
+        or not _RENAME_SUPPORTS_DIR_FD
+        or not callable(getattr(os, "geteuid", None))
         or not _POST_RMDIR_UNLINK_PROOF
     ):
         return (
