@@ -1284,10 +1284,12 @@ def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failur
         ),
     )
 
-    rendered_cleanup = render_terminal(cleanup_report)
-
-    assert "error: pytest: Could not clean up pytest evidence" in rendered_cleanup
-    assert "failed: pytest (exit 1)" in rendered_cleanup
+    assert render_terminal(cleanup_report) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest: Could not clean up pytest evidence: PermissionError: denied\n"
+        "    diagnostic: pytest pytest_preflight stdout: preflight\n"
+        "    failed: pytest (exit 1)\n"
+    )
 
     preflight = ExecutedCheck(
         planned=check,
@@ -1298,7 +1300,41 @@ def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failur
         tmp_path, run_plan((check,)), ExecutionResult((preflight,), 2)
     )
 
-    assert "preflight stdout: preflight" in render_terminal(preflight_report)
+    assert render_terminal(preflight_report) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest evidence: supported preflight has no pytest version\n"
+        "    diagnostic: pytest pytest_preflight stdout: preflight\n"
+    )
+
+
+def test_terminal_projects_each_logical_pytest_error_once(tmp_path: Path) -> None:
+    interrupted = pytest_report_for_exit(tmp_path, 2)
+    artifact_observation = finalized_pytest_execution_observation()
+    artifact_missing = pytest_report_for_exit(
+        tmp_path,
+        0,
+        observation=replace(
+            artifact_observation,
+            artifact=PytestArtifactObservation("missing", None, (), None),
+        ),
+    )
+    check = pytest_planned_check(tmp_path)
+    not_started = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((), 0))
+
+    assert render_terminal(interrupted) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest evidence: pytest execution was interrupted\n"
+        "    diagnostic: pytest pytest_preflight stdout: preflight\n"
+    )
+    assert render_terminal(artifact_missing) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest evidence: pytest artifact is missing\n"
+        "    diagnostic: pytest pytest_preflight stdout: preflight\n"
+    )
+    assert render_terminal(not_started) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest evidence: pytest execution was not observed\n"
+    )
 
 
 def test_missing_test_reason_advisories_include_empty_reasons_and_deduplicate(
@@ -1413,6 +1449,140 @@ def test_serialize_json_projects_exact_nested_pytest_exit_five_shape(tmp_path: P
         "error": None,
     }
     assert payload["coverage"] is None
+
+
+def test_serialize_json_projects_exact_nonempty_pytest_evidence_members(tmp_path: Path) -> None:
+    report = pytest_report_for_exit(tmp_path, 0)
+    assert report.pytest is not None
+    evidence = PytestEvidence(
+        effective_args=(),
+        collected=4,
+        deselected=0,
+        counts=PytestCounts(0, 0, 0, 1, 1, 2),
+        collection_errors=(
+            CollectionIssue("tests/test_alpha.py", "ImportError: alpha"),
+            CollectionIssue("tests/test_zeta.py", "ImportError: zeta"),
+        ),
+        collection_skips=(
+            CollectionIssue("tests/test_alpha.py", "skip alpha"),
+            CollectionIssue("tests/test_zeta.py", "skip zeta"),
+        ),
+        slowest=(
+            SlowTest("tests/test_zeta.py::test_strict_xpass", 40),
+            SlowTest("tests/test_beta.py::test_xfail", 30),
+            SlowTest("tests/test_delta.py::test_non_strict_xpass", 20),
+            SlowTest("tests/test_alpha.py::test_skip", 10),
+        ),
+        special_outcomes=(
+            SpecialTestOutcome(
+                "tests/test_alpha.py::test_skip", "skipped", None, None, False, 10
+            ),
+            SpecialTestOutcome(
+                "tests/test_beta.py::test_xfail", "xfailed", "expected", None, False, 30
+            ),
+            SpecialTestOutcome(
+                "tests/test_delta.py::test_non_strict_xpass",
+                "xpassed",
+                "non-strict",
+                False,
+                False,
+                20,
+            ),
+            SpecialTestOutcome(
+                "tests/test_zeta.py::test_strict_xpass", "xpassed", "strict", True, True, 40
+            ),
+        ),
+    )
+    pytest_result = replace(
+        report.pytest,
+        complete=False,
+        scope="partial",
+        scope_reasons=("incomplete_session",),
+        evidence=evidence,
+    )
+    report = replace(
+        report,
+        overall_status="error",
+        complete=False,
+        pytest=pytest_result,
+        advisories=reporting._build_advisories(report.checks, pytest_result),
+    )
+
+    payload = reporting.json.loads(serialize_json(report))
+
+    assert payload["pytest"] == {
+        "status": "passed",
+        "complete": False,
+        "scope": "partial",
+        "scope_reasons": ["incomplete_session"],
+        "pytest_version": "8.4.2",
+        "exit_code": 0,
+        "evidence": {
+            "effective_args": [],
+            "collected": 4,
+            "deselected": 0,
+            "counts": {
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 1,
+                "xfailed": 1,
+                "xpassed": 2,
+            },
+            "collection_errors": [
+                {"nodeid": "tests/test_alpha.py", "message": "ImportError: alpha"},
+                {"nodeid": "tests/test_zeta.py", "message": "ImportError: zeta"},
+            ],
+            "collection_skips": [
+                {"nodeid": "tests/test_alpha.py", "message": "skip alpha"},
+                {"nodeid": "tests/test_zeta.py", "message": "skip zeta"},
+            ],
+            "slowest": [
+                {"nodeid": "tests/test_zeta.py::test_strict_xpass", "duration_ms": 40},
+                {"nodeid": "tests/test_beta.py::test_xfail", "duration_ms": 30},
+                {
+                    "nodeid": "tests/test_delta.py::test_non_strict_xpass",
+                    "duration_ms": 20,
+                },
+                {"nodeid": "tests/test_alpha.py::test_skip", "duration_ms": 10},
+            ],
+            "special_outcomes": [
+                {
+                    "nodeid": "tests/test_alpha.py::test_skip",
+                    "outcome": "skipped",
+                    "reason": None,
+                    "strict": None,
+                    "affects_exit": False,
+                    "duration_ms": 10,
+                },
+                {
+                    "nodeid": "tests/test_beta.py::test_xfail",
+                    "outcome": "xfailed",
+                    "reason": "expected",
+                    "strict": None,
+                    "affects_exit": False,
+                    "duration_ms": 30,
+                },
+                {
+                    "nodeid": "tests/test_delta.py::test_non_strict_xpass",
+                    "outcome": "xpassed",
+                    "reason": "non-strict",
+                    "strict": False,
+                    "affects_exit": False,
+                    "duration_ms": 20,
+                },
+                {
+                    "nodeid": "tests/test_zeta.py::test_strict_xpass",
+                    "outcome": "xpassed",
+                    "reason": "strict",
+                    "strict": True,
+                    "affects_exit": True,
+                    "duration_ms": 40,
+                },
+            ],
+        },
+        "error": None,
+    }
 
 
 def test_pytest_early_stop_keeps_partial_failed_evidence_and_terminal_attention(
@@ -1605,9 +1775,13 @@ def test_terminal_does_not_render_empty_test_reason_parentheses(tmp_path: Path) 
 
     terminal = render_terminal(report)
 
-    assert "special: pytest skipped: test_empty\n" in terminal
-    assert "test_empty ()" not in terminal
-    assert "advisory: pytest skipped has no reason: test_empty." in terminal
+    assert terminal == (
+        "\n==> pyrepo-check summary: passed (complete)\n"
+        "    special: pytest skipped: test_empty\n"
+        "    slow: pytest test_empty (1 ms)\n"
+        "    advisory: pytest skipped has no reason: test_empty.\n"
+        "    passed: pytest\n"
+    )
 
 
 def test_validation_rejects_pytest_cross_field_and_nested_cardinality_mutations(

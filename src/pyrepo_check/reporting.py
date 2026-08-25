@@ -350,7 +350,7 @@ def render_terminal(report: AgentReportV1) -> str:
         if check.status != "error":
             continue
         error = check.error
-        if error is not None:
+        if error is not None and not _is_duplicate_pytest_result_error(check, report.pytest):
             lines.append(f"    error: {check.name}: {error.message}")
         _append_helper_diagnostics(lines, check)
     for check in report.checks:
@@ -383,6 +383,14 @@ def _append_failed_line(lines: list[str], name: str, exit_code: int | None) -> N
         lines.append(f"    failed: {name}")
     else:
         lines.append(f"    failed: {name} (exit {exit_code})")
+
+
+def _is_duplicate_pytest_result_error(
+    check: CheckResult, pytest_result: PytestResult | None
+) -> bool:
+    if check.name != "pytest" or check.error is None or pytest_result is None:
+        return False
+    return check.error.code == _expected_pytest_check_error(pytest_result)
 
 
 def _append_helper_diagnostics(lines: list[str], check: CheckResult) -> None:
