@@ -195,7 +195,10 @@ def validate_pytest_execution(
     try:
         loaded_document = _load_bounded_json(artifact.content)
     except (UnicodeDecodeError, ValueError):
-        return _failure("artifact_invalid", "pytest artifact is not valid JSON", pytest_version, primary.returncode)
+        message = "pytest artifact is not valid JSON"
+        if artifact.diagnostic is not None:
+            message = f"{message}; {artifact.diagnostic}"
+        return _failure("artifact_invalid", message, pytest_version, primary.returncode)
     if not isinstance(loaded_document, dict):
         return _failure("artifact_invalid", "pytest artifact root must be an object", pytest_version, primary.returncode)
     document = cast(dict[object, object], loaded_document)

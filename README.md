@@ -151,9 +151,12 @@ signal errors, the CLI returns `2`.
 
 Captured process streams retain only their final 65,536 raw bytes. Production
 capture drains stdout and stderr concurrently with bounded tail buffers;
-reader-construction, reader-start, drain, and wait failures terminate and reap
-the child, close both pipes, and continue later checks through the existing
-`spawn_failed` result.
+reader-construction, reader-start, drain, and wait failures make a best-effort
+terminate/wait/kill/wait attempt for the direct child within one shared cleanup
+deadline, then continue later checks through the existing `spawn_failed`
+result. Reader threads are daemons. A started reader remains the sole closer of
+its pipe; if it is still blocked after the deadline, cleanup returns promptly
+without claiming that inherited descendant handles were reaped or closed.
 Injected test runners are outside that production memory guarantee. Structured
 pytest artifacts and writer markers also have fixed read, nesting, and
 directory-inventory limits. Their descriptor-safe reads are nonblocking, so a
@@ -164,13 +167,19 @@ bounded descriptor-relative recursive removal. Cleanup validates the complete
 tree before deletion, then removes it with streaming descriptor-relative
 operations. Each pass accepts at most 4,096 entries and depth 64; the complete
 cleanup has a five-second monotonic deadline. A single kernel call cannot be
-interrupted by that deadline. Unsupported platforms fail closed before pytest
+interrupted by that deadline. Supported platforms must also prove that an
+opened directory was unlinked after `rmdir`: Linux uses zero link count, while
+Darwin pairs link-count inspection with `F_GETPATH` device/inode verification.
+Unsupported or unproven platforms fail closed before pytest
 starts; pyrepo-check does not fall back to path-based cleanup.
 
 Cleanup failure keeps an already-captured pytest snapshot but makes the check
 an incomplete `cleanup_failed` error. The diagnostic names the retained run
 directory only when its device and inode were reverified through the recorded
-parent directory descriptor. A validation failure leaves the tree untouched;
+parent directory descriptor and the lexical parent and child paths still name
+those recorded identities at observation time. This is a best-effort current
+path observation, not a permanent path guarantee. A validation failure leaves
+the tree untouched;
 a race or I/O failure during the deletion pass can leave the verified root
 partially emptied for manual inspection.
 

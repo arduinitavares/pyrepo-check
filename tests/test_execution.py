@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from pathlib import Path
 import subprocess  # nosec B404
 import sys
@@ -100,6 +101,7 @@ class _VirtualPipe:
         self.offset = 0
         self.reader_ident: int | None = None
         self.closed_by_reader = False
+        self.close_idents: list[int] = []
 
     def readinto(self, buffer: bytearray | memoryview) -> int:
         if self.reader_ident is None:
@@ -120,7 +122,9 @@ class _VirtualPipe:
         return count
 
     def close(self) -> None:
-        self.closed_by_reader = True
+        close_ident = threading.get_ident()
+        self.close_idents.append(close_ident)
+        self.closed_by_reader = self.closed_by_reader or close_ident == self.reader_ident
         if self.blocked_after_failure is not None:
             self.blocked_after_failure.set()
 
@@ -334,6 +338,66 @@ def test_drain_error_aborts_before_blocking_wait_and_reaps_child(
     assert result_holder[0].checks[0].processes[0].returncode is None
 
 
+def test_reader_start_failure_returns_promptly_when_descendant_retains_pipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready_path = tmp_path / "descendant-ready"
+    pid_path = tmp_path / "descendant-pid"
+    source = (
+        "from pathlib import Path\n"
+        "import subprocess, sys, time\n"
+        f"pid_path = Path({str(pid_path)!r})\n"
+        f"ready_path = Path({str(ready_path)!r})\n"
+        "descendant = subprocess.Popen(\n"  # nosec B603
+        "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "    stdout=sys.stdout, stderr=sys.stderr,\n"
+        ")\n"
+        "pid_path.write_text(str(descendant.pid))\n"
+        "ready_path.write_text('ready')\n"
+        "time.sleep(30)\n"
+    )
+    real_thread = threading.Thread
+    start_calls = 0
+
+    class FailSecondStartThread(real_thread):
+        def start(self) -> None:
+            nonlocal start_calls
+            start_calls += 1
+            if start_calls == 2:
+                raise RuntimeError("synthetic stderr reader start failure")
+            super().start()
+            deadline = execution.time.monotonic() + 2
+            while not ready_path.exists() and execution.time.monotonic() < deadline:
+                threading.Event().wait(0.01)
+            assert ready_path.exists(), "child/descendant readiness handshake failed"
+
+    monkeypatch.setattr(execution.threading, "Thread", FailSecondStartThread)
+    completed = threading.Event()
+    result_holder: list[ExecutionResult] = []
+
+    def invoke() -> None:
+        result_holder.append(execute_plan(make_python_check_plan(tmp_path, source), runner=None))
+        completed.set()
+
+    watchdog = real_thread(target=invoke, daemon=True)
+    watchdog.start()
+    returned_promptly = completed.wait(timeout=0.8)
+    try:
+        descendant_pid = int(pid_path.read_text())
+        os.kill(descendant_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    watchdog.join(timeout=2)
+
+    assert returned_promptly, "failure cleanup blocked on a pipe retained by a descendant"
+    assert not watchdog.is_alive(), "descendant pipe probe could not be released"
+    captured = result_holder[0].checks[0].processes[0]
+    assert captured.spawn_error == (
+        "stderr reader start failed: RuntimeError: synthetic stderr reader start failure"
+    )
+
+
 def test_second_reader_start_failure_closes_and_reaps_without_masking_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -353,8 +417,9 @@ def test_second_reader_start_failure_closes_and_reaps_without_masking_root(
             target: Callable[..., object] | None = None,
             args: tuple[object, ...] = (),
             name: str | None = None,
+            daemon: bool | None = None,
         ) -> None:
-            super().__init__(target=target, args=args, name=name)
+            super().__init__(target=target, args=args, name=name, daemon=daemon)
             created_threads.append(self)
 
         def start(self) -> None:
@@ -373,8 +438,12 @@ def test_second_reader_start_failure_closes_and_reaps_without_masking_root(
     assert captured.spawn_error == (
         "stderr reader start failed: RuntimeError: synthetic stderr reader start failure"
     )
-    assert stdout.closed_by_reader and stderr.closed_by_reader
+    assert stdout.closed_by_reader
+    assert stdout.close_idents == [stdout.reader_ident]
+    assert not stderr.closed_by_reader
+    assert stderr.close_idents == [threading.get_ident()]
     assert len(created_threads) == 2
+    assert all(reader.daemon for reader in created_threads)
     assert not created_threads[0].is_alive()
     assert created_threads[1].ident is None
     assert process.terminated and process.killed
@@ -396,12 +465,13 @@ def test_second_reader_construction_failure_is_typed_and_reaps_first_reader(
         target: Callable[..., object] | None = None,
         args: tuple[object, ...] = (),
         name: str | None = None,
+        daemon: bool | None = None,
     ) -> threading.Thread:
         nonlocal constructions
         constructions += 1
         if constructions == 2:
             raise RuntimeError("synthetic stderr reader construction failure")
-        return real_thread(target=target, args=args, name=name)
+        return real_thread(target=target, args=args, name=name, daemon=daemon)
 
     monkeypatch.setattr(execution.threading, "Thread", construct_thread)
 
@@ -414,7 +484,159 @@ def test_second_reader_construction_failure_is_typed_and_reaps_first_reader(
         "synthetic stderr reader construction failure"
     )
     assert process.terminated
-    assert stdout.closed_by_reader and stderr.closed_by_reader
+    assert stdout.closed_by_reader
+    assert stdout.close_idents == [stdout.reader_ident]
+    assert not stderr.closed_by_reader
+    assert stderr.close_idents == [threading.get_ident()]
+
+
+def test_cleanup_failures_return_with_only_daemon_blocked_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    reader_started = threading.Event()
+
+    class BlockingPipe(_VirtualPipe):
+        def readinto(self, buffer: bytearray | memoryview) -> int:
+            del buffer
+            if self.reader_ident is None:
+                self.reader_ident = threading.get_ident()
+                reader_started.set()
+            release.wait()
+            return 0
+
+        def close(self) -> None:
+            if threading.get_ident() != self.reader_ident:
+                release.wait()
+            super().close()
+
+    blocked = BlockingPipe(0, ord("y"))
+    process = _FakePopen(
+        _VirtualPipe(0, ord("x"), fail_after_reads=0),
+        blocked,
+        cleanup_errors=True,
+    )
+    _install_fake_popen(monkeypatch, [process])
+    real_thread = threading.Thread
+    readers: list[threading.Thread] = []
+
+    class RecordingThread(real_thread):
+        def __init__(
+            self,
+            *,
+            target: Callable[..., object] | None = None,
+            args: tuple[object, ...] = (),
+            name: str | None = None,
+            daemon: bool | None = None,
+        ) -> None:
+            super().__init__(target=target, args=args, name=name, daemon=daemon)
+            readers.append(self)
+
+    monkeypatch.setattr(execution.threading, "Thread", RecordingThread)
+    completed = threading.Event()
+    result_holder: list[ExecutionResult] = []
+
+    def invoke() -> None:
+        result_holder.append(execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None))
+        completed.set()
+
+    watchdog = real_thread(target=invoke, daemon=True)
+    watchdog.start()
+    assert reader_started.wait(timeout=1)
+    returned_promptly = completed.wait(timeout=0.6)
+    try:
+        assert returned_promptly, "failure cleanup blocked on the reader-owned pipe lock"
+        assert process.terminated and process.killed
+        assert len(readers) == 2
+        assert all(reader.daemon for reader in readers)
+        assert readers[1].is_alive()
+        assert blocked.close_idents == []
+        assert result_holder[0].checks[0].processes[0].spawn_error == (
+            "stdout drain failed: OSError: synthetic drain failure"
+        )
+    finally:
+        release.set()
+        watchdog.join(timeout=1)
+        for reader in readers:
+            reader.join(timeout=1)
+
+    assert not watchdog.is_alive()
+    assert all(not reader.is_alive() for reader in readers)
+
+
+def test_daemon_blocked_reader_does_not_prevent_interpreter_shutdown() -> None:
+    probe = inspect.cleandoc(
+        """
+        from pathlib import Path
+        import threading
+
+        from pyrepo_check import execution
+
+
+        class ErrorPipe:
+            def readinto(self, _buffer):
+                raise OSError("synthetic drain failure")
+
+            def close(self):
+                return None
+
+
+        class BlockingPipe:
+            def readinto(self, _buffer):
+                threading.Event().wait()
+                return 0
+
+            def close(self):
+                threading.Event().wait()
+
+
+        class FailedCleanupProcess:
+            def __init__(self):
+                self.stdout = ErrorPipe()
+                self.stderr = BlockingPipe()
+
+            def terminate(self):
+                raise OSError("synthetic terminate failure")
+
+            def kill(self):
+                raise OSError("synthetic kill failure")
+
+            def wait(self, timeout=None):
+                del timeout
+                raise OSError("synthetic wait failure")
+
+
+        execution.subprocess.Popen = lambda *_args, **_kwargs: FailedCleanupProcess()
+        try:
+            execution._run_bounded_process(
+                ("unused",),
+                cwd=Path.cwd(),
+                capture_output=True,
+                environment=None,
+            )
+        except execution._ProcessExecutionFailure as error:
+            assert str(error) == (
+                "stdout drain failed: OSError: synthetic drain failure"
+            )
+        else:
+            raise AssertionError("expected typed execution failure")
+        print("finished", flush=True)
+        """
+    )
+
+    completed = subprocess.run(  # nosec B603
+        (sys.executable, "-c", probe),
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "finished\n"
+    assert completed.stderr == ""
 
 
 def test_wait_failure_is_typed_after_both_readers_finish(
@@ -438,7 +660,9 @@ def test_wait_failure_is_typed_after_both_readers_finish(
     assert captured.returncode is None
     assert captured.spawn_error == "wait failed: OSError: synthetic wait failure"
     assert process.terminated
-    assert process.wait_calls == [None, execution._FAILURE_CLEANUP_TIMEOUT_SECONDS]
+    assert process.wait_calls[0] is None
+    assert process.wait_calls[1] is not None
+    assert 0 < process.wait_calls[1] <= execution._FAILURE_CLEANUP_TIMEOUT_SECONDS
 
 
 def test_unexpected_reader_programming_error_cleans_up_then_reraises_by_identity(
@@ -450,6 +674,7 @@ def test_unexpected_reader_programming_error_cleans_up_then_reraises_by_identity
     class ProgrammingFailurePipe(_VirtualPipe):
         def readinto(self, buffer: bytearray | memoryview) -> int:
             del buffer
+            self.reader_ident = threading.get_ident()
             raise error
 
     stdout = ProgrammingFailurePipe(0, ord("x"))

@@ -11,8 +11,10 @@ from pathlib import Path
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 import time
+from types import ModuleType
 from typing import Literal, Never, Protocol, cast
 
 from pyrepo_check.execution import (
@@ -24,6 +26,11 @@ from pyrepo_check.execution import (
     execute_process,
 )
 from pyrepo_check.planning import OutputFormat, PlannedCheck
+
+if sys.platform == "darwin":
+    import fcntl as _fcntl
+else:
+    _fcntl: ModuleType | None = None
 
 
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -41,6 +48,13 @@ _STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
 _STAT_SUPPORTS_FOLLOW_SYMLINKS = os.stat in os.supports_follow_symlinks
 _UNLINK_SUPPORTS_DIR_FD = os.unlink in os.supports_dir_fd
 _RMDIR_SUPPORTS_DIR_FD = os.rmdir in os.supports_dir_fd
+_DARWIN_GETPATH_UNLINK_PROOF = (
+    sys.platform == "darwin"
+    and _fcntl is not None
+    and callable(getattr(_fcntl, "fcntl", None))
+    and type(getattr(_fcntl, "F_GETPATH", None)) is int
+)
+_POST_RMDIR_UNLINK_PROOF = sys.platform.startswith("linux") or _DARWIN_GETPATH_UNLINK_PROOF
 _PREFLIGHT_PROBE = """import json
 import sys
 record = {"schema_version": 1, "python_version": list(sys.version_info[:3]), "pytest_available": False, "pytest_version": None}
@@ -111,15 +125,7 @@ class PytestExecutionObservation:
 class _RunDirectory:
     path: Path
     identity: tuple[int, int]
-    parent_identity: tuple[int, int] | None = None
-
-    def __post_init__(self) -> None:
-        if self.parent_identity is None:
-            object.__setattr__(
-                self,
-                "parent_identity",
-                _directory_identity(self.path.parent),
-            )
+    parent_identity: tuple[int, int]
 
 
 CleanupFailureKind = Literal["budget_exceeded", "unsafe_tree", "io_failed"]
@@ -366,6 +372,11 @@ def _create_run_directory(consumer_root: Path) -> _RunDirectory:
             continue
         seen.add(base)
         try:
+            parent_identity = _directory_identity(base)
+        except OSError as error:
+            last_error = error
+            continue
+        try:
             run_directory = Path(
                 tempfile.mkdtemp(prefix="pyrepo-check-pytest-", dir=base)
             )
@@ -375,23 +386,34 @@ def _create_run_directory(consumer_root: Path) -> _RunDirectory:
         identity: tuple[int, int] | None = None
         try:
             identity = _directory_identity(run_directory)
+            record = _RunDirectory(run_directory, identity, parent_identity)
             resolved_run_directory = run_directory.resolve(strict=True)
+            if resolved_run_directory.parent != base:
+                raise OSError("created run directory parent identity mismatch")
             if _is_within(resolved_run_directory, resolved_root):
                 raise OSError("refusing run directory inside consumer root")
         except OSError as error:
-            cleanup_error = _remove_empty_created_run_directory(run_directory, identity)
+            cleanup_error = _remove_empty_created_run_directory(
+                run_directory,
+                identity,
+                parent_identity,
+            )
             last_error = _with_cleanup_error(error, cleanup_error)
             if cleanup_error is not None:
                 raise last_error
             continue
         if identity is None:
             error = OSError("created run directory identity is unavailable")
-            cleanup_error = _remove_empty_created_run_directory(run_directory, identity)
+            cleanup_error = _remove_empty_created_run_directory(
+                run_directory,
+                identity,
+                parent_identity,
+            )
             last_error = _with_cleanup_error(error, cleanup_error)
             if cleanup_error is not None:
                 raise last_error
             continue
-        return _RunDirectory(run_directory, identity)
+        return record
     if last_error is not None:
         raise last_error
     raise OSError("no safe operating-system temporary directory is available")
@@ -579,15 +601,14 @@ def _remove_run_directory(
             delete=True,
         )
         deletion_budget = _CleanupBudget(started_ns, clock_ns)
-        deletion_budget.check_deadline()
-        _verify_relative_identity(
+        _remove_verified_relative_directory(
             parent_descriptor,
             run_directory.path.name,
             run_directory.identity,
-            "run directory identity mismatch before root removal",
+            expected_device=run_directory.identity[0],
+            budget=deletion_budget,
+            identity_mismatch_message="run directory identity mismatch before root removal",
         )
-        deletion_budget.check_deadline()
-        os.rmdir(run_directory.path.name, dir_fd=parent_descriptor)
     except _CleanupFailure as error:
         retained_path = _verified_retained_path(
             run_directory,
@@ -676,11 +697,17 @@ def _walk_cleanup_tree(
                         frame.identity,
                         f"directory identity mismatch before removal: {frame.name}",
                     )
-                os.close(frame.descriptor)
-                stack.pop()
                 if delete:
                     budget.check_deadline()
                     os.rmdir(frame.name, dir_fd=frame.parent_descriptor)
+                    budget.check_deadline()
+                    if _opened_directory_remains_linked(frame.descriptor):
+                        raise _CleanupFailure(
+                            "unsafe_tree",
+                            f"directory remained linked after removal: {frame.name}",
+                        )
+                os.close(frame.descriptor)
+                stack.pop()
                 continue
             child_depth = frame.depth + 1
             budget.observe_entry(depth=child_depth)
@@ -802,6 +829,67 @@ def _verify_relative_identity(
         raise _CleanupFailure("unsafe_tree", message)
 
 
+def _remove_verified_relative_directory(
+    parent_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    expected_device: int,
+    budget: _CleanupBudget,
+    identity_mismatch_message: str,
+) -> None:
+    descriptor, _status = _open_verified_relative_directory(
+        parent_descriptor,
+        name,
+        identity,
+        expected_device=expected_device,
+        budget=budget,
+    )
+    try:
+        budget.check_deadline()
+        _verify_relative_identity(
+            parent_descriptor,
+            name,
+            identity,
+            identity_mismatch_message,
+        )
+        budget.check_deadline()
+        os.rmdir(name, dir_fd=parent_descriptor)
+        budget.check_deadline()
+        if _opened_directory_remains_linked(descriptor):
+            raise _CleanupFailure(
+                "unsafe_tree",
+                f"directory remained linked after removal: {name}",
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _opened_directory_remains_linked(descriptor: int) -> bool:
+    file_status = os.fstat(descriptor)
+    if file_status.st_nlink == 0:
+        return False
+    if _fcntl is None:
+        return True
+    fcntl_call = getattr(_fcntl, "fcntl", None)
+    get_path = getattr(_fcntl, "F_GETPATH", None)
+    if not callable(fcntl_call) or type(get_path) is not int:
+        return True
+    try:
+        raw_path = fcntl_call(descriptor, get_path, b"\0" * 1024)
+        if not isinstance(raw_path, bytes):
+            return True
+        live_status = os.stat(os.fsdecode(raw_path.split(b"\0", 1)[0]), follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return (
+        stat.S_ISDIR(live_status.st_mode)
+        and _status_identity(live_status) == _status_identity(file_status)
+    )
+
+
 def _verified_retained_path(
     run_directory: _RunDirectory,
     parent_descriptor: int | None,
@@ -809,16 +897,31 @@ def _verified_retained_path(
     if parent_descriptor is None:
         return None
     try:
+        parent_identity = run_directory.parent_identity
+        if _status_identity(os.fstat(parent_descriptor)) != parent_identity:
+            return None
+        lexical_parent_status = os.stat(
+            run_directory.path.parent,
+            follow_symlinks=False,
+        )
+        if (
+            _status_identity(lexical_parent_status) != parent_identity
+            or not stat.S_ISDIR(lexical_parent_status.st_mode)
+        ):
+            return None
         file_status = os.stat(
             run_directory.path.name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
+        lexical_child_status = os.stat(run_directory.path, follow_symlinks=False)
     except OSError:
         return None
     if (
         _status_identity(file_status) != run_directory.identity
         or not stat.S_ISDIR(file_status.st_mode)
+        or _status_identity(lexical_child_status) != run_directory.identity
+        or not stat.S_ISDIR(lexical_child_status.st_mode)
     ):
         return None
     return run_directory.path
@@ -841,15 +944,42 @@ def _cleanup_diagnostic(observation: _CleanupObservation) -> str:
 def _remove_empty_created_run_directory(
     run_directory: Path,
     identity: tuple[int, int] | None,
+    parent_identity: tuple[int, int],
 ) -> OSError | None:
     if identity is None:
         return OSError("created run directory identity is unavailable")
+    parent_descriptor: int | None = None
+    cleanup_error: OSError | None = None
     try:
-        _verify_directory_identity(run_directory, identity)
-        os.rmdir(run_directory)
+        parent_descriptor = os.open(
+            run_directory.parent,
+            _secure_directory_open_flags(),
+        )
+        os.set_inheritable(parent_descriptor, False)
+        if _status_identity(os.fstat(parent_descriptor)) != parent_identity:
+            raise _CleanupFailure(
+                "unsafe_tree",
+                "created run directory parent identity mismatch",
+            )
+        started_ns = time.monotonic_ns()
+        _remove_verified_relative_directory(
+            parent_descriptor,
+            run_directory.name,
+            identity,
+            expected_device=identity[0],
+            budget=_CleanupBudget(started_ns, time.monotonic_ns),
+            identity_mismatch_message="created run directory identity mismatch",
+        )
     except OSError as error:
-        return error
-    return None
+        cleanup_error = error
+    finally:
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+    return cleanup_error
 
 
 def _directory_identity(path: Path) -> tuple[int, int]:
@@ -959,6 +1089,7 @@ def _platform_capability_error() -> str | None:
         or not _STAT_SUPPORTS_FOLLOW_SYMLINKS
         or not _UNLINK_SUPPORTS_DIR_FD
         or not _RMDIR_SUPPORTS_DIR_FD
+        or not _POST_RMDIR_UNLINK_PROOF
     ):
         return (
             "Structured pytest evidence requires descriptor-safe no-follow file opening "

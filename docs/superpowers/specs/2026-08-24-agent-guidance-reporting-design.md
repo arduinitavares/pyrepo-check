@@ -163,6 +163,15 @@ repeating raw `CompletedProcess` fakes; injected runners are outside the
 production memory guarantee and their buffered results are normalized
 immediately to the same bounded observation.
 
+Reader threads are daemons. On reader construction/start, drain, or wait
+failure, execution makes a best-effort terminate/wait/kill/wait attempt for the
+direct child under one monotonic cleanup deadline. It joins only successfully
+started readers within the remaining budget. A started reader is the sole
+closer of its pipe; the caller may therefore return with a daemon reader still
+blocked on a handle retained by a descendant, without claiming that all child
+or descendant resources were reaped or closed. The main thread directly closes
+only pipes whose reader never successfully started.
+
 Terminal mode streams tool output so diagnostics remain readable as checks run.
 JSON mode captures tool output so stdout contains exactly one JSON document;
 captured text has ANSI control sequences removed. Structured artifacts are read
@@ -569,26 +578,35 @@ Structured pytest evidence requires descriptor-safe no-follow file opening and
 bounded descriptor-relative recursive removal. Platform preflight requires
 integer `O_DIRECTORY`, `O_NOFOLLOW`, and `O_NONBLOCK` flags; fd-based
 `scandir`; descriptor-relative `open`, `stat`, `unlink`, and `rmdir`; and
-`stat(..., follow_symlinks=False)`. Unsupported platforms fail closed before
-temporary-directory creation or process spawn; pyrepo-check has no path-based
-cleanup fallback.
+`stat(..., follow_symlinks=False)`. The platform must also have a proven
+post-`rmdir` unlink check: Linux zero-link semantics, or Darwin link-count plus
+`F_GETPATH` device/inode verification. Unsupported or unproven platforms fail
+closed before temporary-directory creation or process spawn; pyrepo-check has
+no path-based cleanup fallback.
 
 The run-directory record includes both the run directory's device/inode and
-its verified parent's device/inode. Cleanup opens the parent first, opens the
-run basename relative to that descriptor, and uses two iterative streaming DFS
-passes. The first pass validates the complete tree without deletion. The
-second pass unlinks leaves and removes verified directories postorder. Each
+its verified parent's device/inode, recorded before directory creation. Cleanup
+opens the parent first, opens the run basename relative to that descriptor, and
+uses two iterative streaming DFS passes. The first pass validates the complete
+tree without deletion. The second pass unlinks leaves and removes verified
+directories postorder. Each
 pass accepts exactly 4,096 non-root entries and depth 64 with root at depth 0;
 the whole cleanup shares a five-second monotonic deadline. Deadline checks run
 between system calls because one in-progress kernel call cannot be interrupted.
 Directories must retain their no-follow stat/open identity and root device;
 symlinks and non-directories are descriptor-relative leaves. Final root removal
-is `rmdir(run_basename, dir_fd=verified_parent_fd)`.
+is `rmdir(run_basename, dir_fd=verified_parent_fd)`. Each directory descriptor
+stays open through its descriptor-relative `rmdir`; cleanup then verifies that
+the opened inode was actually unlinked. A replacement basename removed during
+a race is diagnosed as an unsafe tree rather than reported as successful.
 
 Budget, unsafe-tree, and I/O failures project to the existing public
 `cleanup_failed` code while preserving any otherwise valid `PytestResult`.
 The diagnostic includes the exact retained path only after revalidating the
-recorded root identity through the parent descriptor. Validation-pass failure
+recorded parent and root identities both through the parent descriptor and at
+the lexical parent and child paths at observation time. That path is a
+best-effort current observation, not a permanent location guarantee.
+Validation-pass failure
 leaves the tree untouched. A race or I/O failure during the deletion pass may
 leave that verified root partially emptied; cleanup never retries or traverses
 a replacement.

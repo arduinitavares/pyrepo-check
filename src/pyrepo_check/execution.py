@@ -266,6 +266,7 @@ def _run_bounded_process(
                     target=_run_pipe_reader,
                     args=(stream, pipe, accumulator, results),
                     name=f"pyrepo-check-{stream}",
+                    daemon=True,
                 )
             except (OSError, RuntimeError) as error:
                 raise _ProcessExecutionFailure(
@@ -332,34 +333,42 @@ def _cleanup_failed_process(
     ],
     started_threads: list[threading.Thread],
 ) -> None:
+    deadline = time.monotonic() + _FAILURE_CLEANUP_TIMEOUT_SECONDS
     reaped = False
     try:
         process.terminate()
     except BaseException:
         pass
-    try:
-        process.wait(timeout=_FAILURE_CLEANUP_TIMEOUT_SECONDS)
-        reaped = True
-    except BaseException:
-        pass
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining > 0:
+        try:
+            process.wait(timeout=remaining)
+            reaped = True
+        except BaseException:
+            pass
     if not reaped:
         try:
             process.kill()
         except BaseException:
             pass
-        try:
-            process.wait(timeout=_FAILURE_CLEANUP_TIMEOUT_SECONDS)
-        except BaseException:
-            pass
-    for _stream, pipe, _accumulator in streams:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining > 0:
+            try:
+                process.wait(timeout=remaining)
+            except BaseException:
+                pass
+    for _stream, pipe, _accumulator in streams[len(started_threads) :]:
         if pipe is not None:
             try:
                 pipe.close()
             except BaseException:
                 pass
     for reader in started_threads:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            break
         try:
-            reader.join(timeout=_FAILURE_CLEANUP_TIMEOUT_SECONDS)
+            reader.join(timeout=remaining)
         except BaseException:
             pass
 

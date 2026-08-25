@@ -572,6 +572,31 @@ def test_artifact_rejects_non_finite_ignored_metadata(constant: str) -> None:
     assert result.message == "pytest artifact is not valid JSON"
 
 
+def test_malformed_artifact_preserves_writer_inventory_diagnostic() -> None:
+    check = _check()
+    assert check.pytest is not None
+    check = replace(
+        check,
+        pytest=replace(
+            check.pytest,
+            artifact=replace(
+                check.pytest.artifact,
+                content=b"{malformed",
+                diagnostic="writer marker iteration failed: PermissionError: denied",
+            ),
+        ),
+    )
+
+    result = validate_pytest_execution(check)
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == "artifact_invalid"
+    assert result.message == (
+        "pytest artifact is not valid JSON; "
+        "writer marker iteration failed: PermissionError: denied"
+    )
+
+
 def test_expected_failure_shape_beats_parallelism_and_repeated_reports_are_retries() -> None:
     invalid = _artifact_document(_check())
     invalid_report = _report(invalid, 1)

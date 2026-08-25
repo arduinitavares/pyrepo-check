@@ -389,6 +389,7 @@ def test_missing_platform_capability_fails_before_temp_or_spawn(
         "_STAT_SUPPORTS_FOLLOW_SYMLINKS",
         "_UNLINK_SUPPORTS_DIR_FD",
         "_RMDIR_SUPPORTS_DIR_FD",
+        "_POST_RMDIR_UNLINK_PROOF",
     ),
 )
 def test_missing_descriptor_operation_fails_before_temp_or_spawn(
@@ -503,6 +504,7 @@ def safe_run_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     created_run_directory = pytest_execution._RunDirectory(
         run_directory,
         pytest_execution._directory_identity(run_directory),
+        pytest_execution._directory_identity(run_directory.parent),
     )
     monkeypatch.setattr(
         pytest_execution,
@@ -1270,6 +1272,7 @@ def _cleanup_record(run_directory: Path) -> pytest_execution._RunDirectory:
     return pytest_execution._RunDirectory(
         run_directory,
         pytest_execution._directory_identity(run_directory),
+        pytest_execution._directory_identity(run_directory.parent),
     )
 
 
@@ -1619,6 +1622,110 @@ def test_cleanup_rejects_child_substitution_before_rmdir(
     assert displaced.exists()
 
 
+def test_cleanup_reports_child_swap_during_rmdir_as_unsafe_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    run_directory = tmp_path / "run"
+    child = run_directory / "child"
+    child.mkdir(parents=True)
+    displaced = tmp_path / "displaced-child"
+    original_rmdir = pytest_execution.os.rmdir
+    swapped = False
+
+    def swap_during_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if os.fsdecode(path) == "child" and not swapped:
+            child.rename(displaced)
+            child.mkdir()
+            swapped = True
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_during_rmdir)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+    )
+
+    assert swapped
+    assert observation is not None
+    assert observation.kind == "unsafe_tree"
+    assert observation.message == "directory remained linked after removal: child"
+    assert displaced.exists()
+
+
+def test_cleanup_reports_root_swap_during_rmdir_as_unsafe_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    displaced = tmp_path / "displaced-run"
+    original_rmdir = pytest_execution.os.rmdir
+    swapped = False
+
+    def swap_during_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if os.fsdecode(path) == run_directory.name and not swapped:
+            run_directory.rename(displaced)
+            run_directory.mkdir()
+            swapped = True
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_during_rmdir)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+    )
+
+    assert swapped
+    assert observation is not None
+    assert observation.kind == "unsafe_tree"
+    assert observation.message == f"directory remained linked after removal: {run_directory.name}"
+    assert displaced.exists()
+
+
+def test_parent_rename_prevents_stale_retained_path_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer_root = tmp_path / "consumer"
+    consumer_root.mkdir()
+    parent = tmp_path / "parent"
+    run_directory = parent / "run"
+    run_directory.mkdir(parents=True)
+    moved_parent = tmp_path / "moved-parent"
+
+    def rename_parent_then_fail(*_args: object, **_kwargs: object) -> None:
+        parent.rename(moved_parent)
+        raise pytest_execution._CleanupFailure("unsafe_tree", "synthetic cleanup failure")
+
+    monkeypatch.setattr(pytest_execution, "_walk_cleanup_tree", rename_parent_then_fail)
+
+    observation = pytest_execution._remove_run_directory(
+        _cleanup_record(run_directory),
+        consumer_root=consumer_root,
+    )
+
+    assert observation is not None
+    assert observation.retained_path is None
+    assert (moved_parent / "run").exists()
+
+
 def test_cleanup_concurrent_growth_reports_enotempty_and_retains_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1727,19 +1834,109 @@ def test_run_directory_creation_failure_is_typed_not_started(
     assert observation.pytest.artifact.state == "not_attempted"
 
 
+def test_parent_identity_failure_precedes_mkdtemp_and_leaves_no_run_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_parents = {
+        Path(tempfile.gettempdir()).resolve(strict=True),
+        Path("/tmp").resolve(strict=True),  # nosec B108
+        Path("/var/tmp").resolve(strict=True),  # nosec B108
+    }
+    original_identity = pytest_execution._directory_identity
+    original_mkdtemp = tempfile.mkdtemp
+    created_directories: list[Path] = []
+
+    def deny_candidate_parent_identity(directory: Path) -> tuple[int, int]:
+        if directory.resolve(strict=True) in candidate_parents:
+            raise PermissionError("candidate parent identity denied")
+        return original_identity(directory)
+
+    def track_mkdtemp(
+        *,
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+    ) -> str:
+        directory = Path(original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir))
+        created_directories.append(directory)
+        return str(directory)
+
+    monkeypatch.setattr(pytest_execution, "_directory_identity", deny_candidate_parent_identity)
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", track_mkdtemp)
+
+    try:
+        with pytest.raises(PermissionError, match="candidate parent identity denied"):
+            pytest_execution._create_run_directory(Path.cwd())
+    finally:
+        for directory in created_directories:
+            if directory.exists():
+                directory.rmdir()
+
+    assert created_directories == []
+
+
+def test_empty_created_cleanup_reports_swap_during_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    identity = pytest_execution._directory_identity(run_directory)
+    parent_identity = pytest_execution._directory_identity(tmp_path)
+    displaced = tmp_path / "displaced-run"
+    original_rmdir = pytest_execution.os.rmdir
+    swapped = False
+
+    def swap_during_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if os.fsdecode(path) == run_directory.name and not swapped:
+            run_directory.rename(displaced)
+            run_directory.mkdir()
+            swapped = True
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_during_rmdir)
+
+    cleanup_error = pytest_execution._remove_empty_created_run_directory(
+        run_directory,
+        identity,
+        parent_identity,
+    )
+
+    assert swapped
+    assert isinstance(cleanup_error, pytest_execution._CleanupFailure)
+    assert cleanup_error.kind == "unsafe_tree"
+    assert cleanup_error.message == f"directory remained linked after removal: {run_directory.name}"
+    assert displaced.exists()
+
+
 def test_rejected_consumer_root_run_directories_are_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created_directories: list[Path] = []
+    original_mkdtemp = tempfile.mkdtemp
+    original_is_within = pytest_execution._is_within
 
-    def create_in_consumer_root(**_kwargs: object) -> str:
-        run_directory = tmp_path / f"run-directory-{len(created_directories)}"
-        run_directory.mkdir()
+    def create_candidate(
+        *,
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+    ) -> str:
+        run_directory = Path(original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir))
         created_directories.append(run_directory)
         return str(run_directory)
 
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_in_consumer_root)
+    def reject_created(directory: Path, root: Path) -> bool:
+        return directory in created_directories or original_is_within(directory, root)
+
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(pytest_execution, "_is_within", reject_created)
 
     with pytest.raises(OSError, match="inside consumer root"):
         pytest_execution._create_run_directory(tmp_path)
@@ -1753,24 +1950,34 @@ def test_rejected_run_directory_cleanup_failure_is_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created_directories: list[Path] = []
+    original_mkdtemp = tempfile.mkdtemp
     original_rmdir = pytest_execution.os.rmdir
+    original_is_within = pytest_execution._is_within
 
-    def create_in_consumer_root(**_kwargs: object) -> str:
-        run_directory = tmp_path / f"run-directory-{len(created_directories)}"
-        run_directory.mkdir()
+    def create_candidate(
+        *,
+        suffix: str | None = None,
+        prefix: str | None = None,
+        dir: str | os.PathLike[str] | None = None,
+    ) -> str:
+        run_directory = Path(original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir))
         created_directories.append(run_directory)
         return str(run_directory)
+
+    def reject_created(directory: Path, root: Path) -> bool:
+        return directory in created_directories or original_is_within(directory, root)
 
     def deny_rmdir(
         path: str | bytes | os.PathLike[str],
         *,
         dir_fd: int | None = None,
     ) -> None:
-        if Path(os.fsdecode(path)).name.startswith("run-directory-"):
+        if Path(os.fsdecode(path)).name.startswith("pyrepo-check-pytest-"):
             raise PermissionError("run directory cleanup denied")
         original_rmdir(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_in_consumer_root)
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(pytest_execution, "_is_within", reject_created)
     monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rmdir)
 
     with pytest.raises(OSError, match="cleanup failed: PermissionError: run directory cleanup denied"):
@@ -1787,6 +1994,7 @@ def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
     created_directories: list[Path] = []
     original_mkdtemp = tempfile.mkdtemp
     original_rmdir = pytest_execution.os.rmdir
+    original_is_within = pytest_execution._is_within
 
     def create_candidate(
         *,
@@ -1794,24 +2002,24 @@ def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
         prefix: str | None = None,
         dir: str | os.PathLike[str] | None = None,
     ) -> str:
-        if not created_directories:
-            run_directory = tmp_path / "rejected-run-directory"
-            run_directory.mkdir()
-        else:
-            run_directory = Path(original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir))
+        run_directory = Path(original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir))
         created_directories.append(run_directory)
         return str(run_directory)
+
+    def reject_created(directory: Path, root: Path) -> bool:
+        return directory in created_directories or original_is_within(directory, root)
 
     def deny_rejected_rmdir(
         path: str | bytes | os.PathLike[str],
         *,
         dir_fd: int | None = None,
     ) -> None:
-        if Path(os.fsdecode(path)) == created_directories[0]:
+        if Path(os.fsdecode(path)).name == created_directories[0].name:
             raise PermissionError("rejected candidate cleanup denied")
         original_rmdir(path, dir_fd=dir_fd)
 
     monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(pytest_execution, "_is_within", reject_created)
     monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rejected_rmdir)
 
     try:
@@ -1825,7 +2033,7 @@ def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
             if directory.exists():
                 original_rmdir(directory)
 
-    assert created_directories == [tmp_path / "rejected-run-directory"]
+    assert len(created_directories) == 1
 
 
 def test_open_verified_parent_closes_descriptor_when_identity_check_fails(
@@ -1837,6 +2045,7 @@ def test_open_verified_parent_closes_descriptor_when_identity_check_fails(
     record = pytest_execution._RunDirectory(
         run_directory,
         pytest_execution._directory_identity(run_directory),
+        pytest_execution._directory_identity(run_directory.parent),
     )
     opened: list[int] = []
     closed: list[int] = []
