@@ -7,8 +7,9 @@ from typing import Any, cast
 
 import pytest
 
+import pyrepo_check.pytest_execution as pytest_execution
 import pyrepo_check.reporting as reporting
-from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult
+from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult, execute_plan
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
@@ -867,9 +868,34 @@ def test_pytest_execution_bridge_keeps_missing_primary_model(tmp_path: Path) -> 
     )
 
 
+def test_pytest_setup_not_started_projects_missing_primary_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+
+    def fail_run_directory(_consumer_root: Path) -> Path:
+        raise PermissionError("temporary directory denied")
+
+    monkeypatch.setattr(pytest_execution, "_create_run_directory", fail_run_directory)
+
+    execution = execute_plan(run_plan((check,)))
+    report = build_run_report(tmp_path, run_plan((check,)), execution)
+
+    assert execution.checks[0].processes == ()
+    assert execution.checks[0].pytest is not None
+    assert execution.checks[0].pytest.preflight.classification == "not_started"
+    assert report.pytest is None
+    assert report.checks[0].error == CheckError(
+        "missing_primary_process",
+        "No primary process observation was recorded.",
+    )
+
+
 @pytest.mark.parametrize(
     "processes",
     [
+        lambda check: (),
         lambda check: (ExecutedProcess(
             role="primary", command=check.command, cwd=check.cwd, returncode=0,
             duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
@@ -882,7 +908,7 @@ def test_pytest_execution_bridge_keeps_missing_primary_model(tmp_path: Path) -> 
             duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
         )),
     ],
-    ids=("primary-before-preflight", "two-primary-processes"),
+    ids=("empty-supported-observation", "primary-before-preflight", "two-primary-processes"),
 )
 def test_pytest_execution_bridge_rejects_noncanonical_internal_order(
     tmp_path: Path,

@@ -88,6 +88,12 @@ class PytestExecutionObservation:
     cleanup_error: str | None
 
 
+@dataclass(frozen=True)
+class _RunDirectory:
+    path: Path
+    identity: tuple[int, int]
+
+
 def execute_pytest(
     check: PlannedCheck,
     *,
@@ -125,9 +131,9 @@ def execute_pytest(
 
     cleanup_error: str | None = None
     try:
-        artifact_path, writer_directory = _prepare_run_directory(run_directory)
+        artifact_path, writer_directory = _prepare_run_directory(run_directory.path)
         environment = _isolated_environment(
-            run_directory,
+            run_directory.path,
             artifact_path,
             writer_directory,
         )
@@ -269,7 +275,7 @@ def _prepare_run_directory(run_directory: Path) -> tuple[Path, Path]:
     return run_directory / "artifact.json", writer_directory
 
 
-def _create_run_directory(consumer_root: Path) -> Path:
+def _create_run_directory(consumer_root: Path) -> _RunDirectory:
     resolved_root = consumer_root.resolve()
     candidates = (Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp"))  # nosec B108
     last_error: OSError | None = None
@@ -290,15 +296,22 @@ def _create_run_directory(consumer_root: Path) -> Path:
         except OSError as error:
             last_error = error
             continue
+        identity: tuple[int, int] | None = None
         try:
+            identity = _directory_identity(run_directory)
             resolved_run_directory = run_directory.resolve(strict=True)
+            if _is_within(resolved_run_directory, resolved_root):
+                raise OSError("refusing run directory inside consumer root")
         except OSError as error:
-            last_error = error
+            cleanup_error = _remove_empty_created_run_directory(run_directory, identity)
+            last_error = _with_cleanup_error(error, cleanup_error)
             continue
-        if _is_within(resolved_run_directory, resolved_root):
-            last_error = OSError("refusing run directory inside consumer root")
+        if identity is None:
+            error = OSError("created run directory identity is unavailable")
+            cleanup_error = _remove_empty_created_run_directory(run_directory, identity)
+            last_error = _with_cleanup_error(error, cleanup_error)
             continue
-        return run_directory
+        return _RunDirectory(run_directory, identity)
     if last_error is not None:
         raise last_error
     raise OSError("no safe operating-system temporary directory is available")
@@ -388,11 +401,48 @@ def _marker_id(name: str) -> str | None:
     return marker_id
 
 
-def _remove_run_directory(run_directory: Path, *, consumer_root: Path) -> None:
-    resolved_run_directory = run_directory.resolve(strict=True)
+def _remove_run_directory(run_directory: _RunDirectory, *, consumer_root: Path) -> None:
+    resolved_run_directory = run_directory.path.resolve(strict=True)
     if _is_within(resolved_run_directory, consumer_root.resolve()):
         raise OSError("refusing to remove consumer root or its contents")
-    shutil.rmtree(run_directory)
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise OSError("symlink-safe recursive removal is unavailable")
+    _verify_directory_identity(run_directory.path, run_directory.identity)
+    shutil.rmtree(run_directory.path)
+
+
+def _remove_empty_created_run_directory(
+    run_directory: Path,
+    identity: tuple[int, int] | None,
+) -> OSError | None:
+    if identity is None:
+        return OSError("created run directory identity is unavailable")
+    try:
+        _verify_directory_identity(run_directory, identity)
+        os.rmdir(run_directory)
+    except OSError as error:
+        return error
+    return None
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    file_status = os.lstat(path)
+    if not stat.S_ISDIR(file_status.st_mode):
+        raise OSError("run directory is not a directory")
+    return file_status.st_dev, file_status.st_ino
+
+
+def _verify_directory_identity(path: Path, identity: tuple[int, int]) -> None:
+    if _directory_identity(path) != identity:
+        raise OSError("run directory identity mismatch")
+
+
+def _with_cleanup_error(error: OSError, cleanup_error: OSError | None) -> OSError:
+    if cleanup_error is None:
+        return error
+    return OSError(
+        f"{error}; cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+    )
 
 
 class _UnsafePathError(OSError):

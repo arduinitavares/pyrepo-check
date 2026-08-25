@@ -63,10 +63,14 @@ def completed(
 def safe_run_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     run_directory = Path(tempfile.mkdtemp(prefix="pyrepo-check-test-"))
     assert not run_directory.is_relative_to(tmp_path)
+    created_run_directory = pytest_execution._RunDirectory(
+        run_directory,
+        pytest_execution._directory_identity(run_directory),
+    )
     monkeypatch.setattr(
         pytest_execution,
         "_create_run_directory",
-        lambda _consumer_root: run_directory,
+        lambda _consumer_root: created_run_directory,
     )
     return run_directory
 
@@ -609,8 +613,12 @@ def test_cleanup_failure_is_observed_without_losing_snapshot(
 ) -> None:
     run_directory = safe_run_directory(tmp_path, monkeypatch)
 
-    def failing_cleanup(path: Path, *, consumer_root: Path) -> None:
-        del path, consumer_root
+    def failing_cleanup(
+        run_directory: pytest_execution._RunDirectory,
+        *,
+        consumer_root: Path,
+    ) -> None:
+        del run_directory, consumer_root
         raise PermissionError("cleanup denied")
 
     monkeypatch.setattr(pytest_execution, "_remove_run_directory", failing_cleanup)
@@ -712,3 +720,93 @@ def test_run_directory_creation_failure_is_typed_not_started(
     assert observation.pytest.preflight.classification == "not_started"
     assert observation.pytest.preflight.diagnostic == "PermissionError: temporary directory denied"
     assert observation.pytest.artifact.state == "not_attempted"
+
+
+def test_rejected_consumer_root_run_directories_are_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_directories: list[Path] = []
+
+    def create_in_consumer_root(**_kwargs: object) -> str:
+        run_directory = tmp_path / f"run-directory-{len(created_directories)}"
+        run_directory.mkdir()
+        created_directories.append(run_directory)
+        return str(run_directory)
+
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_in_consumer_root)
+
+    with pytest.raises(OSError, match="inside consumer root"):
+        pytest_execution._create_run_directory(tmp_path)
+
+    assert created_directories
+    assert all(not directory.exists() for directory in created_directories)
+
+
+def test_rejected_run_directory_cleanup_failure_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_directories: list[Path] = []
+    original_rmdir = pytest_execution.os.rmdir
+
+    def create_in_consumer_root(**_kwargs: object) -> str:
+        run_directory = tmp_path / f"run-directory-{len(created_directories)}"
+        run_directory.mkdir()
+        created_directories.append(run_directory)
+        return str(run_directory)
+
+    def deny_rmdir(
+        path: str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if Path(os.fsdecode(path)).name.startswith("run-directory-"):
+            raise PermissionError("run directory cleanup denied")
+        original_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_in_consumer_root)
+    monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rmdir)
+
+    with pytest.raises(OSError, match="cleanup failed: PermissionError: run directory cleanup denied"):
+        pytest_execution._create_run_directory(tmp_path)
+
+    for directory in created_directories:
+        original_rmdir(directory)
+
+
+def test_cleanup_does_not_delete_replaced_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    replacement_file = run_directory / "replacement"
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output
+        if env is not None and command[1:3] == ("-m", "pytest"):
+            shutil.rmtree(run_directory)
+            run_directory.mkdir()
+            replacement_file.write_text("do not delete")
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+        )
+
+    try:
+        observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+        assert replacement_file.exists()
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+
+    assert observation.pytest is not None
+    assert observation.pytest.cleanup_error is not None
+    assert "identity mismatch" in observation.pytest.cleanup_error

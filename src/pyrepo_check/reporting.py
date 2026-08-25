@@ -764,7 +764,12 @@ def _build_check_result(
 
 def _project_pytest_primary(observation: ExecutedCheck) -> ExecutedProcess | None:
     processes = observation.processes
-    if not processes or processes[0].role != "pytest_preflight":
+    if not processes:
+        pytest_observation = observation.pytest
+        if pytest_observation is not None and pytest_observation.preflight.classification == "not_started":
+            return None
+        raise ReportingError("pytest execution process order must start with preflight")
+    if processes[0].role != "pytest_preflight":
         raise ReportingError("pytest execution process order must start with preflight")
     if len(processes) == 1:
         return None
