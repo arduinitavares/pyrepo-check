@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 import json
 import math
 import os
@@ -141,12 +142,12 @@ def _remove_owned_plugin_pair(args: list[str]) -> list[str]:
     return effective_args
 
 
-@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+@pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_load_initial_conftests(
     early_config: pytest.Config,
     parser: pytest.Parser,
     args: list[str],
-) -> object:
+) -> Generator[None, object, None]:
     yield
     _EVIDENCE.effective_args = _remove_owned_plugin_pair(list(args))
 
@@ -157,12 +158,12 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     _EVIDENCE.publish("started")
 
 
-@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+@pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_collection_modifyitems(
     session: pytest.Session,
     config: pytest.Config,
     items: list[pytest.Item],
-) -> object:
+) -> Generator[None, object, None]:
     _EVIDENCE.snapshot_semantic_options(config)
     _EVIDENCE.initial_nodeids = [item.nodeid for item in items]
     _EVIDENCE._deselected_during_collection = []

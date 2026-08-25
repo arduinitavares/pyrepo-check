@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+from stat import S_IMODE
 import subprocess  # nosec B404
 import sys
 from typing import cast
@@ -15,7 +16,9 @@ import uuid
 class PluginProjectRun:
     completed: subprocess.CompletedProcess[str]
     artifact: dict[str, object]
+    artifact_path: Path
     markers: list[dict[str, object]]
+    marker_paths: list[Path]
     project: Path
 
 
@@ -69,11 +72,16 @@ def run_plugin_project(
         check=False,
     )
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    markers = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(writer_dir.glob("pytest-writer-*.json"))
-    ]
-    return PluginProjectRun(completed, artifact, markers, project)
+    marker_paths = sorted(writer_dir.glob("pytest-writer-*.json"))
+    markers = [json.loads(path.read_text(encoding="utf-8")) for path in marker_paths]
+    return PluginProjectRun(
+        completed,
+        artifact,
+        artifact_path,
+        markers,
+        marker_paths,
+        project,
+    )
 
 
 def test_plugin_finalizes_one_atomic_session_for_a_passing_test(tmp_path: Path) -> None:
@@ -81,7 +89,13 @@ def test_plugin_finalizes_one_atomic_session_for_a_passing_test(tmp_path: Path) 
 
     assert run.completed.returncode == 0
     assert run.artifact["state"] == "finalized"
+    assert len(run.markers) == 1
+    assert set(run.markers[0]) == {"schema_version", "writer_id", "pid"}
+    assert run.markers[0]["schema_version"] == 1
+    assert isinstance(run.markers[0]["pid"], int)
     assert run.artifact["writer_id"] == run.markers[0]["writer_id"]
+    assert S_IMODE(run.artifact_path.stat().st_mode) == 0o600
+    assert S_IMODE(run.marker_paths[0].stat().st_mode) == 0o600
     assert run.artifact["session"] == {
         "starts": 1,
         "finishes": 1,
