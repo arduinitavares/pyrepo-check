@@ -331,13 +331,25 @@ def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
         text=True,
     ).stdout
     environment = dict(os.environ)
-    environment["COVERAGE_PROCESS_START"] = str(consumer / "coverage.toml")
-    environment["COVERAGE_PROCESS_CONFIG"] = str(consumer / "coverage.toml")
     environment["COVERAGE_FILE"] = str(consumer / ".coverage")
     environment["PYTHONPATH"] = str(consumer / "support")
     completed = subprocess.run(  # nosec B603
         (
+            str(PROJECT_ROOT / ".venv" / "bin" / "python"),
+            "-c",
+            (
+                "import os\n"
+                "import runpy\n"
+                "import sys\n"
+                "entrypoint, process_start, process_config, *arguments = sys.argv[1:]\n"
+                "os.environ['COVERAGE_PROCESS_START'] = process_start\n"
+                "os.environ['COVERAGE_PROCESS_CONFIG'] = process_config\n"
+                "sys.argv = [entrypoint, *arguments]\n"
+                "runpy.run_path(entrypoint, run_name='__main__')\n"
+            ),
             str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            str(consumer / "coverage.toml"),
+            str(consumer / "coverage.toml"),
             "--format",
             "json",
             "pytest",
