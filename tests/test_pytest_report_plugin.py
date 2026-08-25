@@ -199,6 +199,52 @@ def test_plugin_finalization_is_idempotent_after_an_early_abort(
     assert evidence.stopped_early is True
 
 
+def test_plugin_finalized_exit_zero_requires_teardown_for_terminal_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+    evidence = module._Evidence()
+    setattr(module, "_EVIDENCE", evidence)
+    nodeid = "test_sample.py::test_case"
+    evidence.starts = 1
+    evidence.collection_completed = True
+    evidence.initial_nodeids = [nodeid]
+    evidence.final_nodeids = [nodeid]
+    evidence._final_nodeid_set = {nodeid}
+
+    class Report:
+        duration = 0.0
+        outcome = "passed"
+        longrepr = None
+
+        def __init__(self, when: str) -> None:
+            self.nodeid = nodeid
+            self.when = when
+
+    module.pytest_runtest_logreport(Report("setup"))
+    module.pytest_runtest_logreport(Report("call"))
+
+    class Session:
+        shouldstop = False
+        shouldfail = False
+
+    module.pytest_sessionfinish(Session(), 0)
+    artifact = json.loads(
+        (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
+    )
+
+    assert artifact["state"] == "finalized"
+    assert artifact["session"] == {
+        "starts": 1,
+        "finishes": 1,
+        "exit_code": 0,
+        "collection_completed": True,
+        "stopped_early": True,
+    }
+    assert [report["when"] for report in artifact["reports"]] == ["setup", "call"]
+
+
 def test_plugin_finalizes_one_atomic_session_for_a_passing_test(tmp_path: Path) -> None:
     run = run_plugin_project(tmp_path, "def test_ok():\n    assert True\n")
 

@@ -48,12 +48,22 @@ class _CountingNodeId(str):
 
 
 @pytest.mark.parametrize(
-    ("test_source", "project_sources", "invocation_args"),
+    ("test_source", "project_sources", "invocation_args", "expected_complete"),
     (
-        ("def test_case():\n    assert True\n", None, ()),
-        ("def test_case():\n    assert False\n", None, ()),
-        ("import pytest\n\n@pytest.mark.skip(reason='skip')\ndef test_case(): pass\n", None, ()),
-        ("import pytest\n\n@pytest.mark.xfail(reason='xfail')\ndef test_case(): assert False\n", None, ()),
+        ("def test_case():\n    assert True\n", None, (), True),
+        ("def test_case():\n    assert False\n", None, (), True),
+        (
+            "import pytest\n\n@pytest.mark.skip(reason='skip')\ndef test_case(): pass\n",
+            None,
+            (),
+            True,
+        ),
+        (
+            "import pytest\n\n@pytest.mark.xfail(reason='xfail')\ndef test_case(): assert False\n",
+            None,
+            (),
+            True,
+        ),
         (
             "def test_case(failing_setup): pass\n",
             {
@@ -63,6 +73,7 @@ class _CountingNodeId(str):
                 )
             },
             (),
+            True,
         ),
         (
             "def test_case(failing_teardown): pass\n",
@@ -73,17 +84,22 @@ class _CountingNodeId(str):
                 )
             },
             (),
+            True,
         ),
-        ("def test_case():\n    assert True\n", None, ("--collect-only",)),
+        ("def test_case():\n    assert True\n", None, ("--setup-only",), True),
+        ("def test_case():\n    assert True\n", None, ("--setup-plan",), True),
+        ("def test_case():\n    assert True\n", None, ("--collect-only",), False),
         (
             "def test_first(): assert False\n\ndef test_second(): assert True\n",
             None,
             ("-x",),
+            False,
         ),
         (
             "def test_kept(): pass\n\ndef test_removed(): pass\n",
             None,
             ("-k", "kept"),
+            True,
         ),
     ),
     ids=(
@@ -93,6 +109,8 @@ class _CountingNodeId(str):
         "xfail",
         "setup-error",
         "teardown-error",
+        "setup-only",
+        "setup-plan",
         "collect-only",
         "early-stop",
         "deselection",
@@ -103,6 +121,7 @@ def test_real_plugin_artifact_matrix_passes_task_five_validation(
     test_source: str,
     project_sources: dict[str, str] | None,
     invocation_args: tuple[str, ...],
+    expected_complete: bool,
 ) -> None:
     run = run_plugin_project(
         tmp_path,
@@ -130,6 +149,9 @@ def test_real_plugin_artifact_matrix_passes_task_five_validation(
     check = replace(check, processes=(primary,), pytest=observation)
 
     assert isinstance(validate_pytest_execution(check), ValidatedPytestSession)
+    result = build_pytest_result(_plan(check), check)
+    assert result.complete is expected_complete
+    assert result.evidence is not None
 
 
 def _check(
@@ -980,6 +1002,31 @@ def test_validation_rejects_impossible_phase_order(phases: tuple[str, ...]) -> N
     assert result.error.code == "artifact_invalid"
 
 
+def test_setup_and_passing_call_without_teardown_is_trusted_but_incomplete() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    reports = cast(list[dict[str, object]], document["reports"])
+    document["reports"] = reports[:2]
+    document["effective_args"] = []
+    options = cast(dict[str, object], document["semantic_options"])
+    options["collection_paths"] = []
+    changed = _with_document(check, document)
+
+    validated = validate_pytest_execution(changed)
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert isinstance(validated, ValidatedPytestSession)
+    assert result.status == "passed"
+    assert result.complete is False
+    assert result.scope == "partial"
+    assert result.scope_reasons == ("incomplete_session",)
+    assert result.pytest_version == "8.4.2"
+    assert result.exit_code == 0
+    assert result.evidence is not None
+    assert result.evidence.counts == PytestCounts(1, 0, 0, 0, 0, 0)
+    assert result.error is None
+
+
 def test_evidence_consolidation_uses_linear_membership_operations() -> None:
     nodeids = tuple(_CountingNodeId(f"node-{index}") for index in range(2_000))
     reports = tuple(
@@ -997,7 +1044,7 @@ def test_evidence_consolidation_uses_linear_membership_operations() -> None:
         pytest_version="8.4.2",
         exit_code=0,
         effective_args=(),
-        semantic_options={},
+        semantic_options={"setuponly": False, "setupplan": False},
         collection={
             "final_nodeids": nodeids,
             "deselected_nodeids": (),

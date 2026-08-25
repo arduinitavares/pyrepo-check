@@ -246,13 +246,18 @@ def build_pytest_result(plan: RunPlan, check: ExecutedCheck) -> PytestResult:
     evidence, terminal_nodeids = _build_evidence(validated)
     collection_errors = evidence.collection_errors
     final_nodeids = cast(tuple[str, ...], validated.collection["final_nodeids"])
+    final_nodeid_set = set(final_nodeids)
+    final_phase_nodeids = {
+        report.nodeid for report in validated.reports if report.when == "teardown"
+    }
     collection_completed = cast(bool, validated.session["collection_completed"])
     stopped_early = cast(bool, validated.session["stopped_early"])
     complete = (
         collection_completed
         and not collection_errors
         and not stopped_early
-        and set(final_nodeids).issubset(terminal_nodeids)
+        and final_nodeid_set.issubset(terminal_nodeids)
+        and final_nodeid_set.issubset(final_phase_nodeids)
         and _count_total(evidence.counts) == evidence.collected
         and validated.exit_code in {0, 1, 5}
         and (validated.exit_code != 5 or evidence.collected == 0)
@@ -304,9 +309,13 @@ def _build_evidence(
     slowest: list[SlowTest] = []
     special: list[SpecialTestOutcome] = []
     terminal_nodeids: set[str] = set()
+    setup_only = bool(
+        validated.semantic_options["setuponly"]
+        or validated.semantic_options["setupplan"]
+    )
     for nodeid in final_nodeids:
         reports = phases_by_nodeid.get(nodeid, [])
-        outcome = _consolidate_node(reports)
+        outcome = _consolidate_node(reports, setup_only=setup_only)
         if outcome is None:
             continue
         terminal_nodeids.add(nodeid)
@@ -344,6 +353,8 @@ def _build_evidence(
 
 def _consolidate_node(
     reports: list[ValidatedPhaseReport],
+    *,
+    setup_only: bool,
 ) -> tuple[Literal["passed", "failed", "errors", "skipped", "xfailed", "xpassed"], str | None, bool | None, bool] | None:
     if not reports:
         return None
@@ -373,16 +384,23 @@ def _consolidate_node(
     skipped = next((report for report in reports if report.outcome == "skipped"), None)
     if skipped is not None:
         return ("skipped", None, None, False)
-    if not _has_terminal_phase(reports):
+    if not _has_terminal_phase(reports, setup_only=setup_only):
         return None
     return ("passed", None, None, False)
 
 
-def _has_terminal_phase(reports: list[ValidatedPhaseReport]) -> bool:
+def _has_terminal_phase(
+    reports: list[ValidatedPhaseReport],
+    *,
+    setup_only: bool,
+) -> bool:
     return any(
         report.when == "call"
         or (report.when == "setup" and report.outcome != "passed")
-        or (report.when == "teardown" and report.outcome != "passed")
+        or (
+            report.when == "teardown"
+            and (report.outcome != "passed" or setup_only)
+        )
         for report in reports
     )
 

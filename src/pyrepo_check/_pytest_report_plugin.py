@@ -223,7 +223,7 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     _EVIDENCE._observed_phase_keys.add(phase_key)
     if report.outcome not in {"passed", "failed", "skipped"}:
         _EVIDENCE.unsupported_retries = True
-    if report.when in {"call", "teardown"}:
+    if report.when == "teardown":
         _EVIDENCE._terminal_nodeids.add(report.nodeid)
     _EVIDENCE.reports.append(
         {
