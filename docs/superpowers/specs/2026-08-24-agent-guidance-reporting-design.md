@@ -180,7 +180,7 @@ For each selected pytest run, the executor first creates an owner-only
 temporary directory outside the consumer repository. Before loading the
 plugin, it runs a `pytest_preflight` under the consumer interpreter. Its `-c`
 probe uses Python 3.7-compatible syntax, reads `sys.version_info` before
-importing pytest, and emits a small JSON record. A consumer below Python 3.9
+importing pytest, and emits a small JSON record. A consumer below Python 3.13.15
 produces a synthetic `PytestResult` with `unsupported_python`; missing or
 out-of-range pytest produces `module_unavailable` or `unsupported_version`. No
 plugin is loaded and no tests run in those cases.
@@ -218,7 +218,7 @@ the target pytest version, exit code, collection/session state, and per-node
 setup/call/teardown reports. Missing, malformed, schema-invalid, or
 non-finalized artifacts are evidence errors; the artifact pytest version must
 equal the trusted preflight version. Version 1 supports pytest
-`>=8,<9` in consumer Python `>=3.9`. The standalone source uses only Python 3.9
+`>=8,<9` in consumer Python `>=3.13.15`. The standalone source uses only Python 3.13
 grammar and standard-library APIs because the preflight prevents it from being
 loaded on an unsupported interpreter.
 
@@ -393,11 +393,11 @@ arguments.
 ### Supported version and native configuration
 
 Version 1 supports Coverage.py `coverage[toml]>=7.15,<8` in consumer Python
-`>=3.10`, matching the package's
-[published Python support](https://coverage.readthedocs.io/en/7.15.2/).
-Plain structured pytest evidence retains its Python `>=3.9` floor. The tool
-installation remains isolated and does not make Coverage.py available to
-`uv run` inside the consumer project.
+`>=3.13.15`. This is stricter than Coverage.py's
+[published Python support](https://coverage.readthedocs.io/en/7.15.2/) and
+matches the package and structured pytest evidence floor. The tool installation
+remains isolated and does not make Coverage.py available to `uv run` inside the
+consumer project.
 
 Coverage settings belong to Coverage.py in `pyproject.toml`. The minimum is:
 
@@ -429,7 +429,7 @@ Coverage.py version before starting coverage. Missing or unsupported coverage
 is an execution error and is never reported as successful plain pytest.
 The preflight runs consumer Python with an argument-vector `-c` probe that
 emits the Python version and, on supported Python, imports `coverage` and emits
-`coverage.__version__`. Consumer Python below 3.10 is
+`coverage.__version__`. Consumer Python below 3.13.15 is
 `CoverageError.unsupported_python`; only a stable Coverage.py release in the
 supported range proceeds. Its stdout/stderr and result are recorded as the
 `coverage_preflight` process.
@@ -1268,10 +1268,9 @@ the intended contract.
   unreported collection-list reduction all remain partial and gate-ineligible.
   Assert exact reason arrays: a reported reduction uses `deselected_tests`;
   only uncovered removed identities add `collection_reduced`.
-- Prove consumer Python below 3.9 and pytest outside `>=8,<9` stop in
-  `pytest_preflight` without loading the plugin. Prove Python 3.9 plain evidence
-  works while coverage returns `CoverageError.unsupported_python` and launches
-  no pytest process.
+- Prove consumer Python below 3.13.15 and pytest outside `>=8,<9` stop in
+  `pytest_preflight` without loading the plugin. Prove Python 3.13.15 plain and
+  coverage evidence work when their required consumer dependencies are present.
 - Prove xdist `-n 0` remains single-process, non-empty xdist worker specs stop
   before workers start, and observable worker metadata, multiple artifact
   writers, duplicated sessions, or coverage shards invalidate evidence. Active

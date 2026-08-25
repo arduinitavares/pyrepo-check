@@ -1,10 +1,14 @@
 from pathlib import Path
 import sys
+import tomllib
 
 import pytest
 
 from pyrepo_check.cli import main, parse_args
 from tests.support import RecordingRunner
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
@@ -205,4 +209,28 @@ def test_invalid_format_remains_argparse_owned(
     assert captured.value.code == 2
     assert output.out == ""
     assert "invalid choice: 'xml'" in output.err
-    assert "choose from terminal, json" in output.err
+    assert "choose from 'terminal', 'json'" in output.err
+
+
+def test_python_requirement_is_consistent_across_active_contracts() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lockfile = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    reporting_design = (
+        PROJECT_ROOT
+        / "docs"
+        / "superpowers"
+        / "specs"
+        / "2026-08-24-agent-guidance-reporting-design.md"
+    ).read_text(encoding="utf-8")
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert pyproject["project"]["requires-python"] == ">=3.13.15"
+    assert pyproject["tool"]["ruff"]["target-version"] == "py313"
+    assert lockfile["requires-python"] == ">=3.13.15"
+    assert (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8") == "3.13.15\n"
+    assert "consumer Python `>=3.13.15`" in reporting_design
+    assert "consumer Python `>=3.9`" not in reporting_design
+    assert "consumer Python `>=3.10`" not in reporting_design
+    assert "consumer Python below 3.9" not in reporting_design
+    assert "consumer Python below 3.10" not in reporting_design
+    assert "Python 3.13.15 or newer is required" in readme

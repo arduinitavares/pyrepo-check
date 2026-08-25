@@ -5,6 +5,8 @@ editable global tool, then run it from any Python project root.
 
 ## Install
 
+Python 3.13.15 or newer is required.
+
 ```bash
 uv tool install --editable /Users/aaat/projects/pyrepo-check
 ```
