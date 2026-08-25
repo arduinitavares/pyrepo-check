@@ -115,6 +115,7 @@ _ADVISORY_CODES = frozenset(
     )
 )
 _TERMINAL_COVERAGE_FILE_LIMIT = 3
+_TERMINAL_COVERAGE_NAME_WIDTH = 48
 _PYTEST_SCOPE_REASONS: tuple[str, ...] = (
     "planned_selector",
     "effective_narrowing_option",
@@ -498,7 +499,8 @@ def _append_coverage_summary(lines: list[str], coverage: CoverageResult) -> None
     _append_coverage_table(lines, rows, total_row)
     omitted = len(files_with_gaps) - len(focus_files)
     if omitted:
-        lines.append(f"      ... {omitted} more files with gaps")
+        noun = "file" if omitted == 1 else "files"
+        lines.append(f"      ... {omitted} more {noun} with gaps")
     if files_with_gaps:
         lines.append(
             "    coverage details: use --format json for exact missing lines and branches"
@@ -521,14 +523,15 @@ def _append_coverage_table(
     rows: list[tuple[str, int, int, int, int, str]],
     total_row: tuple[str, int, int, int, int, str],
 ) -> None:
-    name_width = max(len("Name"), *(len(row[0]) for row in (*rows, total_row)))
+    display_rows = [(_coverage_display_name(row[0]), *row[1:]) for row in rows]
+    name_width = max(len("Name"), *(len(row[0]) for row in (*display_rows, total_row)))
     header = (
         f"      {'Name':<{name_width}}  {'Stmts':>5}  {'Miss':>4}  "
         f"{'Branch':>6}  {'BrMiss':>6}  {'Cover':>7}"
     )
     separator = "      " + "-" * (len(header) - 6)
     lines.extend(("    coverage:", header, separator))
-    for name, statements, missing, branches, branch_missing, cover in rows:
+    for name, statements, missing, branches, branch_missing, cover in display_rows:
         lines.append(
             f"      {name:<{name_width}}  {statements:>5}  {missing:>4}  "
             f"{branches:>6}  {branch_missing:>6}  {cover:>7}"
@@ -542,9 +545,21 @@ def _append_coverage_table(
     )
 
 
+def _coverage_display_name(path: str) -> str:
+    if len(path) <= _TERMINAL_COVERAGE_NAME_WIDTH:
+        return path
+    return "..." + path[-(_TERMINAL_COVERAGE_NAME_WIDTH - 3) :]
+
+
 def _coverage_percentage(covered: int, missing: int) -> str:
     total = covered + missing
     percentage = 100.0 if total == 0 else covered * 100 / total
+    if 0 < percentage < 0.01:
+        percentage = 0.01
+    elif 99.99 < percentage < 100:
+        percentage = 99.99
+    else:
+        percentage = round(percentage, 2)
     return f"{percentage:.2f}%"
 
 

@@ -1386,7 +1386,7 @@ summary as:
 
 1. incomplete or errored evidence;
 2. failed checks, pytest, or coverage in planned order;
-3. exact coverage gaps;
+3. compact coverage status and highest-gap file summary;
 4. special pytest outcomes and slow nodes;
 5. advisories; and
 6. compact successful-check confirmation.

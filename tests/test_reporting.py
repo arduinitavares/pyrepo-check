@@ -725,9 +725,12 @@ def test_terminal_coverage_summary_caps_ranked_files_and_keeps_exact_json_gaps(
 ) -> None:
     source_directory = tmp_path / "src"
     source_directory.mkdir()
+    long_alpha_name = f"{'very_long_' * 12}alpha.py"
     sources = {
-        name: source_directory / name
-        for name in ("alpha.py", "beta.py", "gamma.py", "delta.py", "epsilon.py")
+        "alpha.py": source_directory / long_alpha_name,
+        "beta.py": source_directory / "beta.py",
+        "gamma.py": source_directory / "gamma.py",
+        "delta.py": source_directory / "delta.py",
     }
     for source in sources.values():
         source.write_text("value = 1\n", encoding="utf-8")
@@ -782,26 +785,14 @@ def test_terminal_coverage_summary_caps_ranked_files_and_keeps_exact_json_gaps(
                 "missing_lines": [701, 702, 703],
                 "missing_branches": [[801, 802]],
             },
-            str(sources["epsilon.py"]): {
-                "summary": {
-                    "covered_lines": 10,
-                    "missing_lines": 2,
-                    "num_statements": 12,
-                    "covered_branches": 6,
-                    "missing_branches": 1,
-                    "num_branches": 7,
-                },
-                "missing_lines": [901, 902],
-                "missing_branches": [[903, 904]],
-            },
         },
         "totals": {
-            "covered_lines": 50,
-            "missing_lines": 20,
-            "num_statements": 70,
-            "covered_branches": 30,
-            "missing_branches": 11,
-            "num_branches": 41,
+            "covered_lines": 40,
+            "missing_lines": 18,
+            "num_statements": 58,
+            "covered_branches": 24,
+            "missing_branches": 10,
+            "num_branches": 34,
         },
     }
     report = build_coverage_report(
@@ -818,12 +809,13 @@ def test_terminal_coverage_summary_caps_ranked_files_and_keeps_exact_json_gaps(
         "    coverage: guidance (partial); minimum 90% not applied\n"
         "    coverage:\n"
     )
-    assert "src/alpha.py" in terminal
+    alpha_path = f"src/{long_alpha_name}"
+    assert alpha_path not in terminal
+    assert f"...{alpha_path[-45:]}" in terminal
     assert "src/beta.py" in terminal
     assert "src/gamma.py" in terminal
     assert "src/delta.py" not in terminal
-    assert "src/epsilon.py" not in terminal
-    assert "      ... 2 more files with gaps\n" in terminal
+    assert "      ... 1 more file with gaps\n" in terminal
     assert "201->-1" not in terminal
     assert "coverage: missing lines:" not in terminal
     assert "coverage: missing branches:" not in terminal
@@ -841,6 +833,23 @@ def test_terminal_coverage_summary_caps_ranked_files_and_keeps_exact_json_gaps(
         201,
         -1,
     ]
+
+
+@pytest.mark.parametrize(
+    ("covered", "missing", "expected"),
+    (
+        (99_999, 1, "99.99%"),
+        (1, 99_999, "0.01%"),
+        (1, 0, "100.00%"),
+        (0, 1, "0.00%"),
+    ),
+)
+def test_coverage_percentage_reserves_zero_and_hundred_for_exact_values(
+    covered: int,
+    missing: int,
+    expected: str,
+) -> None:
+    assert reporting._coverage_percentage(covered, missing) == expected
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permits literal backslashes and drive-like names")
