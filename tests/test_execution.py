@@ -16,11 +16,12 @@ from pyrepo_check import execution
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
+    ExecutedCheck,
     ExecutedProcess,
     ExecutionResult,
     execute_plan,
 )
-from pyrepo_check.planning import OutputFormat, PlannedCheck, RunPlan
+from pyrepo_check.planning import OutputFormat, PlannedCheck, PytestExecutionPlan, RunPlan
 from tests.support import RecordingRunner
 
 
@@ -80,6 +81,46 @@ def make_python_check_plan(tmp_path: Path, source: str) -> RunPlan:
         ),
         output_format="json",
     )
+
+
+def test_execute_plan_passes_authoritative_plan_to_pytest_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import pytest_execution
+
+    pytest_plan = PytestExecutionPlan(
+        consumer_python=("consumer-python",),
+        pytest_args=(),
+    )
+    check = PlannedCheck(
+        name="pytest",
+        command=("consumer-python", "-m", "pytest"),
+        cwd=tmp_path,
+        pytest=pytest_plan,
+    )
+    plan = RunPlan(mode="strict_aggregate", targets=(), checks=(check,))
+
+    def fake_execute_pytest(
+        observed_check: PlannedCheck,
+        *,
+        plan: RunPlan | None,
+        output_format: OutputFormat,
+        runner: object,
+        clock_ns: object,
+    ) -> ExecutedCheck:
+        del output_format, runner, clock_ns
+        assert observed_check is check
+        assert plan is not None
+        assert plan is expected_plan
+        return ExecutedCheck(planned=check, processes=())
+
+    expected_plan = plan
+    monkeypatch.setattr(pytest_execution, "execute_pytest", fake_execute_pytest)
+
+    result = execute_plan(plan)
+
+    assert result.checks == (ExecutedCheck(planned=check, processes=()),)
 
 
 class _VirtualPipe:

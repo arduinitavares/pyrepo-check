@@ -14,7 +14,13 @@ from typing import Callable, Never, TypeVar, cast
 import pytest
 
 from pyrepo_check.execution import CapturedBytes, ExecutionResult, execute_plan
-from pyrepo_check.planning import OutputFormat, PlannedCheck, PytestExecutionPlan, RunPlan
+from pyrepo_check.planning import (
+    CoverageExecutionPlan,
+    OutputFormat,
+    PlannedCheck,
+    PytestExecutionPlan,
+    RunPlan,
+)
 import pyrepo_check.pytest_execution as pytest_execution
 from pyrepo_check.pytest_execution import execute_pytest
 from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
@@ -412,6 +418,30 @@ def pytest_check(tmp_path: Path) -> PlannedCheck:
         cwd=tmp_path,
         pytest=pytest,
     )
+
+
+def test_planned_coverage_requires_the_authoritative_run_plan(tmp_path: Path) -> None:
+    plain = pytest_check(tmp_path)
+    if plain.pytest is None:
+        raise AssertionError("pytest plan is unavailable")
+    coverage = CoverageExecutionPlan(
+        consumer_python=plain.pytest.consumer_python,
+        config_path=tmp_path / "pyproject.toml",
+        fail_under=80,
+    )
+    check = PlannedCheck(
+        name=plain.name,
+        command=plain.command,
+        cwd=plain.cwd,
+        pytest=PytestExecutionPlan(
+            consumer_python=plain.pytest.consumer_python,
+            pytest_args=plain.pytest.pytest_args,
+            coverage=coverage,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires RunPlan"):
+        execute_pytest(check, output_format="json")
 
 
 def preflight_document(

@@ -102,6 +102,28 @@ def test_regular_file_growth_after_fstat_is_rejected(
         artifact_safety.read_regular_file(marker, max_bytes=1)
 
 
+def test_regular_file_same_size_mutation_during_read_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "marker.json"
+    marker.write_bytes(b"original")
+    original_read = artifact_safety.os.read
+    mutated = False
+
+    def mutate_after_read(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        content = original_read(descriptor, size)
+        if content and not mutated:
+            mutated = True
+            marker.write_bytes(b"changed!")
+        return content
+
+    monkeypatch.setattr(artifact_safety.os, "read", mutate_after_read)
+    with pytest.raises(artifact_safety._UnsafePathError, match="changed during read"):
+        artifact_safety.read_regular_file(marker, max_bytes=8)
+
+
 def test_regular_file_reader_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target.json"
     target.write_text("{}")
@@ -348,3 +370,18 @@ def test_copy_digest_observation_never_retains_destination_bytes(tmp_path: Path)
 
     assert all(not isinstance(value, bytes) for value in vars(digest).values())
     assert destination.read_bytes() == b"source"
+
+
+def test_regular_file_copy_returns_verified_destination_identity(tmp_path: Path) -> None:
+    source = tmp_path / "source.data"
+    source.write_bytes(b"source")
+    destination = tmp_path / "destination.data"
+
+    copied = artifact_safety.copy_regular_file(source, destination, max_bytes=8)
+    destination_status = destination.stat()
+
+    assert copied.digest == artifact_safety.digest_regular_file(destination, max_bytes=8)
+    assert copied.destination_identity == artifact_safety.FileIdentity(
+        device=destination_status.st_dev,
+        inode=destination_status.st_ino,
+    )

@@ -26,6 +26,22 @@ class FileDigest:
 
 
 @dataclass(frozen=True)
+class FileIdentity:
+    """The stable filesystem identity of one regular file."""
+
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class RegularFileCopy:
+    """Digest and held-descriptor identity verified by one exclusive copy."""
+
+    digest: FileDigest
+    destination_identity: FileIdentity
+
+
+@dataclass(frozen=True)
 class _DirectoryIdentity:
     device: int
     inode: int
@@ -91,6 +107,7 @@ def read_regular_file(
             content.extend(chunk)
         if len(content) > max_bytes:
             raise _BoundedReadError(f"{path.name} exceeds the {max_bytes}-byte limit")
+        _verify_unchanged(descriptor, path.name, file_status)
         return bytes(content)
     finally:
         os.close(descriptor)
@@ -152,6 +169,24 @@ def copy_regular_file_with_digest(
     destination_dir_fd: int | None = None,
 ) -> FileDigest:
     """Copy one bounded regular file, then verify the destination digest."""
+    return copy_regular_file(
+        source_path,
+        destination_path,
+        max_bytes=max_bytes,
+        source_dir_fd=source_dir_fd,
+        destination_dir_fd=destination_dir_fd,
+    ).digest
+
+
+def copy_regular_file(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    max_bytes: int,
+    source_dir_fd: int | None = None,
+    destination_dir_fd: int | None = None,
+) -> RegularFileCopy:
+    """Copy a bounded regular file and return its verified digest and identity."""
     source_descriptor, initial_status = _open_regular_file(
         source_path,
         max_bytes=max_bytes,
@@ -229,7 +264,13 @@ def copy_regular_file_with_digest(
         )
         if destination_digest != source_digest:
             raise _DigestMismatchError(f"{destination_path.name} digest mismatch after copy")
-        return source_digest
+        return RegularFileCopy(
+            digest=source_digest,
+            destination_identity=FileIdentity(
+                device=destination_metadata.device,
+                inode=destination_metadata.inode,
+            ),
+        )
     finally:
         if destination_descriptor is not None:
             os.close(destination_descriptor)

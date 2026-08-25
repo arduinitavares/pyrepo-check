@@ -127,6 +127,7 @@ def execute_plan(
             executed.append(
                 execute_pytest(
                     check,
+                    plan=plan,
                     output_format=plan.output_format,
                     runner=runner,
                     clock_ns=clock_ns,

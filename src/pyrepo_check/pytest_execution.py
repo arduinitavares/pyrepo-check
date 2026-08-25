@@ -24,6 +24,7 @@ from pyrepo_check.artifact_safety import (
     read_regular_file as _read_regular_file,
     load_bounded_json as _load_bounded_json,
 )
+from pyrepo_check.coverage_evidence import coverage_gate_policy
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
@@ -34,14 +35,23 @@ from pyrepo_check.execution import (
 )
 from pyrepo_check.coverage_execution import (
     CoverageArtifactObservation,
+    CoverageDataError,
+    CoverageDataSnapshot,
     CoverageExecutionObservation,
     classify_coverage_preflight,
     coverage_environment,
+    coverage_json_command,
+    coverage_json_environment,
     coverage_preflight_command,
     coverage_primary_command,
     invalid_coverage_observation,
+    prepare_coverage_data_snapshot,
+    require_coverage_json_destination_absent,
+    snapshot_coverage_json,
+    verify_coverage_data_snapshot,
 )
-from pyrepo_check.planning import OutputFormat, PlannedCheck
+from pyrepo_check.planning import CoverageExecutionPlan, OutputFormat, PlannedCheck, RunPlan
+from pyrepo_check.pytest_evidence import build_pytest_result
 
 if sys.platform == "darwin":
     import fcntl as _fcntl
@@ -304,6 +314,7 @@ class _CleanupFrame:
 def execute_pytest(
     check: PlannedCheck,
     *,
+    plan: RunPlan | None = None,
     output_format: OutputFormat,
     runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
@@ -314,6 +325,8 @@ def execute_pytest(
         raise ValueError("pytest execution requires PlannedCheck.pytest metadata")
     artifact = PytestArtifactObservation("not_attempted", None, (), None)
     coverage_plan = pytest_plan.coverage
+    if coverage_plan is not None and plan is None:
+        raise ValueError("planned coverage report generation requires RunPlan")
     coverage: CoverageExecutionObservation | None = (
         invalid_coverage_observation("coverage execution setup did not run")
         if coverage_plan is not None
@@ -433,7 +446,9 @@ def execute_pytest(
                         coverage_preflight = classify_coverage_preflight(coverage_process)
                         coverage = CoverageExecutionObservation(
                             preflight=coverage_preflight,
-                            artifact=CoverageArtifactObservation("not_attempted", None),
+                            artifact=CoverageArtifactObservation(
+                                "not_attempted", None, None
+                            ),
                         )
                         try:
                             verified_run.verify("after coverage preflight")
@@ -474,6 +489,78 @@ def execute_pytest(
                             writer_directory,
                             run_descriptor=verified_run.descriptor,
                         )
+                        interim_pytest = PytestExecutionObservation(
+                            preflight=preflight,
+                            artifact=artifact,
+                            cleanup_error=None,
+                        )
+                        interim_check = ExecutedCheck(
+                            planned=check,
+                            processes=tuple(processes),
+                            pytest=interim_pytest,
+                            coverage=coverage,
+                        )
+                        if plan is None:
+                            raise AssertionError("coverage RunPlan is unavailable")
+                        pytest_result = build_pytest_result(plan, interim_check)
+                        if (
+                            pytest_result.error is not None
+                            and pytest_result.error.code == "unsupported_parallelism"
+                        ):
+                            if coverage is None:
+                                raise AssertionError("coverage observation is unavailable")
+                            coverage = CoverageExecutionObservation(
+                                preflight=coverage.preflight,
+                                artifact=CoverageArtifactObservation(
+                                    "unsupported_parallelism",
+                                    None,
+                                    "pytest artifact reports unsupported parallel execution",
+                                ),
+                            )
+                        else:
+                            policy = coverage_gate_policy(plan, pytest_result, True)
+                            if coverage is None:
+                                raise AssertionError("coverage observation is unavailable")
+                            (
+                                coverage_artifact,
+                                coverage_json_process,
+                                coverage_close_error,
+                            ) = _generate_coverage_json(
+                                verified_run=verified_run,
+                                coverage_plan=coverage_plan,
+                                check=check,
+                                base_environment=coverage_env,
+                                force_fail_under_zero=policy.force_fail_under_zero,
+                                retain_threshold_exit_two=(
+                                    policy.gate_eligible
+                                    and policy.skipped_reason is None
+                                ),
+                                runner=runner,
+                                clock_ns=clock_ns,
+                            )
+                            if coverage_json_process is not None:
+                                processes.append(coverage_json_process)
+                            if coverage_close_error is not None:
+                                cleanup_error = _combine_diagnostic(
+                                    cleanup_error,
+                                    coverage_close_error,
+                                )
+                            coverage = CoverageExecutionObservation(
+                                preflight=coverage.preflight,
+                                artifact=coverage_artifact,
+                            )
+                elif (
+                    coverage is not None
+                    and coverage.preflight.classification == "supported"
+                ):
+                    coverage = CoverageExecutionObservation(
+                        preflight=coverage.preflight,
+                        artifact=CoverageArtifactObservation(
+                            "data_missing",
+                            None,
+                            "coverage data was not produced because pytest primary did not run",
+                        ),
+                    )
             elif preflight.classification == "supported":
                 processes.append(
                     _run_primary(
@@ -527,10 +614,16 @@ def execute_pytest(
                 clock_ns=clock_ns,
             )
         except OSError as error:
-            cleanup_error = f"{type(error).__name__}: {error}"
+            cleanup_error = _combine_diagnostic(
+                cleanup_error,
+                f"{type(error).__name__}: {error}",
+            )
         else:
             if cleanup_observation is not None:
-                cleanup_error = _cleanup_diagnostic(cleanup_observation)
+                cleanup_error = _combine_diagnostic(
+                    cleanup_error,
+                    _cleanup_diagnostic(cleanup_observation),
+                )
     return ExecutedCheck(
         planned=check,
         processes=tuple(processes),
@@ -580,6 +673,111 @@ def _run_primary(
         clock_ns=clock_ns,
         environment=dict(environment),
     )
+
+
+def _generate_coverage_json(
+    *,
+    verified_run: _VerifiedRunDirectory,
+    coverage_plan: CoverageExecutionPlan,
+    check: PlannedCheck,
+    base_environment: Mapping[str, str],
+    force_fail_under_zero: bool,
+    retain_threshold_exit_two: bool,
+    runner: ProcessRunner | None,
+    clock_ns: Callable[[], int],
+) -> tuple[CoverageArtifactObservation, ExecutedProcess | None, str | None]:
+    snapshot: CoverageDataSnapshot | None = None
+    process: ExecutedProcess | None = None
+    coverage_artifact: CoverageArtifactObservation | None = None
+    close_error: str | None = None
+    try:
+        try:
+            verified_run.verify("before coverage data snapshot")
+            snapshot = prepare_coverage_data_snapshot(
+                verified_run.run_directory.path,
+                run_descriptor=verified_run.descriptor,
+            )
+            verified_run.verify("before coverage JSON generation")
+            verify_coverage_data_snapshot(snapshot)
+            require_coverage_json_destination_absent(snapshot)
+        except CoverageDataError as error:
+            coverage_artifact = CoverageArtifactObservation(
+                error.code,
+                None,
+                error.message,
+            )
+        except OSError as error:
+            coverage_artifact = CoverageArtifactObservation(
+                "unexpected_parallel_data",
+                None,
+                f"coverage workspace validation failed: {type(error).__name__}: {error}",
+            )
+        else:
+            config_path = coverage_plan.config_path.resolve()
+            process = execute_process(
+                role="coverage_json",
+                command=coverage_json_command(
+                    consumer_python=coverage_plan.consumer_python,
+                    config_path=config_path,
+                    data_path=snapshot.data_path,
+                    output_path=verified_run.run_directory.path / "coverage.json",
+                    force_fail_under_zero=force_fail_under_zero,
+                ),
+                cwd=check.cwd,
+                capture_output=True,
+                runner=runner,
+                clock_ns=clock_ns,
+                environment=coverage_json_environment(
+                    base_environment,
+                    data_path=snapshot.data_path,
+                    config_path=config_path,
+                ),
+            )
+
+            endpoint_error: str | None = None
+            try:
+                verified_run.verify("after coverage JSON generation")
+                verify_coverage_data_snapshot(snapshot)
+            except (CoverageDataError, OSError) as error:
+                endpoint_error = f"{type(error).__name__}: {error}"
+
+            if process.spawn_error is not None or process.returncode is None:
+                coverage_artifact = CoverageArtifactObservation(
+                    "spawn_failed",
+                    None,
+                    process.spawn_error or "coverage JSON process has no exit code",
+                )
+            elif process.returncode < 0:
+                coverage_artifact = CoverageArtifactObservation(
+                    "terminated_by_signal",
+                    None,
+                    f"coverage JSON process terminated by signal {-process.returncode}",
+                )
+            elif endpoint_error is not None:
+                coverage_artifact = CoverageArtifactObservation(
+                    "unexpected_parallel_data",
+                    None,
+                    endpoint_error,
+                )
+            elif process.returncode != 0 and not (
+                process.returncode == 2 and retain_threshold_exit_two
+            ):
+                coverage_artifact = CoverageArtifactObservation(
+                    "generation_failed",
+                    None,
+                    f"coverage JSON generation exited with code {process.returncode}",
+                )
+            else:
+                coverage_artifact = snapshot_coverage_json(snapshot)
+    finally:
+        if snapshot is not None:
+            try:
+                snapshot.close()
+            except OSError as error:
+                close_error = f"coverage snapshot close failed: {type(error).__name__}: {error}"
+    if coverage_artifact is None:
+        raise AssertionError("coverage artifact observation is unavailable")
+    return coverage_artifact, process, close_error
 
 
 def _prepare_run_directory(
