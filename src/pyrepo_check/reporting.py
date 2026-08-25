@@ -100,6 +100,49 @@ _ADVISORY_CODES = frozenset(
         "output_truncated",
     )
 )
+_PYTEST_SCOPE_REASONS: tuple[str, ...] = (
+    "planned_selector",
+    "effective_narrowing_option",
+    "unclassified_external_option",
+    "deselected_tests",
+    "collection_reduced",
+    "incomplete_session",
+)
+_PYTEST_ERROR_CODES = frozenset(
+    (
+        "unsupported_python",
+        "module_unavailable",
+        "unsupported_version",
+        "preflight_invalid",
+        "unsupported_parallelism",
+        "unsupported_retries",
+        "exit_code_mismatch",
+        "not_started",
+        "spawn_failed",
+        "terminated_by_signal",
+        "artifact_missing",
+        "artifact_invalid",
+        "artifact_not_finalized",
+        "session_incomplete",
+        "interrupted",
+        "internal_error",
+        "usage_error",
+        "unknown_exit_code",
+    )
+)
+_PYTEST_PREFLIGHT_ERROR_CODES = frozenset(
+    ("unsupported_python", "module_unavailable", "unsupported_version", "preflight_invalid")
+)
+_PYTEST_ARTIFACT_ERROR_CODES = frozenset(
+    (
+        "unsupported_parallelism",
+        "unsupported_retries",
+        "exit_code_mismatch",
+        "artifact_missing",
+        "artifact_invalid",
+        "artifact_not_finalized",
+    )
+)
 
 
 class ReportingError(RuntimeError):
@@ -271,16 +314,18 @@ def build_run_report(
 
 
 def validate_report_v1(report: AgentReportV1) -> None:
-    _validate_exact_int(report.schema_version, "schema_version")
-    if report.schema_version != 1:
-        _invalid("schema_version must be 1")
-    if isinstance(report, PlanningErrorReportV1):
-        _validate_planning_error_report(report)
-        return
-    if isinstance(report, RunReportV1):
+    try:
+        if not isinstance(report, (PlanningErrorReportV1, RunReportV1)):
+            _invalid("unsupported producer model")
+        _validate_exact_int(report.schema_version, "schema_version")
+        if report.schema_version != 1:
+            _invalid("schema_version must be 1")
+        if isinstance(report, PlanningErrorReportV1):
+            _validate_planning_error_report(report)
+            return
         _validate_run_report(report)
-        return
-    _invalid("unsupported producer model")
+    except (AttributeError, TypeError) as error:
+        _invalid(f"malformed report model: {error}")
 
 
 def render_terminal(report: AgentReportV1) -> str:
@@ -294,23 +339,34 @@ def render_terminal(report: AgentReportV1) -> str:
 
     completeness = "complete" if report.complete else "incomplete"
     lines = ["", f"==> pyrepo-check summary: {report.overall_status} ({completeness})"]
+    if report.pytest is not None and (
+        not report.pytest.complete or report.pytest.status == "error"
+    ):
+        if report.pytest.error is None:
+            lines.append("    error: pytest evidence is incomplete.")
+        else:
+            lines.append(f"    error: pytest evidence: {report.pytest.error.message}")
     for check in report.checks:
         if check.status != "error":
             continue
         error = check.error
         if error is not None:
             lines.append(f"    error: {check.name}: {error.message}")
+        _append_helper_diagnostics(lines, check)
     for check in report.checks:
         if check.status != "failed":
             continue
-        exit_code = _first_positive_exit_code(check.processes)
-        if exit_code is None:
-            lines.append(f"    failed: {check.name}")
-        else:
-            lines.append(f"    failed: {check.name} (exit {exit_code})")
+        _append_failed_line(lines, check.name, _first_positive_exit_code(check.processes))
+    pytest_check = next((check for check in report.checks if check.name == "pytest"), None)
+    if (
+        report.pytest is not None
+        and report.pytest.status == "failed"
+        and (pytest_check is None or pytest_check.status != "failed")
+    ):
+        _append_failed_line(lines, "pytest", report.pytest.exit_code)
     if report.pytest is not None and report.pytest.evidence is not None:
         for outcome in report.pytest.evidence.special_outcomes:
-            reason = f" ({outcome.reason})" if outcome.reason is not None else ""
+            reason = f" ({outcome.reason})" if outcome.reason else ""
             lines.append(f"    special: pytest {outcome.outcome}: {outcome.nodeid}{reason}")
         for slow_test in report.pytest.evidence.slowest:
             lines.append(f"    slow: pytest {slow_test.nodeid} ({slow_test.duration_ms} ms)")
@@ -320,6 +376,26 @@ def render_terminal(report: AgentReportV1) -> str:
     if passed_checks:
         lines.append(f"    passed: {', '.join(passed_checks)}")
     return "\n".join(lines) + "\n"
+
+
+def _append_failed_line(lines: list[str], name: str, exit_code: int | None) -> None:
+    if exit_code is None:
+        lines.append(f"    failed: {name}")
+    else:
+        lines.append(f"    failed: {name} (exit {exit_code})")
+
+
+def _append_helper_diagnostics(lines: list[str], check: CheckResult) -> None:
+    for process in check.processes:
+        if process.role not in {"pytest_preflight", "coverage_preflight", "coverage_json"}:
+            continue
+        for stream_name, captured in (("stdout", process.stdout), ("stderr", process.stderr)):
+            if not captured.captured or not captured.text:
+                continue
+            for line in captured.text.rstrip("\n").splitlines() or [captured.text]:
+                lines.append(
+                    f"    diagnostic: {check.name} {process.role} {stream_name}: {line}"
+                )
 
 
 def serialize_json(report: AgentReportV1) -> bytes:
@@ -337,6 +413,7 @@ def serialize_json(report: AgentReportV1) -> bytes:
 
 def select_exit_code(report: AgentReportV1) -> int:
     """Select the public exit code from report evidence in execution order."""
+    validate_report_v1(report)
     if isinstance(report, PlanningErrorReportV1):
         return 2
     for check in report.checks:
@@ -514,8 +591,14 @@ def _validate_planning_error_report(report: PlanningErrorReportV1) -> None:
         _invalid("planning report overall_status must be error")
     if report.complete is not False:
         _invalid("planning report complete must be false")
+    if not isinstance(report.error, PlanningError):
+        _invalid("planning report error must be a PlanningError")
     if report.error.code not in _PLANNING_ERROR_CODES:
         _invalid("unknown planning error code")
+    if not isinstance(report.error.message, str):
+        _invalid("planning error message must be a string")
+    if report.error.hint is not None and not isinstance(report.error.hint, str):
+        _invalid("planning error hint must be null or a string")
 
 
 def _validate_run_report(report: RunReportV1) -> None:
@@ -525,90 +608,35 @@ def _validate_run_report(report: RunReportV1) -> None:
         _invalid("unknown run mode")
     if report.overall_status not in _OVERALL_STATUSES:
         _invalid("unknown overall status")
+    if type(report.complete) is not bool:
+        _invalid("run complete must be boolean")
+    if not isinstance(report.project_root, str):
+        _invalid("project_root must be a string")
     if not Path(report.project_root).is_absolute():
         _invalid("project_root must be absolute")
     if report.coverage is not None:
         _invalid("coverage must be null before coverage execution")
 
+    pytest_selected = _validate_selection(report.selection)
     selection = report.selection
-    if any(name not in _CHECK_NAMES for name in selection.checks):
-        _invalid("selection contains an unknown check name")
-    if not isinstance(selection.targets, tuple) or any(
-        not isinstance(target, str) for target in selection.targets
-    ):
-        _invalid("targets must be a tuple of strings")
-    if selection.planned_test_scope not in _PLANNED_TEST_SCOPES:
-        _invalid("unknown planned test scope")
-    if selection.planned_coverage_scope not in _PLANNED_COVERAGE_SCOPES:
-        _invalid("unknown planned coverage scope")
-    if selection.planned_coverage_scope != "not_requested":
-        _invalid("planned_coverage_scope must be not_requested before coverage planning")
-
+    if not isinstance(report.checks, tuple):
+        _invalid("checks must be a tuple")
+    for check in report.checks:
+        if not isinstance(check, CheckResult):
+            _invalid("checks must contain CheckResult values")
     emitted_names = tuple(check.name for check in report.checks)
     if selection.checks != emitted_names:
         _invalid("selection checks must exactly match emitted checks")
-    if len(set(selection.checks)) != len(selection.checks):
-        _invalid("selection checks must be unique")
-    canonical_selection = tuple(
-        name for name in _B_CANONICAL_CHECK_ORDER if name in selection.checks
-    )
-    if selection.checks != canonical_selection:
-        _invalid("selection checks must use canonical order")
-
-    shortcut = selection.test_shortcut
-    if shortcut is not None and (
-        not isinstance(shortcut, str) or TEST_SHORTCUT_NAME_PATTERN.fullmatch(shortcut) is None
-    ):
-        _invalid("test_shortcut must be null or a valid Test Shortcut name")
-
-    if selection.pytest_args is not None and (
-        not isinstance(selection.pytest_args, tuple)
-        or any(not isinstance(arg, str) for arg in selection.pytest_args)
-    ):
-        _invalid("pytest_args must be null or a tuple of strings")
-
-    pytest_selected = "pytest" in selection.checks
-    if not pytest_selected:
-        if shortcut is not None:
-            _invalid("test_shortcut requires pytest selection")
-        if selection.pytest_args is not None:
-            _invalid("pytest_args must be null when pytest is not selected")
-        if selection.planned_test_scope != "not_selected":
-            _invalid("planned_test_scope must be not_selected when pytest is not selected")
-    elif shortcut is not None:
-        if selection.checks != ("pytest",):
-            _invalid("test_shortcut requires a pytest-only selection")
-        if selection.targets:
-            _invalid("test_shortcut cannot coexist with direct targets")
-        if not selection.pytest_args:
-            _invalid("test_shortcut requires non-empty pytest_args")
-        if selection.planned_test_scope != "partial":
-            _invalid("test_shortcut requires partial planned test scope")
-    else:
-        if selection.pytest_args != selection.targets:
-            _invalid("pytest_args must exactly match targets without a Test Shortcut")
-        expected_scope: PlannedTestScope = "partial" if selection.targets else "complete"
-        if selection.planned_test_scope != expected_scope:
-            _invalid("planned_test_scope is inconsistent with pytest selection")
-
-    pytest_selected = "pytest" in selection.checks
     if pytest_selected != (report.pytest is not None):
         _invalid("pytest must be present exactly when pytest is selected")
     if report.pytest is not None:
-        _validate_pytest_result(report.pytest)
+        _validate_pytest_result(report.pytest, selection)
 
     statuses = {
         _validate_check_result(check, report.pytest if check.name == "pytest" else None)
         for check in report.checks
     }
-    for advisory in report.advisories:
-        if advisory.code not in _ADVISORY_CODES:
-            _invalid("unknown advisory code")
-    if (
-        tuple(sorted(report.advisories, key=lambda item: (item.code, item.message)))
-        != report.advisories
-    ):
-        _invalid("advisories must use code then message order")
+    _validate_advisories(report.advisories, report.checks, report.pytest)
 
     expected_complete = _run_complete(report.checks, report.pytest)
     if (
@@ -627,11 +655,77 @@ def _validate_run_report(report: RunReportV1) -> None:
         _invalid("complete is inconsistent with evidence")
 
 
+def _validate_selection(selection: Selection) -> bool:
+    if not isinstance(selection, Selection):
+        _invalid("selection must be a Selection")
+    if not isinstance(selection.checks, tuple) or any(
+        not isinstance(name, str) or name not in _CHECK_NAMES for name in selection.checks
+    ):
+        _invalid("selection contains an unknown check name")
+    if len(set(selection.checks)) != len(selection.checks):
+        _invalid("selection checks must be unique")
+    canonical_selection = tuple(
+        name for name in _B_CANONICAL_CHECK_ORDER if name in selection.checks
+    )
+    if selection.checks != canonical_selection:
+        _invalid("selection checks must use canonical order")
+    if not isinstance(selection.targets, tuple) or any(
+        not isinstance(target, str) for target in selection.targets
+    ):
+        _invalid("targets must be a tuple of strings")
+    if selection.test_shortcut is not None and (
+        not isinstance(selection.test_shortcut, str)
+        or TEST_SHORTCUT_NAME_PATTERN.fullmatch(selection.test_shortcut) is None
+    ):
+        _invalid("test_shortcut must be null or a valid Test Shortcut name")
+    if selection.pytest_args is not None and (
+        not isinstance(selection.pytest_args, tuple)
+        or any(not isinstance(arg, str) for arg in selection.pytest_args)
+    ):
+        _invalid("pytest_args must be null or a tuple of strings")
+    if selection.planned_test_scope not in _PLANNED_TEST_SCOPES:
+        _invalid("unknown planned test scope")
+    if selection.planned_coverage_scope not in _PLANNED_COVERAGE_SCOPES:
+        _invalid("unknown planned coverage scope")
+    if selection.planned_coverage_scope != "not_requested":
+        _invalid("planned_coverage_scope must be not_requested before coverage planning")
+
+    pytest_selected = "pytest" in selection.checks
+    if not pytest_selected:
+        if selection.test_shortcut is not None:
+            _invalid("test_shortcut requires pytest selection")
+        if selection.pytest_args is not None:
+            _invalid("pytest_args must be null when pytest is not selected")
+        if selection.planned_test_scope != "not_selected":
+            _invalid("planned_test_scope must be not_selected when pytest is not selected")
+    elif selection.test_shortcut is not None:
+        if selection.checks != ("pytest",):
+            _invalid("test_shortcut requires a pytest-only selection")
+        if selection.targets:
+            _invalid("test_shortcut cannot coexist with direct targets")
+        if not selection.pytest_args:
+            _invalid("test_shortcut requires non-empty pytest_args")
+        if selection.planned_test_scope != "partial":
+            _invalid("test_shortcut requires partial planned test scope")
+    else:
+        if selection.pytest_args != selection.targets:
+            _invalid("pytest_args must exactly match targets without a Test Shortcut")
+        expected_scope: PlannedTestScope = "partial" if selection.targets else "complete"
+        if selection.planned_test_scope != expected_scope:
+            _invalid("planned_test_scope is inconsistent with pytest selection")
+    return pytest_selected
+
+
 def _validate_check_result(check: CheckResult, pytest_result: PytestResult | None) -> CheckStatus:
+    if not isinstance(check, CheckResult):
+        _invalid("check must be a CheckResult")
     if check.name not in _CHECK_NAMES:
         _invalid("unknown check name")
     if check.status not in _CHECK_STATUSES:
         _invalid("unknown check status")
+    if not isinstance(check.processes, tuple):
+        _invalid("check processes must be a tuple")
+    _validate_check_error(check.error)
     if check.name == "pytest":
         return _validate_pytest_check_result(check, pytest_result)
     if not check.processes:
@@ -675,35 +769,23 @@ def _validate_pytest_check_result(check: CheckResult, result: PytestResult | Non
         _invalid("pytest check requires a pytest result")
         return check.status
     processes = check.processes
-    if processes:
-        if processes[0].role != "pytest_preflight":
-            _invalid("pytest processes must start with pytest_preflight")
-        if len(processes) > 2 or (len(processes) == 2 and processes[1].role != "primary"):
-            _invalid("pytest processes must be preflight then optional primary")
-        for process in processes:
-            _validate_process_result(process)
-    if result.error is not None and result.error.code == "not_started":
-        expected_error = "missing_primary_process"
-    elif result.error is not None and result.error.code == "spawn_failed":
-        expected_error = "spawn_failed"
-    elif result.error is not None and result.error.code == "terminated_by_signal":
-        expected_error = "terminated_by_signal"
-    elif result.error is not None and result.error.code in {
-        "unsupported_python",
-        "module_unavailable",
-        "unsupported_version",
-        "preflight_invalid",
-    }:
-        expected_error = "pytest_preflight_failed"
-    elif result.error is not None and result.status == "error":
-        expected_error = "pytest_evidence_error"
-    else:
-        expected_error = None
+    if len(processes) > 2:
+        _invalid("pytest processes must be preflight then optional primary")
+    for process in processes:
+        _validate_process_result(process)
+    preflight = processes[0] if processes else None
+    primary = processes[1] if len(processes) == 2 else None
+    if preflight is not None and preflight.role != "pytest_preflight":
+        _invalid("pytest processes must start with pytest_preflight")
+    if primary is not None and primary.role != "primary":
+        _invalid("pytest processes must be preflight then optional primary")
+    _validate_pytest_execution_shape(result, preflight, primary)
 
     if check.error is not None and check.error.code == "cleanup_failed":
         if check.status != "error":
             _invalid("cleanup failure requires pytest check error")
-        return check.status
+        return "error"
+    expected_error = _expected_pytest_check_error(result)
     if expected_error is None:
         if check.status != result.status or check.error is not None:
             _invalid("pytest check must match successful pytest evidence")
@@ -712,7 +794,165 @@ def _validate_pytest_check_result(check: CheckResult, result: PytestResult | Non
     return check.status
 
 
-def _validate_pytest_result(result: PytestResult) -> None:
+def _expected_pytest_check_error(result: PytestResult) -> CheckErrorCode | None:
+    if result.error is None or result.status != "error":
+        return None
+    if result.error.code == "not_started":
+        return "missing_primary_process"
+    if result.error.code == "spawn_failed":
+        return "spawn_failed"
+    if result.error.code == "terminated_by_signal":
+        return "terminated_by_signal"
+    if result.error.code in _PYTEST_PREFLIGHT_ERROR_CODES:
+        return "pytest_preflight_failed"
+    return "pytest_evidence_error"
+
+
+def _validate_pytest_execution_shape(
+    result: PytestResult,
+    preflight: ProcessResult | None,
+    primary: ProcessResult | None,
+) -> None:
+    error_code = result.error.code if result.error is not None else None
+    if primary is None:
+        if result.exit_code is not None:
+            _invalid("pytest without a primary process must not have an exit_code")
+        if result.evidence is not None:
+            _invalid("pytest without a primary process must not have evidence")
+        if result.complete or result.status != "error" or error_code is None:
+            _invalid("pytest without a primary process must be a typed error")
+        if error_code == "not_started":
+            if preflight is None:
+                if result.pytest_version is not None:
+                    _invalid("pytest without preflight cannot have a trusted version")
+                return
+            if preflight.outcome == "exited" and preflight.exit_code == 0:
+                if result.pytest_version is None:
+                    _invalid("successful pytest preflight requires a trusted version")
+                return
+            _invalid("not_started requires absent or successful pytest preflight")
+            return
+        if preflight is None:
+            _invalid("selected pytest requires preflight before a non-started error")
+            return
+        if preflight.outcome == "spawn_failed":
+            if result.pytest_version is not None:
+                _invalid("failed pytest preflight cannot have a trusted version")
+            if error_code != "spawn_failed":
+                _invalid("pytest preflight spawn failure contradicts pytest error")
+            return
+        if preflight.outcome == "signaled":
+            if result.pytest_version is not None:
+                _invalid("failed pytest preflight cannot have a trusted version")
+            if error_code != "terminated_by_signal":
+                _invalid("pytest preflight signal contradicts pytest error")
+            return
+        if error_code not in _PYTEST_PREFLIGHT_ERROR_CODES:
+            _invalid("pytest without a primary process requires a preflight error")
+        if preflight.exit_code != 0 and error_code != "preflight_invalid":
+            _invalid("failed pytest preflight must be preflight_invalid")
+        if error_code == "unsupported_version":
+            if result.pytest_version is None:
+                _invalid("unsupported pytest version requires a trusted version")
+        elif result.pytest_version is not None:
+            _invalid("untrusted pytest preflight cannot have a version")
+        return
+
+    if preflight is None:
+        _invalid("pytest primary requires a successful preflight")
+        return
+    if preflight.outcome != "exited" or preflight.exit_code != 0:
+        _invalid("pytest primary requires a successful preflight")
+        return
+    if result.pytest_version is None:
+        _invalid("pytest primary requires a trusted preflight version")
+        return
+    if primary.outcome == "spawn_failed":
+        _validate_pytest_no_exit_error(result, "spawn_failed")
+        return
+    if primary.outcome == "signaled":
+        _validate_pytest_no_exit_error(result, "terminated_by_signal")
+        return
+
+    exit_code = primary.exit_code
+    if exit_code is None:
+        _invalid("exited pytest primary requires an exit_code")
+        return
+    if result.exit_code != exit_code:
+        _invalid("pytest exit_code must match the primary process")
+    _validate_pytest_primary_outcome(result, exit_code)
+
+
+def _validate_pytest_no_exit_error(result: PytestResult, expected_code: str) -> None:
+    if (
+        result.status != "error"
+        or result.complete
+        or result.exit_code is not None
+        or result.evidence is not None
+        or result.error is None
+        or result.error.code != expected_code
+    ):
+        _invalid("pytest process failure contradicts pytest result")
+
+
+def _validate_pytest_primary_outcome(result: PytestResult, exit_code: int) -> None:
+    if result.error is None:
+        if exit_code == 0:
+            expected_status: CheckStatus = "passed"
+        elif exit_code in {1, 5}:
+            expected_status = "failed"
+        else:
+            _invalid("pytest exit requires an error result")
+            return
+        if result.status != expected_status:
+            _invalid("pytest status contradicts the primary exit_code")
+        if exit_code == 5 and result.complete:
+            evidence = result.evidence
+            if evidence is None or evidence.collected != 0:
+                _invalid("complete pytest exit 5 requires zero collected tests")
+        return
+
+    code = result.error.code
+    if code == "session_incomplete":
+        if (
+            exit_code != 1
+            or result.status != "failed"
+            or result.complete
+            or result.evidence is None
+        ):
+            _invalid("session_incomplete must retain failed pytest exit 1 evidence")
+        return
+    expected_exit_codes = {
+        "interrupted": {2},
+        "internal_error": {3},
+        "usage_error": {4},
+    }
+    if code in expected_exit_codes:
+        if (
+            exit_code not in expected_exit_codes[code]
+            or result.status != "error"
+            or result.complete
+            or result.evidence is None
+        ):
+            _invalid("pytest exit-matrix error contradicts process evidence")
+        return
+    if code == "unknown_exit_code":
+        if (
+            exit_code in {0, 1, 2, 3, 4, 5}
+            or result.status != "error"
+            or result.complete
+            or result.evidence is None
+        ):
+            _invalid("unknown pytest exit_code contradicts process evidence")
+        return
+    if code in _PYTEST_ARTIFACT_ERROR_CODES:
+        if result.status != "error" or result.complete or result.evidence is not None:
+            _invalid("invalid pytest artifact must produce incomplete error evidence")
+        return
+    _invalid("pytest primary exit contradicts pytest error")
+
+
+def _validate_pytest_result(result: PytestResult, selection: Selection) -> None:
     if not isinstance(result, PytestResult):
         _invalid("pytest must be a PytestResult")
     if result.status not in _CHECK_STATUSES:
@@ -721,20 +961,13 @@ def _validate_pytest_result(result: PytestResult) -> None:
         _invalid("pytest complete must be boolean")
     if result.scope not in {"partial", "complete"}:
         _invalid("unknown pytest scope")
-    reasons = (
-        "planned_selector",
-        "effective_narrowing_option",
-        "unclassified_external_option",
-        "deselected_tests",
-        "collection_reduced",
-        "incomplete_session",
-    )
     if not isinstance(result.scope_reasons, tuple) or any(
-        reason not in reasons for reason in result.scope_reasons
+        not isinstance(reason, str) or reason not in _PYTEST_SCOPE_REASONS
+        for reason in result.scope_reasons
     ):
         _invalid("unknown pytest scope reason")
     if (
-        tuple(reason for reason in reasons if reason in result.scope_reasons)
+        tuple(reason for reason in _PYTEST_SCOPE_REASONS if reason in result.scope_reasons)
         != result.scope_reasons
     ):
         _invalid("pytest scope reasons must use fixed unique order")
@@ -749,26 +982,7 @@ def _validate_pytest_result(result: PytestResult) -> None:
     if result.error is not None:
         if not isinstance(result.error, PytestError):
             _invalid("pytest error must be a PytestError")
-        if result.error.code not in {
-            "unsupported_python",
-            "module_unavailable",
-            "unsupported_version",
-            "preflight_invalid",
-            "unsupported_parallelism",
-            "unsupported_retries",
-            "exit_code_mismatch",
-            "not_started",
-            "spawn_failed",
-            "terminated_by_signal",
-            "artifact_missing",
-            "artifact_invalid",
-            "artifact_not_finalized",
-            "session_incomplete",
-            "interrupted",
-            "internal_error",
-            "usage_error",
-            "unknown_exit_code",
-        }:
+        if result.error.code not in _PYTEST_ERROR_CODES:
             _invalid("unknown pytest error code")
         if not isinstance(result.error.message, str):
             _invalid("pytest error message must be a string")
@@ -784,24 +998,31 @@ def _validate_pytest_result(result: PytestResult) -> None:
         _invalid("complete pytest result cannot contain an error")
     if result.complete and result.evidence is None:
         _invalid("complete pytest result requires evidence")
-    if not result.complete and "incomplete_session" not in result.scope_reasons:
-        _invalid("incomplete pytest result requires incomplete_session")
-    _validate_pytest_evidence(result.evidence)
-    if result.complete and result.evidence is not None:
-        counts = result.evidence.counts
-        if (
-            counts.passed
-            + counts.failed
-            + counts.errors
-            + counts.skipped
-            + counts.xfailed
-            + counts.xpassed
-            != result.evidence.collected
+    if ("planned_selector" in result.scope_reasons) != (
+        selection.planned_test_scope == "partial"
+    ):
+        _invalid("pytest planned_selector must match planned test scope")
+    if ("incomplete_session" in result.scope_reasons) != (not result.complete):
+        _invalid("pytest incomplete_session must match completeness")
+    if result.error is not None and result.error.code == "session_incomplete" and (
+        result.status != "failed" or result.complete or result.evidence is None
+    ):
+        _invalid("session_incomplete requires incomplete failed evidence")
+    _validate_pytest_evidence(result.evidence, complete=result.complete)
+    if result.evidence is None:
+        if result.complete or result.error is None or result.status != "error":
+            _invalid("null pytest evidence requires an incomplete error result")
+        if any(
+            reason not in {"planned_selector", "incomplete_session"}
+            for reason in result.scope_reasons
         ):
-            _invalid("complete pytest counts must equal collected")
+            _invalid("null pytest evidence cannot claim artifact-derived scope reasons")
+    else:
+        if ("deselected_tests" in result.scope_reasons) != (result.evidence.deselected > 0):
+            _invalid("pytest deselected_tests must match evidence")
 
 
-def _validate_pytest_evidence(evidence: PytestEvidence | None) -> None:
+def _validate_pytest_evidence(evidence: PytestEvidence | None, *, complete: bool) -> None:
     if evidence is None:
         return
     if not isinstance(evidence, PytestEvidence):
@@ -838,17 +1059,6 @@ def _validate_pytest_evidence(evidence: PytestEvidence | None) -> None:
     _validate_issue_order(evidence.collection_skips, "collection skips")
     if not isinstance(evidence.slowest, tuple) or not isinstance(evidence.special_outcomes, tuple):
         _invalid("pytest result lists must be tuples")
-    if (
-        tuple(sorted(evidence.slowest, key=lambda item: (-item.duration_ms, item.nodeid)))
-        != evidence.slowest
-        or len(evidence.slowest) > 10
-    ):
-        _invalid("pytest slowest tests must use deterministic order")
-    if (
-        tuple(sorted(evidence.special_outcomes, key=lambda item: item.nodeid))
-        != evidence.special_outcomes
-    ):
-        _invalid("pytest special outcomes must use nodeid order")
     for item in evidence.slowest:
         if not isinstance(item, SlowTest):
             _invalid("pytest slow test must be a SlowTest")
@@ -857,6 +1067,14 @@ def _validate_pytest_evidence(evidence: PytestEvidence | None) -> None:
         _validate_exact_int(item.duration_ms, "slow test duration_ms")
         if item.duration_ms < 0:
             _invalid("slow test duration_ms must be non-negative")
+    if len({item.nodeid for item in evidence.slowest}) != len(evidence.slowest):
+        _invalid("pytest slow tests must use unique nodeids")
+    if (
+        tuple(sorted(evidence.slowest, key=lambda item: (-item.duration_ms, item.nodeid)))
+        != evidence.slowest
+        or len(evidence.slowest) > 10
+    ):
+        _invalid("pytest slowest tests must use deterministic order")
     for item in evidence.special_outcomes:
         if not isinstance(item, SpecialTestOutcome):
             _invalid("pytest special outcome must be a SpecialTestOutcome")
@@ -881,23 +1099,67 @@ def _validate_pytest_evidence(evidence: PytestEvidence | None) -> None:
         _validate_exact_int(item.duration_ms, "pytest special duration_ms")
         if item.duration_ms < 0:
             _invalid("pytest special duration_ms must be non-negative")
+    if len({item.nodeid for item in evidence.special_outcomes}) != len(
+        evidence.special_outcomes
+    ):
+        _invalid("pytest special outcomes must use unique nodeids")
+    if (
+        tuple(sorted(evidence.special_outcomes, key=lambda item: item.nodeid))
+        != evidence.special_outcomes
+    ):
+        _invalid("pytest special outcomes must use nodeid order")
+
+    count_total = (
+        evidence.counts.passed
+        + evidence.counts.failed
+        + evidence.counts.errors
+        + evidence.counts.skipped
+        + evidence.counts.xfailed
+        + evidence.counts.xpassed
+    )
+    if count_total > evidence.collected:
+        _invalid("pytest outcome counts cannot exceed collected")
+    if len(evidence.slowest) != min(10, count_total):
+        _invalid("pytest slow-test cardinality must match terminal outcomes")
+    if len(evidence.special_outcomes) != (
+        evidence.counts.skipped + evidence.counts.xfailed + evidence.counts.xpassed
+    ):
+        _invalid("pytest special-outcome cardinality must match counts")
+    slow_durations = {item.nodeid: item.duration_ms for item in evidence.slowest}
+    for item in evidence.special_outcomes:
+        if item.nodeid in slow_durations and slow_durations[item.nodeid] != item.duration_ms:
+            _invalid("pytest special duration must match the slow-test duration")
+    if complete:
+        if evidence.collection_errors:
+            _invalid("complete pytest evidence cannot contain collection errors")
+        if count_total != evidence.collected:
+            _invalid("complete pytest counts must equal collected")
 
 
 def _validate_issue_order(issues: tuple[CollectionIssue, ...], field: str) -> None:
-    if tuple(sorted(issues, key=lambda item: (item.nodeid, item.message))) != issues:
-        _invalid(f"pytest {field} must use deterministic order")
     for issue in issues:
         if not isinstance(issue, CollectionIssue):
             _invalid(f"pytest {field} must contain CollectionIssue values")
         if not isinstance(issue.nodeid, str) or not isinstance(issue.message, str):
             _invalid(f"pytest {field} require strings")
+    pairs = tuple((issue.nodeid, issue.message) for issue in issues)
+    if len(set(pairs)) != len(pairs):
+        _invalid(f"pytest {field} must be unique")
+    if tuple(sorted(issues, key=lambda item: (item.nodeid, item.message))) != issues:
+        _invalid(f"pytest {field} must use deterministic order")
 
 
 def _validate_process_result(process: ProcessResult) -> None:
+    if not isinstance(process, ProcessResult):
+        _invalid("process must be a ProcessResult")
     if process.role not in _PROCESS_ROLES:
         _invalid("unknown process role")
     if process.outcome not in _PROCESS_OUTCOMES:
         _invalid("unknown process outcome")
+    if not isinstance(process.argv, tuple) or any(not isinstance(arg, str) for arg in process.argv):
+        _invalid("process argv must be a tuple of strings")
+    if not isinstance(process.cwd, str):
+        _invalid("process cwd must be a string")
     if not Path(process.cwd).is_absolute():
         _invalid("process cwd must be absolute")
     _validate_exact_int(process.duration_ms, "process duration_ms")
@@ -905,6 +1167,8 @@ def _validate_process_result(process: ProcessResult) -> None:
         _invalid("process duration_ms must be non-negative")
     _validate_captured_text(process.stdout)
     _validate_captured_text(process.stderr)
+    if process.error_message is not None and not isinstance(process.error_message, str):
+        _invalid("process error_message must be null or a string")
 
     if process.outcome == "exited":
         exit_code = process.exit_code
@@ -936,6 +1200,14 @@ def _validate_process_result(process: ProcessResult) -> None:
 
 
 def _validate_captured_text(captured: CapturedText) -> None:
+    if not isinstance(captured, CapturedText):
+        _invalid("captured stream must be CapturedText")
+    if type(captured.captured) is not bool:
+        _invalid("captured flag must be boolean")
+    if not isinstance(captured.text, str):
+        _invalid("captured text must be a string")
+    if type(captured.truncated) is not bool:
+        _invalid("captured truncated must be boolean")
     _validate_exact_int(captured.omitted_bytes, "captured omitted_bytes")
     if captured.omitted_bytes < 0:
         _invalid("captured omitted_bytes must be non-negative")
@@ -945,6 +1217,42 @@ def _validate_captured_text(captured: CapturedText) -> None:
         return
     if captured.truncated is not (captured.omitted_bytes > 0):
         _invalid("captured truncation must match a positive omitted-byte count")
+
+
+def _validate_check_error(error: CheckError | None) -> None:
+    if error is None:
+        return
+    if not isinstance(error, CheckError):
+        _invalid("check error must be a CheckError")
+    if error.code not in _CHECK_ERROR_CODES:
+        _invalid("unknown check error code")
+    if not isinstance(error.message, str):
+        _invalid("check error message must be a string")
+
+
+def _validate_advisories(
+    advisories: tuple[Advisory, ...],
+    checks: tuple[CheckResult, ...],
+    pytest_result: PytestResult | None,
+) -> None:
+    if not isinstance(advisories, tuple):
+        _invalid("advisories must be a tuple")
+    for advisory in advisories:
+        if not isinstance(advisory, Advisory):
+            _invalid("advisories must contain Advisory values")
+        if advisory.code not in _ADVISORY_CODES:
+            _invalid("unknown advisory code")
+        if not isinstance(advisory.message, str):
+            _invalid("advisory message must be a string")
+        if advisory.hint is not None and not isinstance(advisory.hint, str):
+            _invalid("advisory hint must be null or a string")
+    keys = tuple((advisory.code, advisory.message) for advisory in advisories)
+    if len(set(keys)) != len(keys):
+        _invalid("advisories must be unique by code and message")
+    if tuple(sorted(advisories, key=lambda item: (item.code, item.message))) != advisories:
+        _invalid("advisories must use code then message order")
+    if advisories != _build_advisories(checks, pytest_result):
+        _invalid("advisories must exactly match report evidence")
 
 
 def _invalid(message: str) -> None:
@@ -1017,7 +1325,7 @@ def _build_advisories(
                 )
     if pytest_result is not None and pytest_result.evidence is not None:
         for outcome in pytest_result.evidence.special_outcomes:
-            if outcome.reason is None:
+            if outcome.reason is None or outcome.reason == "":
                 advisories.append(
                     Advisory(
                         code="missing_test_reason",
@@ -1025,7 +1333,8 @@ def _build_advisories(
                         hint=None,
                     )
                 )
-    return tuple(sorted(advisories, key=lambda advisory: (advisory.code, advisory.message)))
+    unique = {(advisory.code, advisory.message): advisory for advisory in advisories}
+    return tuple(sorted(unique.values(), key=lambda advisory: (advisory.code, advisory.message)))
 
 
 def _match_observations(

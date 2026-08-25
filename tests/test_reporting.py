@@ -26,6 +26,7 @@ from pyrepo_check.pytest_execution import (
     PytestPreflightRecord,
 )
 from pyrepo_check.pytest_evidence import (
+    CollectionIssue,
     PytestCounts,
     PytestError,
     PytestEvidence,
@@ -649,7 +650,7 @@ def test_select_exit_code_preserves_first_positive_process_code(tmp_path: Path) 
     assert select_exit_code(report) == 7
 
 
-def test_select_exit_code_uses_report_status_when_no_positive_process_exists(
+def test_select_exit_code_uses_valid_report_evidence_and_error_fallback(
     tmp_path: Path,
 ) -> None:
     passed_check = planned_check(tmp_path, "ruff")
@@ -658,40 +659,17 @@ def test_select_exit_code_uses_report_status_when_no_positive_process_exists(
         run_plan((passed_check,)),
         ExecutionResult((executed_check(passed_check, 0),), 0),
     )
-    failed = RunReportV1(
-        schema_version=1,
-        kind="run",
-        project_root=str(tmp_path.resolve()),
-        mode="focused",
-        overall_status="failed",
-        complete=True,
-        selection=Selection((), (), None, None, "not_selected", "not_requested"),
-        checks=(CheckResult("ruff", "failed", (), None),),
-        pytest=None,
-        coverage=None,
-        advisories=(),
+    failed_check = planned_check(tmp_path, "ty")
+    failed = build_run_report(
+        tmp_path,
+        run_plan((failed_check,)),
+        ExecutionResult((executed_check(failed_check, 1),), 1),
     )
-    errored = RunReportV1(
-        schema_version=1,
-        kind="run",
-        project_root=str(tmp_path.resolve()),
-        mode="focused",
-        overall_status="error",
-        complete=False,
-        selection=Selection((), (), None, None, "not_selected", "not_requested"),
-        checks=(
-            CheckResult(
-                "ruff",
-                "error",
-                (),
-                CheckError(
-                    "missing_primary_process", "No primary process observation was recorded."
-                ),
-            ),
-        ),
-        pytest=None,
-        coverage=None,
-        advisories=(),
+    missing_check = planned_check(tmp_path, "bandit")
+    errored = build_run_report(
+        tmp_path,
+        run_plan((missing_check,)),
+        ExecutionResult((), 0),
     )
     planning_error = build_planning_error_report("unknown_check", "Unknown check(s): mypy")
 
@@ -865,6 +843,42 @@ def pytest_preflight_process(check: PlannedCheck) -> ExecutedProcess:
         stdout=b"preflight",
         stderr=b"",
         spawn_error=None,
+    )
+
+
+def pytest_report_for_exit(
+    tmp_path: Path,
+    exit_code: int,
+    *,
+    observation: PytestExecutionObservation | None = None,
+    targets: tuple[str, ...] = (),
+) -> RunReportV1:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=exit_code,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    return build_run_report(
+        tmp_path,
+        run_plan((check,), targets=targets),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check), primary),
+                    pytest=observation
+                    if observation is not None
+                    else finalized_pytest_execution_observation(exit_code=exit_code),
+                ),
+            ),
+            exit_code,
+        ),
     )
 
 
@@ -1075,6 +1089,675 @@ def test_validation_rejects_malformed_public_pytest_models(
 
     with pytest.raises(ReportingError, match=r"^invalid report:"):
         validate_report_v1(mutate(report))
+
+
+def test_validation_rejects_malformed_pytest_nested_values_as_reporting_error(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check), primary),
+                    pytest=finalized_pytest_execution_observation(),
+                ),
+            ),
+            0,
+        ),
+    )
+    assert report.pytest is not None
+    assert report.pytest.evidence is not None
+    malformed = replace(
+        report,
+        pytest=replace(
+            report.pytest,
+            evidence=replace(report.pytest.evidence, slowest=(cast(Any, object()),)),
+        ),
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(malformed)
+
+
+def test_validation_rejects_pytest_primary_exit_mismatch(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check), primary),
+                    pytest=finalized_pytest_execution_observation(),
+                ),
+            ),
+            0,
+        ),
+    )
+    assert report.pytest is not None
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(replace(report, pytest=replace(report.pytest, exit_code=1)))
+
+
+def test_validation_rejects_planned_selector_scope_mismatch(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), targets=("tests/test_one.py",)),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check), primary),
+                    pytest=finalized_pytest_execution_observation(),
+                ),
+            ),
+            0,
+        ),
+    )
+    assert report.pytest is not None
+    mismatched = replace(report.pytest, scope="complete", scope_reasons=())
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(replace(report, pytest=mismatched))
+
+
+def test_validation_rejects_artifact_scope_reasons_when_evidence_is_null(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check), primary),
+                    pytest=finalized_pytest_execution_observation(),
+                ),
+            ),
+            0,
+        ),
+    )
+    assert report.pytest is not None
+    invalid_result = replace(
+        report.pytest,
+        status="error",
+        complete=False,
+        scope="partial",
+        scope_reasons=("effective_narrowing_option", "incomplete_session"),
+        evidence=None,
+        error=PytestError("artifact_missing", "pytest artifact is missing"),
+    )
+    invalid_check = replace(
+        report.checks[0],
+        status="error",
+        error=CheckError("pytest_evidence_error", "pytest artifact is missing"),
+    )
+    invalid_report = replace(
+        report,
+        overall_status="error",
+        complete=False,
+        checks=(invalid_check,),
+        pytest=invalid_result,
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(invalid_report)
+
+
+def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    failed_primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=1,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    cleanup_report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check), failed_primary),
+                    pytest=finalized_pytest_execution_observation(
+                        cleanup_error="PermissionError: denied", exit_code=1
+                    ),
+                ),
+            ),
+            1,
+        ),
+    )
+
+    rendered_cleanup = render_terminal(cleanup_report)
+
+    assert "error: pytest: Could not clean up pytest evidence" in rendered_cleanup
+    assert "failed: pytest (exit 1)" in rendered_cleanup
+
+    preflight = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check),),
+        pytest=pytest_execution_observation(),
+    )
+    preflight_report = build_run_report(
+        tmp_path, run_plan((check,)), ExecutionResult((preflight,), 2)
+    )
+
+    assert "preflight stdout: preflight" in render_terminal(preflight_report)
+
+
+def test_missing_test_reason_advisories_include_empty_reasons_and_deduplicate(
+    tmp_path: Path,
+) -> None:
+    evidence = PytestEvidence(
+        effective_args=(),
+        collected=1,
+        deselected=0,
+        counts=PytestCounts(0, 0, 0, 1, 0, 0),
+        collection_errors=(),
+        collection_skips=(),
+        slowest=(),
+        special_outcomes=(SpecialTestOutcome("test_empty", "skipped", "", None, False, 1),),
+    )
+    pytest_result = reporting.PytestResult(
+        status="passed",
+        complete=True,
+        scope="complete",
+        scope_reasons=(),
+        pytest_version="8.4.2",
+        exit_code=0,
+        evidence=evidence,
+        error=None,
+    )
+    truncated = ProcessResult(
+        role="primary",
+        argv=("pytest",),
+        cwd=str(tmp_path.resolve()),
+        outcome="exited",
+        exit_code=0,
+        signal=None,
+        duration_ms=0,
+        stdout=CapturedText(True, "", True, 1),
+        stderr=CapturedText(True, "", False, 0),
+        error_message=None,
+    )
+    check = CheckResult("ruff", "passed", (truncated,), None)
+
+    advisories = reporting._build_advisories((check, check), pytest_result)
+
+    assert advisories == (
+        Advisory("missing_test_reason", "pytest skipped has no reason: test_empty.", None),
+        Advisory(
+            "output_truncated",
+            "ruff process 1 (primary) stdout omitted 1 byte(s); only the final 65536 bytes are included.",
+            None,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "status", "complete", "error_code"),
+    (
+        (0, "passed", True, None),
+        (1, "failed", True, None),
+        (2, "error", False, "interrupted"),
+        (3, "error", False, "internal_error"),
+        (4, "error", False, "usage_error"),
+        (5, "failed", True, None),
+        (9, "error", False, "unknown_exit_code"),
+    ),
+)
+def test_pytest_exit_matrix_projects_every_authoritative_primary_exit(
+    tmp_path: Path,
+    exit_code: int,
+    status: str,
+    complete: bool,
+    error_code: str | None,
+) -> None:
+    report = pytest_report_for_exit(tmp_path, exit_code)
+
+    assert report.pytest is not None
+    assert report.pytest.status == status
+    assert report.pytest.complete is complete
+    assert report.pytest.exit_code == exit_code
+    assert report.pytest.error is None or report.pytest.error.code == error_code
+    assert report.checks[0].status == status
+    assert validate_report_v1(report) is None
+    assert select_exit_code(report) == (exit_code if exit_code else 0)
+
+
+def test_serialize_json_projects_exact_nested_pytest_exit_five_shape(tmp_path: Path) -> None:
+    report = pytest_report_for_exit(tmp_path, 5)
+
+    payload = reporting.json.loads(serialize_json(report))
+
+    assert payload["pytest"] == {
+        "status": "failed",
+        "complete": True,
+        "scope": "complete",
+        "scope_reasons": [],
+        "pytest_version": "8.4.2",
+        "exit_code": 5,
+        "evidence": {
+            "effective_args": [],
+            "collected": 0,
+            "deselected": 0,
+            "counts": {
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "xfailed": 0,
+                "xpassed": 0,
+            },
+            "collection_errors": [],
+            "collection_skips": [],
+            "slowest": [],
+            "special_outcomes": [],
+        },
+        "error": None,
+    }
+    assert payload["coverage"] is None
+
+
+def test_pytest_early_stop_keeps_partial_failed_evidence_and_terminal_attention(
+    tmp_path: Path,
+) -> None:
+    observation = finalized_pytest_execution_observation(exit_code=1)
+    artifact = observation.artifact
+    assert artifact.content is not None
+    document = reporting.json.loads(artifact.content)
+    document["session"]["stopped_early"] = True
+    observation = replace(
+        observation,
+        artifact=replace(artifact, content=reporting.json.dumps(document).encode()),
+    )
+
+    report = pytest_report_for_exit(tmp_path, 1, observation=observation)
+
+    assert report.pytest == reporting.PytestResult(
+        status="failed",
+        complete=False,
+        scope="partial",
+        scope_reasons=("incomplete_session",),
+        pytest_version="8.4.2",
+        exit_code=1,
+        evidence=PytestEvidence(
+            effective_args=(),
+            collected=0,
+            deselected=0,
+            counts=PytestCounts(0, 0, 0, 0, 0, 0),
+            collection_errors=(),
+            collection_skips=(),
+            slowest=(),
+            special_outcomes=(),
+        ),
+        error=PytestError(
+            "session_incomplete", "pytest session stopped before all selected tests completed"
+        ),
+    )
+    assert report.overall_status == "error"
+    assert report.complete is False
+    assert render_terminal(report) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest evidence: pytest session stopped before all selected tests completed\n"
+        "    failed: pytest (exit 1)\n"
+    )
+
+
+def test_incomplete_trusted_pytest_evidence_gets_attention_after_exit_zero(
+    tmp_path: Path,
+) -> None:
+    observation = finalized_pytest_execution_observation()
+    artifact = observation.artifact
+    assert artifact.content is not None
+    document = reporting.json.loads(artifact.content)
+    document["collection"]["errors"] = [
+        {"nodeid": "test_collect", "message": "ImportError: missing dependency"}
+    ]
+    observation = replace(
+        observation,
+        artifact=replace(artifact, content=reporting.json.dumps(document).encode()),
+    )
+
+    report = pytest_report_for_exit(tmp_path, 0, observation=observation)
+
+    assert report.pytest is not None
+    assert report.pytest.status == "passed"
+    assert report.pytest.complete is False
+    assert report.pytest.error is None
+    assert report.pytest.evidence is not None
+    assert report.pytest.evidence.collection_errors == (
+        CollectionIssue("test_collect", "ImportError: missing dependency"),
+    )
+    assert render_terminal(report) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: pytest evidence is incomplete.\n"
+        "    passed: pytest\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "spawn_error", "pytest_error", "check_error"),
+    (
+        (None, "FileNotFoundError: uv", "spawn_failed", "spawn_failed"),
+        (-15, None, "terminated_by_signal", "terminated_by_signal"),
+    ),
+)
+def test_pytest_primary_spawn_and_signal_keep_process_and_result_evidence(
+    tmp_path: Path,
+    returncode: int | None,
+    spawn_error: str | None,
+    pytest_error: str,
+    check_error: str,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult(
+            (executed_check(check, returncode, spawn_error=spawn_error),),
+            2,
+        ),
+    )
+
+    assert report.pytest is not None
+    assert report.pytest.status == "error"
+    assert report.pytest.complete is False
+    assert report.pytest.exit_code is None
+    assert report.pytest.evidence is None
+    assert report.pytest.error is not None
+    assert report.pytest.error.code == pytest_error
+    assert report.checks[0].error is not None
+    assert report.checks[0].error.code == check_error
+    assert validate_report_v1(report) is None
+    assert select_exit_code(report) == 2
+
+
+def test_pytest_preflight_failure_has_no_primary_and_preserves_helper_diagnostic(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    observation = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check),),
+        pytest=pytest_execution_observation(),
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult((observation,), 2),
+    )
+
+    assert report.pytest is not None
+    assert report.pytest.error == PytestError(
+        "preflight_invalid", "supported preflight has no pytest version"
+    )
+    assert report.checks[0].error == CheckError(
+        "pytest_preflight_failed", "supported preflight has no pytest version"
+    )
+    assert len(report.checks[0].processes) == 1
+    assert validate_report_v1(report) is None
+    assert "pytest_preflight stdout: preflight" in render_terminal(report)
+
+
+def test_pytest_missing_artifact_projects_null_evidence_without_artifact_scope_reasons(
+    tmp_path: Path,
+) -> None:
+    observation = finalized_pytest_execution_observation()
+    observation = replace(
+        observation,
+        artifact=PytestArtifactObservation("missing", None, (), None),
+    )
+
+    report = pytest_report_for_exit(tmp_path, 0, observation=observation)
+
+    assert report.pytest == reporting.PytestResult(
+        status="error",
+        complete=False,
+        scope="partial",
+        scope_reasons=("incomplete_session",),
+        pytest_version="8.4.2",
+        exit_code=0,
+        evidence=None,
+        error=PytestError("artifact_missing", "pytest artifact is missing"),
+    )
+    assert report.checks[0].error == CheckError(
+        "pytest_evidence_error", "pytest artifact is missing"
+    )
+    assert validate_report_v1(report) is None
+
+
+def test_terminal_does_not_render_empty_test_reason_parentheses(tmp_path: Path) -> None:
+    report = pytest_report_for_exit(tmp_path, 0)
+    assert report.pytest is not None
+    evidence = PytestEvidence(
+        effective_args=(),
+        collected=1,
+        deselected=0,
+        counts=PytestCounts(0, 0, 0, 1, 0, 0),
+        collection_errors=(),
+        collection_skips=(),
+        slowest=(SlowTest("test_empty", 1),),
+        special_outcomes=(SpecialTestOutcome("test_empty", "skipped", "", None, False, 1),),
+    )
+    pytest_result = replace(report.pytest, evidence=evidence)
+    report = replace(
+        report,
+        pytest=pytest_result,
+        advisories=reporting._build_advisories(report.checks, pytest_result),
+    )
+
+    terminal = render_terminal(report)
+
+    assert "special: pytest skipped: test_empty\n" in terminal
+    assert "test_empty ()" not in terminal
+    assert "advisory: pytest skipped has no reason: test_empty." in terminal
+
+
+def test_validation_rejects_pytest_cross_field_and_nested_cardinality_mutations(
+    tmp_path: Path,
+) -> None:
+    report = pytest_report_for_exit(tmp_path, 0)
+    assert report.pytest is not None
+    assert report.pytest.evidence is not None
+    preflight = report.checks[0].processes[0]
+
+    missing_primary = replace(report, checks=(replace(report.checks[0], processes=(preflight,)),))
+    complete_with_incomplete_reason = replace(
+        report,
+        pytest=replace(
+            report.pytest,
+            scope="partial",
+            scope_reasons=("incomplete_session",),
+        ),
+    )
+    non_cleanup_error = replace(
+        report,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                report.checks[0],
+                status="error",
+                error=CheckError("pytest_evidence_error", "not a cleanup failure"),
+            ),
+        ),
+    )
+    duplicate_special_evidence = PytestEvidence(
+        effective_args=(),
+        collected=2,
+        deselected=0,
+        counts=PytestCounts(0, 0, 0, 2, 0, 0),
+        collection_errors=(),
+        collection_skips=(),
+        slowest=(SlowTest("test_a", 1), SlowTest("test_b", 1)),
+        special_outcomes=(
+            SpecialTestOutcome("test_a", "skipped", None, None, False, 1),
+            SpecialTestOutcome("test_a", "skipped", None, None, False, 1),
+        ),
+    )
+    duplicate_special = replace(
+        report, pytest=replace(report.pytest, evidence=duplicate_special_evidence)
+    )
+    duplicate_issue_evidence = replace(
+        report.pytest.evidence,
+        collection_errors=(
+            CollectionIssue("test_collect", "bad import"),
+            CollectionIssue("test_collect", "bad import"),
+        ),
+    )
+    duplicate_issue = replace(
+        report, pytest=replace(report.pytest, evidence=duplicate_issue_evidence)
+    )
+    missing_slow_test_evidence = replace(
+        report.pytest.evidence,
+        collected=1,
+        counts=PytestCounts(1, 0, 0, 0, 0, 0),
+        slowest=(),
+    )
+    missing_slow_test = replace(
+        report, pytest=replace(report.pytest, evidence=missing_slow_test_evidence)
+    )
+    malformed_process = replace(
+        report,
+        checks=(replace(report.checks[0], processes=(cast(Any, object()),)),),
+    )
+
+    for invalid in (
+        missing_primary,
+        complete_with_incomplete_reason,
+        non_cleanup_error,
+        duplicate_special,
+        duplicate_issue,
+        missing_slow_test,
+        malformed_process,
+    ):
+        with pytest.raises(ReportingError, match=r"^invalid report:"):
+            validate_report_v1(invalid)
+
+
+def test_validation_rejects_not_started_when_preflight_has_spawn_evidence(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    report = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((), 0))
+    preflight_spawn_failure = ProcessResult(
+        role="pytest_preflight",
+        argv=("uv", "run", "python", "-c", "probe"),
+        cwd=str(tmp_path.resolve()),
+        outcome="spawn_failed",
+        exit_code=None,
+        signal=None,
+        duration_ms=0,
+        stdout=CapturedText(True, "", False, 0),
+        stderr=CapturedText(True, "", False, 0),
+        error_message="FileNotFoundError: uv",
+    )
+    invalid = replace(
+        report,
+        checks=(replace(report.checks[0], processes=(preflight_spawn_failure,)),),
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(invalid)
+
+
+def test_validation_rejects_primary_pytest_result_without_trusted_version(tmp_path: Path) -> None:
+    report = pytest_report_for_exit(tmp_path, 0)
+    assert report.pytest is not None
+    invalid = replace(report, pytest=replace(report.pytest, pytest_version=None))
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(invalid)
+
+
+def test_validation_rejects_not_started_pytest_version_without_matching_preflight(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    no_preflight = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((), 0))
+    successful_preflight = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(pytest_preflight_process(check),),
+                    pytest=finalized_pytest_execution_observation(),
+                ),
+            ),
+            2,
+        ),
+    )
+    assert no_preflight.pytest is not None
+    assert successful_preflight.pytest is not None
+    invalid_without_preflight = replace(
+        no_preflight,
+        pytest=replace(no_preflight.pytest, pytest_version="8.4.2"),
+    )
+    invalid_after_successful_preflight = replace(
+        successful_preflight,
+        pytest=replace(successful_preflight.pytest, pytest_version=None),
+    )
+
+    for invalid in (invalid_without_preflight, invalid_after_successful_preflight):
+        with pytest.raises(ReportingError, match=r"^invalid report:"):
+            validate_report_v1(invalid)
 
 
 def test_pytest_setup_not_started_projects_missing_primary_model(
