@@ -262,18 +262,7 @@ def _validate_coverage_counts(counts: CoverageCounts, field: str) -> None:
 def _validate_coverage_file(file: CoverageFile) -> None:
     if not isinstance(file, CoverageFile):
         raise ValueError("coverage file must be a CoverageFile")
-    if (
-        not isinstance(file.path, str)
-        or not file.path
-        or "\x00" in file.path
-        or file.path.startswith("./")
-        or file.path.startswith("/")
-        or _WINDOWS_ABSOLUTE_PATH.match(file.path) is not None
-        or "\\" in file.path
-        or file.path.endswith("/")
-        or any(part in {"", ".", ".."} for part in file.path.split("/"))
-    ):
-        raise ValueError("coverage file path must be project-relative POSIX text")
+    _validate_coverage_file_path(file.path)
     if not isinstance(file.statements, FileStatementCoverage):
         raise ValueError("coverage statements must be FileStatementCoverage")
     _validate_coverage_counts(
@@ -306,6 +295,22 @@ def _validate_coverage_file(file: CoverageFile) -> None:
         or len(arcs) != file.branches.missing
     ):
         raise ValueError("coverage missing arcs must be unique ordered integer pairs")
+
+
+def _validate_coverage_file_path(path: object) -> str:
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\x00" in path
+        or path.startswith("./")
+        or path.startswith("/")
+        or _WINDOWS_ABSOLUTE_PATH.match(path) is not None
+        or "\\" in path
+        or path.endswith("/")
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise ValueError("coverage file path must be project-relative POSIX text")
+    return path
 
 
 def _coverage_file_sort_key(file: CoverageFile) -> tuple[int, str]:
@@ -717,7 +722,7 @@ def _normalize_measured_path(raw_path: str, root: Path) -> tuple[str, tuple[int,
         status = resolved.stat()
     except OSError as error:
         raise ValueError(f"coverage JSON file path is invalid: {raw_path!r}") from error
-    return relative.as_posix(), (status.st_dev, status.st_ino)
+    return _validate_coverage_file_path(relative.as_posix()), (status.st_dev, status.st_ino)
 
 
 def _summary_counts(summary: dict[object, object], name: str) -> dict[str, int]:

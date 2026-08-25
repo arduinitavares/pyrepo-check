@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import re
@@ -581,10 +580,13 @@ def _parse_coverage_preflight_record(output: CapturedBytes | None) -> CoveragePr
     if len(lines) != 1:
         raise ValueError("preflight must emit exactly one JSON line")
     try:
-        document = json.loads(lines[0])
-    except json.JSONDecodeError as error:
+        loaded_document = load_bounded_json(lines[0].encode("utf-8"))
+    except ValueError as error:
         raise ValueError("preflight JSON is malformed") from error
-    if not isinstance(document, dict) or set(document) != {
+    if not isinstance(loaded_document, dict):
+        raise ValueError("preflight JSON does not match schema version 1")
+    document = cast(dict[str, object], loaded_document)
+    if set(document) != {
         "schema_version",
         "python_version",
         "coverage_available",

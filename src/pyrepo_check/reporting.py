@@ -772,6 +772,10 @@ def _validate_run_report(report: RunReportV1) -> None:
         _invalid("project_root must be absolute")
     pytest_selected = _validate_selection(report.selection)
     selection = report.selection
+    if report.mode == "focused" and selection.planned_coverage_scope == "unavailable":
+        _invalid("focused runs cannot have unavailable planned coverage")
+    if report.mode == "strict_aggregate" and selection.planned_coverage_scope == "not_requested":
+        _invalid("strict aggregate runs cannot omit planned coverage")
     if not isinstance(report.checks, tuple):
         _invalid("checks must be a tuple")
     for check in report.checks:

@@ -651,6 +651,35 @@ def test_coverage_json_rejects_one_measured_path_defect(
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits literal backslashes and drive-like names")
+@pytest.mark.parametrize(
+    ("raw_path", "path_parts"),
+    (
+        ("src\\alpha.py", ("src\\alpha.py",)),
+        ("C:/alpha.py", ("C:", "alpha.py")),
+    ),
+    ids=("literal-backslash", "drive-like-prefix"),
+)
+def test_coverage_json_rejects_non_posix_measured_paths_before_result_construction(
+    tmp_path: Path,
+    raw_path: str,
+    path_parts: tuple[str, ...],
+) -> None:
+    root = _coverage_project(tmp_path)
+    measured = root.joinpath(*path_parts)
+    measured.parent.mkdir(parents=True, exist_ok=True)
+    measured.write_text("# literal POSIX name\n")
+    document = _coverage_json_document()
+    document["files"][raw_path] = document["files"].pop("src/alpha.py")
+
+    with pytest.raises(ValueError, match="project-relative POSIX text"):
+        validate_coverage_json(
+            _coverage_json_bytes(document),
+            project_root=root,
+            coverage_version="7.15.2",
+        )
+
+
 @pytest.mark.parametrize(
     "content",
     (

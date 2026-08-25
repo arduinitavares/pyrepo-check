@@ -276,6 +276,7 @@ def build_coverage_report(
     coverage_json_exit_code: int | None = 0,
     coverage_json_stdout: bytes = b"",
     coverage_json_stderr: bytes = b"",
+    coverage_content: bytes | None = None,
 ) -> RunReportV1:
     check = coverage_enabled_pytest_check(tmp_path, fail_under=fail_under)
     source = tmp_path / "src" / "example.py"
@@ -315,7 +316,9 @@ def build_coverage_report(
                     ),
                     pytest=finalized_pytest_execution_observation(),
                     coverage=coverage_execution_observation(
-                        coverage_json_content(source),
+                        coverage_json_content(source)
+                        if coverage_content is None
+                        else coverage_content,
                         json_exit_code=coverage_json_exit_code,
                     ),
                 ),
@@ -698,6 +701,37 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
     assert select_exit_code(threshold_report) == 2
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits literal backslashes and drive-like names")
+@pytest.mark.parametrize(
+    ("raw_path", "path_parts"),
+    (
+        ("src\\example.py", ("src\\example.py",)),
+        ("C:/example.py", ("C:", "example.py")),
+    ),
+    ids=("literal-backslash", "drive-like-prefix"),
+)
+def test_coverage_path_artifacts_become_typed_errors_before_json_serialization(
+    tmp_path: Path,
+    raw_path: str,
+    path_parts: tuple[str, ...],
+) -> None:
+    source = tmp_path.joinpath(*path_parts)
+    content = reporting.json.loads(coverage_json_content(source))
+    content["files"][raw_path] = content["files"].pop(str(source))
+
+    report = build_coverage_report(
+        tmp_path,
+        coverage_content=reporting.json.dumps(content).encode(),
+    )
+
+    assert report.coverage is not None
+    assert report.coverage.status == "error"
+    assert report.coverage.error is not None
+    assert report.coverage.error.code == "artifact_invalid"
+    payload = reporting.json.loads(serialize_json(report))
+    assert payload["coverage"]["error"]["code"] == "artifact_invalid"
+
+
 def test_unavailable_coverage_is_null_and_adds_its_exact_advisory(tmp_path: Path) -> None:
     check = pytest_planned_check(tmp_path)
     report = build_run_report(
@@ -715,6 +749,53 @@ def test_unavailable_coverage_is_null_and_adds_its_exact_advisory(tmp_path: Path
         ),
     )
     assert validate_report_v1(report) is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "planned_coverage_scope"),
+    (
+        ("focused", "not_requested"),
+        ("strict_aggregate", "unavailable"),
+    ),
+    ids=("focused-not-requested", "strict-aggregate-unavailable"),
+)
+def test_validation_accepts_planner_mode_and_coverage_scope_pairs(
+    tmp_path: Path,
+    mode: RunMode,
+    planned_coverage_scope: PlannedCoverageScope,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode=mode, planned_coverage_scope=planned_coverage_scope),
+        ExecutionResult((executed_check(check, 0),), 0),
+    )
+
+    assert validate_report_v1(report) is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "planned_coverage_scope"),
+    (
+        ("focused", "unavailable"),
+        ("strict_aggregate", "not_requested"),
+    ),
+    ids=("focused-unavailable", "strict-aggregate-not-requested"),
+)
+def test_validation_rejects_impossible_mode_and_coverage_scope_pairs(
+    tmp_path: Path,
+    mode: RunMode,
+    planned_coverage_scope: PlannedCoverageScope,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode=mode, planned_coverage_scope=planned_coverage_scope),
+        ExecutionResult((executed_check(check, 0),), 0),
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(report)
 
 
 @pytest.mark.parametrize(

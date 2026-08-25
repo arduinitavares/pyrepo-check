@@ -514,6 +514,32 @@ def test_coverage_preflight_classifies_the_supported_consumer_contract(
         assert observation.record.coverage_version == version
 
 
+@pytest.mark.parametrize(
+    "member",
+    ("schema_version", "python_version", "coverage_available", "coverage_version"),
+)
+def test_coverage_preflight_rejects_duplicate_raw_required_members(member: str) -> None:
+    encoded_values = {
+        "schema_version": b"1",
+        "python_version": b"[3,13,15]",
+        "coverage_available": b"true",
+        "coverage_version": b'"7.15.2"',
+    }
+    duplicate = (
+        _document()[:-1]
+        + b","
+        + json.dumps(member).encode()
+        + b":"
+        + encoded_values[member]
+        + b"}"
+    )
+
+    observation = coverage_execution.classify_coverage_preflight(_process(stdout=duplicate))
+
+    assert observation.classification == "preflight_invalid"
+    assert observation.record is None
+
+
 def test_coverage_preflight_rejects_truncated_stderr() -> None:
     process = _process(stdout=_document())
     object.__setattr__(process, "stderr", CapturedBytes(b"tail", 1))
