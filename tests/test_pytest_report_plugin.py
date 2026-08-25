@@ -11,6 +11,8 @@ import sys
 from typing import cast
 import uuid
 
+import pytest
+
 
 @dataclass(frozen=True)
 class PluginProjectRun:
@@ -216,3 +218,245 @@ def test_plugin_keeps_collection_errors_and_skips_separate(tmp_path: Path) -> No
     }
     assert [issue["nodeid"] for issue in errors] == ["test_error.py"]
     assert [issue["nodeid"] for issue in skips] == ["test_skip.py"]
+
+
+@pytest.mark.parametrize(
+    ("test_source", "expected_reports"),
+    [
+        (
+            "import pytest\n\ndef test_case():\n    pytest.skip('skip reason')\n",
+            [
+                ("setup", "passed", False, None),
+                ("call", "skipped", False, None),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+        (
+            "import pytest\n\ndef test_case():\n    pytest.xfail('imperative reason')\n",
+            [
+                ("setup", "passed", False, None),
+                ("call", "skipped", True, "imperative reason"),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+        (
+            "import pytest\n\n@pytest.mark.xfail(reason='marked reason')\ndef test_case():\n    assert False\n",
+            [
+                ("setup", "passed", False, None),
+                ("call", "skipped", True, "marked reason"),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+        (
+            "import pytest\n\n@pytest.mark.xfail(reason='not run', run=False)\ndef test_case():\n    assert False\n",
+            [
+                ("setup", "skipped", True, "[NOTRUN] not run"),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+        (
+            "import pytest\n\n@pytest.mark.xfail(reason='strict reason', strict=True)\ndef test_case():\n    assert True\n",
+            [
+                ("setup", "passed", False, None),
+                ("call", "failed", False, None),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+        (
+            "import pytest\n\n@pytest.mark.xfail(reason='non-strict reason')\ndef test_case():\n    assert True\n",
+            [
+                ("setup", "passed", False, None),
+                ("call", "passed", True, "non-strict reason"),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+    ],
+)
+def test_plugin_records_pytest_8_expected_failure_shapes(
+    tmp_path: Path,
+    test_source: str,
+    expected_reports: list[tuple[str, str, bool, str | None]],
+) -> None:
+    """Catch loss or coercion of pytest 8 skip/XFAIL/XPASS metadata."""
+    run = run_plugin_project(tmp_path, test_source)
+
+    reports = cast(list[dict[str, object]], run.artifact["reports"])
+    assert [
+        (
+            report["when"],
+            report["outcome"],
+            report["wasxfail_present"],
+            report["wasxfail"],
+        )
+        for report in reports
+    ] == expected_reports
+    assert all(report["wasxfail_valid"] is True for report in reports)
+    assert all(report["longrepr"] is None or isinstance(report["longrepr"], str) for report in reports)
+
+
+@pytest.mark.parametrize("invocation_args", (("-x",), ("--maxfail=1",)))
+def test_plugin_marks_early_stop_when_a_collected_node_lacks_terminal_outcome(
+    tmp_path: Path,
+    invocation_args: tuple[str, ...],
+) -> None:
+    """Catch treating a truncated session as complete after collection."""
+    run = run_plugin_project(
+        tmp_path,
+        "def test_first():\n    assert False\n\ndef test_never_runs():\n    assert True\n",
+        invocation_args=invocation_args,
+    )
+
+    collection = cast(dict[str, object], run.artifact["collection"])
+    reports = cast(list[dict[str, object]], run.artifact["reports"])
+    assert run.completed.returncode == 1
+    assert collection["final_nodeids"] == [
+        "test_sample.py::test_first",
+        "test_sample.py::test_never_runs",
+    ]
+    assert {report["nodeid"] for report in reports} == {"test_sample.py::test_first"}
+    assert run.artifact["session"] == {
+        "starts": 1,
+        "finishes": 1,
+        "exit_code": 1,
+        "collection_completed": True,
+        "stopped_early": True,
+    }
+
+
+def test_plugin_does_not_treat_executed_failures_as_early_stop(tmp_path: Path) -> None:
+    """Catch deriving early-stop status solely from a nonzero failed-test count."""
+    run = run_plugin_project(
+        tmp_path,
+        "def test_one():\n    assert False\n\ndef test_two():\n    assert False\n",
+    )
+
+    assert run.completed.returncode == 1
+    assert run.artifact["session"] == {
+        "starts": 1,
+        "finishes": 1,
+        "exit_code": 1,
+        "collection_completed": True,
+        "stopped_early": False,
+    }
+
+
+def test_plugin_marks_a_final_node_without_any_phase_report_as_early_stop(
+    tmp_path: Path,
+) -> None:
+    """Catch a plugin silently preventing one collected node from running."""
+    run = run_plugin_project(
+        tmp_path,
+        "def test_runs():\n    assert True\n\ndef test_has_no_report():\n    assert True\n",
+        invocation_args=("-p", "suppress_node"),
+        plugin_sources={
+            "suppress_node": """
+def pytest_runtest_protocol(item, nextitem):
+    if item.name == \"test_has_no_report\":
+        return True
+    return None
+""",
+        },
+    )
+
+    reports = cast(list[dict[str, object]], run.artifact["reports"])
+    session = cast(dict[str, object], run.artifact["session"])
+    assert run.completed.returncode == 0
+    assert {report["nodeid"] for report in reports} == {"test_sample.py::test_runs"}
+    assert session["stopped_early"] is True
+
+
+def test_plugin_allows_inactive_xdist_without_parallelism_flag(tmp_path: Path) -> None:
+    """Catch flagging installed xdist when it is explicitly inactive."""
+    run = run_plugin_project(
+        tmp_path,
+        "def test_ok():\n    assert True\n",
+        invocation_args=("-n", "0"),
+    )
+
+    assert run.completed.returncode == 0
+    assert run.artifact["flags"] == {
+        "unsupported_parallelism": False,
+        "unsupported_retries": False,
+        "worker_metadata": False,
+    }
+
+
+def test_plugin_rejects_xdist_before_a_worker_can_import_tests(tmp_path: Path) -> None:
+    """Catch allowing a parallel worker to create test-side effects."""
+    worker_sentinel = tmp_path / "worker-imported"
+    run = run_plugin_project(
+        tmp_path,
+        (
+            "import os\n"
+            "from pathlib import Path\n\n"
+            "if os.environ.get('PYTEST_XDIST_WORKER'):\n"
+            f"    Path({str(worker_sentinel)!r}).write_text('worker started', encoding='utf-8')\n\n"
+            "def test_ok():\n"
+            "    assert True\n"
+        ),
+        invocation_args=("-n", "1"),
+    )
+
+    assert run.completed.returncode == 4
+    assert run.artifact["flags"] == {
+        "unsupported_parallelism": True,
+        "unsupported_retries": False,
+        "worker_metadata": False,
+    }
+    assert not worker_sentinel.exists()
+
+
+def test_plugin_rejects_real_reruns(tmp_path: Path) -> None:
+    """Catch accepting a session whose passed result required a retry."""
+    run = run_plugin_project(
+        tmp_path,
+        "attempts = 0\n\ndef test_flaky():\n    global attempts\n    attempts += 1\n    assert attempts == 2\n",
+        invocation_args=("--reruns", "1"),
+    )
+
+    assert run.completed.returncode == 0
+    flags = cast(dict[str, object], run.artifact["flags"])
+    assert flags["unsupported_retries"] is True
+
+
+@pytest.mark.parametrize(
+    "injected_outcome",
+    ("passed", "rerun"),
+)
+def test_plugin_rejects_synthetic_repeated_phase_and_noncore_outcome(
+    tmp_path: Path,
+    injected_outcome: str,
+) -> None:
+    """Catch retry-like reports injected by another pytest plugin."""
+    run = run_plugin_project(
+        tmp_path,
+        "def test_ok():\n    assert True\n",
+        invocation_args=("-p", "inject_report"),
+        plugin_sources={
+            "inject_report": f"""
+from _pytest.reports import TestReport
+
+
+def pytest_sessionfinish(session, exitstatus):
+    session.config.hook.pytest_runtest_logreport(
+        report=TestReport(
+            nodeid=\"test_sample.py::test_ok\",
+            location=(\"test_sample.py\", 0, \"test_ok\"),
+            keywords={{}},
+            outcome={injected_outcome!r},
+            longrepr=None,
+            when=\"setup\",
+            sections=(),
+            duration=0.0,
+            start=0.0,
+            stop=0.0,
+            user_properties=[],
+        )
+    )
+""",
+        },
+    )
+
+    assert run.completed.returncode == 0
+    flags = cast(dict[str, object], run.artifact["flags"])
+    assert flags["unsupported_retries"] is True

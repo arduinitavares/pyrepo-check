@@ -13,6 +13,8 @@ pyrepo-check = "pyrepo_check.cli:main"
 dev = [
     "bandit>=1.9,<2",
     "pytest>=8,<9",
+    "pytest-rerunfailures>=16.6,<17",
+    "pytest-xdist>=3.8,<4",
     "ruff>=0.15,<1",
     "ty>=0.0.35,<0.1",
 ]

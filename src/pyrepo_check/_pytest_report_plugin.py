@@ -110,6 +110,12 @@ class _Evidence:
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, _ARTIFACT_PATH)
 
+    def has_terminal_outcome(self, nodeid: str) -> bool:
+        return any(
+            report["nodeid"] == nodeid and report["when"] in {"call", "teardown"}
+            for report in self.reports
+        )
+
 
 _EVIDENCE = _Evidence()
 
@@ -226,7 +232,17 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     _EVIDENCE.finishes += 1
     _EVIDENCE.exit_code = exitstatus
-    _EVIDENCE.stopped_early = bool(session.shouldstop or session.shouldfail)
+    _EVIDENCE.stopped_early = bool(
+        session.shouldstop
+        or session.shouldfail
+        or (
+            not _EVIDENCE.collection_errors
+            and any(
+                not _EVIDENCE.has_terminal_outcome(nodeid)
+                for nodeid in _EVIDENCE.final_nodeids
+            )
+        )
+    )
     _EVIDENCE.publish("finalized")
 
 
@@ -234,6 +250,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 def pytest_xdist_setupnodes(config: pytest.Config, specs: list[object]) -> None:
     if specs:
         _EVIDENCE.unsupported_parallelism = True
+        _EVIDENCE.publish("started")
+        pytest.exit(returncode=4)
 
 
 def pytest_configure(config: pytest.Config) -> None:

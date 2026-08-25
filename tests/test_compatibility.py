@@ -234,3 +234,12 @@ def test_python_requirement_is_consistent_across_active_contracts() -> None:
     assert "consumer Python below 3.9" not in reporting_design
     assert "consumer Python below 3.10" not in reporting_design
     assert "Python 3.13.15 or newer is required" in readme
+
+
+def test_pytest_fixture_dependencies_are_development_only() -> None:
+    """Reject moving plugin integration fixtures into runtime dependencies."""
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["dependencies"] == []
+    assert "pytest-xdist>=3.8,<4" in pyproject["dependency-groups"]["dev"]
+    assert "pytest-rerunfailures>=16.6,<17" in pyproject["dependency-groups"]["dev"]
