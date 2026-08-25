@@ -34,7 +34,10 @@ def test_isolated_matrix_reports_process_failure_before_reading_artifact(
 
 
 def run_isolated_pytest_project(
-    tmp_path: Path, pytest_version: str
+    tmp_path: Path,
+    pytest_version: str,
+    *,
+    conftest_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
     """Run the raw-artifact plugin in one cached isolated pytest environment."""
     project = tmp_path / "project"
@@ -67,6 +70,8 @@ def test_deselected():
 """,
         encoding="utf-8",
     )
+    if conftest_source is not None:
+        (project / "conftest.py").write_text(conftest_source, encoding="utf-8")
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
     artifact_path = artifact_dir / "pytest.json"
@@ -154,4 +159,75 @@ def test_raw_artifact_has_one_common_shape_across_supported_pytest_8_minors(
         ("test_sample.py::test_xfail", "call", "skipped", "expected failure"),
         ("test_sample.py::test_strict_xpass", "call", "failed", None),
         ("test_sample.py::test_non_strict_xpass", "call", "passed", "unexpected pass"),
+    ]
+
+
+@pytest.mark.parametrize("pytest_version", PYTEST_8_VERSIONS)
+@pytest.mark.parametrize(
+    "sessionfinish_hook",
+    (
+        """
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    emit_duplicate_report(session)
+""",
+        """
+@pytest.hookimpl(wrapper=True)
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    yield
+    emit_duplicate_report(session)
+""",
+    ),
+    ids=("ordinary-trylast", "wrapper-teardown"),
+)
+def test_terminal_sessionfinish_reports_are_captured_across_supported_pytest_8_minors(
+    tmp_path: Path,
+    pytest_version: str,
+    sessionfinish_hook: str,
+) -> None:
+    completed, artifact = run_isolated_pytest_project(
+        tmp_path,
+        pytest_version,
+        conftest_source=(
+            """
+import pytest
+from _pytest.reports import TestReport
+
+
+def emit_duplicate_report(session):
+    session.config.hook.pytest_runtest_logreport(
+        report=TestReport(
+            nodeid="test_sample.py::test_pass",
+            location=("test_sample.py", 0, "test_pass"),
+            keywords={},
+            outcome="passed",
+            longrepr=None,
+            when="call",
+            sections=(),
+            duration=0.0,
+            start=0.0,
+            stop=0.0,
+            user_properties=[],
+        )
+    )
+"""
+            + sessionfinish_hook
+        ),
+    )
+
+    assert completed.returncode == 1, completed.stderr
+    assert artifact["state"] == "finalized"
+    flags = cast(dict[str, object], artifact["flags"])
+    assert flags["unsupported_retries"] is True
+    reports = cast(list[dict[str, object]], artifact["reports"])
+    assert [
+        (report["nodeid"], report["when"])
+        for report in reports
+        if report["nodeid"] == "test_sample.py::test_pass"
+        and report["when"] == "call"
+    ] == [
+        ("test_sample.py::test_pass", "call"),
+        ("test_sample.py::test_pass", "call"),
     ]

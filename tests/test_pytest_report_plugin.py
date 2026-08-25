@@ -229,7 +229,10 @@ def test_plugin_finalized_exit_zero_requires_teardown_for_terminal_coverage(
         shouldstop = False
         shouldfail = False
 
-    module.pytest_sessionfinish(Session(), 0)
+    wrapper = module.pytest_sessionfinish(Session(), 0)
+    next(wrapper)
+    with pytest.raises(StopIteration):
+        next(wrapper)
     artifact = json.loads(
         (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
     )

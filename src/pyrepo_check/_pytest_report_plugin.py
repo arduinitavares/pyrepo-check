@@ -239,7 +239,12 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     )
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_sessionfinish(
+    session: pytest.Session,
+    exitstatus: int,
+) -> Generator[None, object, None]:
+    yield
     stopped_early = bool(
         session.shouldstop
         or session.shouldfail

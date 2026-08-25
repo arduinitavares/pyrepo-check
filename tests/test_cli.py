@@ -44,6 +44,7 @@ def _write_live_pytest_consumer(
     *,
     include_pytest: bool = True,
     include_xdist: bool = False,
+    conftest_source: str | None = None,
 ) -> None:
     dependencies = (
         '["pytest>=8,<9", "pytest-xdist>=3.8,<4"]'
@@ -72,6 +73,8 @@ def _write_live_pytest_consumer(
             "def test_selected():\n    assert True\n\n\ndef test_other():\n    assert True\n",
             encoding="utf-8",
         )
+        if conftest_source is not None:
+            (root / "conftest.py").write_text(conftest_source, encoding="utf-8")
     subprocess.run(("uv", "lock"), cwd=root, check=True, capture_output=True)  # nosec B603
 
 
@@ -114,13 +117,119 @@ def test_structured_pytest_cli_runs_a_real_consumer_with_one_primary(
         return
     assert completed.stderr == b""
     payload = json.loads(completed.stdout)
+    assert payload["overall_status"] == "passed"
+    assert payload["complete"] is True
     assert payload["selection"]["pytest_args"] == expected_args
+    assert payload["pytest"]["status"] == "passed"
+    assert payload["pytest"]["complete"] is True
     assert payload["pytest"]["scope"] == "partial"
     assert payload["pytest"]["evidence"] is not None
     assert [process["role"] for process in payload["checks"][0]["processes"]] == [
         "pytest_preflight",
         "primary",
     ]
+
+
+@pytest.mark.parametrize(
+    "sessionfinish_hook",
+    (
+        """
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    emit_duplicate_report(session)
+""",
+        """
+@pytest.hookimpl(wrapper=True)
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    yield
+    emit_duplicate_report(session)
+""",
+    ),
+    ids=("ordinary-trylast", "wrapper-teardown"),
+)
+def test_structured_pytest_cli_rejects_reports_emitted_at_terminal_sessionfinish(
+    tmp_path: Path,
+    sessionfinish_hook: str,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_live_pytest_consumer(
+        consumer,
+        conftest_source=(
+            """
+import pytest
+from _pytest.reports import TestReport
+
+
+def emit_duplicate_report(session):
+    session.config.hook.pytest_runtest_logreport(
+        report=TestReport(
+            nodeid="tests/test_sample.py::test_selected",
+            location=("tests/test_sample.py", 0, "test_selected"),
+            keywords={},
+            outcome="passed",
+            longrepr=None,
+            when="call",
+            sections=(),
+            duration=0.0,
+            start=0.0,
+            stop=0.0,
+            user_properties=[],
+        )
+    )
+"""
+            + sessionfinish_hook
+        ),
+    )
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--format",
+            "json",
+            "pytest",
+            "tests/test_sample.py::test_selected",
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 2
+    assert completed.stderr == b""
+    assert payload["overall_status"] == "error"
+    assert payload["complete"] is False
+    assert payload["pytest"] == {
+        "status": "error",
+        "complete": False,
+        "scope": "partial",
+        "scope_reasons": ["planned_selector", "incomplete_session"],
+        "pytest_version": payload["pytest"]["pytest_version"],
+        "exit_code": 0,
+        "evidence": None,
+        "error": {
+            "code": "unsupported_retries",
+            "message": "pytest artifact reports unsupported retries",
+        },
+    }
+    check = payload["checks"][0]
+    assert check["status"] == "error"
+    assert check["error"] == {
+        "code": "pytest_evidence_error",
+        "message": "pytest artifact reports unsupported retries",
+    }
+    assert [process["role"] for process in check["processes"]] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    primary = check["processes"][1]
+    assert primary["outcome"] == "exited"
+    assert primary["exit_code"] == 0
+    assert primary["signal"] is None
+    assert primary["error_message"] is None
 
 
 def test_structured_pytest_cli_stops_after_unsupported_preflight(tmp_path: Path) -> None:
