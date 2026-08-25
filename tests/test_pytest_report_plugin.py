@@ -242,6 +242,44 @@ def test_plugin_terminal_replace_failure_leaves_started_artifact(
     assert artifact["session"]["finishes"] == 0
 
 
+def test_plugin_failed_post_terminal_invalidation_forces_internal_error_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+    evidence = module._Evidence()
+    evidence.start_session()
+    evidence.publish("started")
+    evidence.record_finish(0, stopped_early=False)
+    evidence.close()
+    evidence.finalize_at_exit()
+    forced_exit_codes: list[int] = []
+
+    class ForcedExit(RuntimeError):
+        pass
+
+    def fail_restore_replace(source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("invalidation replace failed")
+
+    def force_exit(exit_code: int) -> None:
+        forced_exit_codes.append(exit_code)
+        raise ForcedExit(str(exit_code))
+
+    monkeypatch.setattr(module.os, "replace", fail_restore_replace)
+    monkeypatch.setattr(module.os, "_exit", force_exit)
+
+    with pytest.raises(ForcedExit, match="^3$"):
+        evidence.observe_hook()
+
+    artifact = json.loads(
+        (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
+    )
+    assert forced_exit_codes == [3]
+    assert artifact["state"] == "finalized"
+    assert artifact["session"]["finishes"] == 1
+
+
 def test_plugin_conflicting_scope_observations_stay_non_finalized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -87,10 +87,16 @@ class _Evidence:
         }
 
     def observe_hook(self) -> bool:
-        if self._closed or self._terminal_published:
+        terminal_was_published = self._terminal_published
+        if self._closed or terminal_was_published:
             self._invalidated = True
             if self._session_started:
-                self.publish("started")
+                try:
+                    self.publish("started")
+                except OSError:
+                    if terminal_was_published:
+                        os._exit(int(pytest.ExitCode.INTERNAL_ERROR))
+                    raise
             return False
         return not self._invalidated
 

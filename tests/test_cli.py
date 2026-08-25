@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import subprocess  # nosec B404
 import sys
 
@@ -230,6 +231,109 @@ def emit_duplicate_report(session):
     assert primary["exit_code"] == 0
     assert primary["signal"] is None
     assert primary["error_message"] is None
+
+
+def test_structured_pytest_cli_rejects_stale_finalized_artifact_when_terminal_invalidation_cannot_publish(
+    tmp_path: Path,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_live_pytest_consumer(consumer)
+    (consumer / "early_terminal_relay.py").write_text(
+        """
+import atexit
+import os
+from pathlib import Path
+
+from _pytest.reports import TestReport
+
+
+_CONFIG = None
+_ORIGINAL_REPLACE = os.replace
+
+
+def relay_after_evidence_finalizer():
+    if _CONFIG is None:
+        return
+    artifact_path = Path(os.environ["PYREPO_CHECK_PYTEST_JSON"])
+    Path("stale-finalized.json").write_bytes(artifact_path.read_bytes())
+
+    def fail_artifact_replace(source, destination):
+        if Path(destination) == artifact_path:
+            raise OSError("terminal invalidation replace failed")
+        _ORIGINAL_REPLACE(source, destination)
+
+    os.replace = fail_artifact_replace
+    _CONFIG.hook.pytest_runtest_logreport(
+        report=TestReport(
+            nodeid="tests/test_sample.py::test_selected",
+            location=("tests/test_sample.py", 0, "test_selected"),
+            keywords={},
+            outcome="passed",
+            longrepr=None,
+            when="call",
+            sections=(),
+            duration=0.0,
+            start=0.0,
+            stop=0.0,
+            user_properties=[],
+        )
+    )
+
+
+atexit.register(relay_after_evidence_finalizer)
+
+
+def pytest_configure(config):
+    global _CONFIG
+    _CONFIG = config
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ | {"PYTEST_ADDOPTS": "-p early_terminal_relay"}
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--format",
+            "json",
+            "pytest",
+            "tests/test_sample.py::test_selected",
+        ),
+        cwd=consumer,
+        env=environment,
+        check=False,
+        capture_output=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    stale_artifact = json.loads(
+        (consumer / "stale-finalized.json").read_text(encoding="utf-8")
+    )
+    assert stale_artifact["state"] == "finalized"
+    assert stale_artifact["session"]["finishes"] == 1
+    assert stale_artifact["session"]["exit_code"] == 0
+    assert completed.returncode == 3
+    assert completed.stderr == b""
+    assert payload["overall_status"] == "error"
+    assert payload["complete"] is False
+    assert payload["pytest"] == {
+        "status": "error",
+        "complete": False,
+        "scope": "partial",
+        "scope_reasons": ["planned_selector", "incomplete_session"],
+        "pytest_version": payload["pytest"]["pytest_version"],
+        "exit_code": 3,
+        "evidence": None,
+        "error": {
+            "code": "exit_code_mismatch",
+            "message": "pytest artifact exit code differs from the primary process",
+        },
+    }
+    primary = payload["checks"][0]["processes"][1]
+    assert primary["role"] == "primary"
+    assert primary["outcome"] == "exited"
+    assert primary["exit_code"] == 3
 
 
 def test_structured_pytest_cli_stops_after_unsupported_preflight(tmp_path: Path) -> None:
