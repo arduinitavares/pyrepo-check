@@ -398,7 +398,11 @@ def execute_pytest(
                         str(error),
                     )
                 else:
-                    artifact = _snapshot_artifact(artifact_path, writer_directory)
+                    artifact = _snapshot_artifact(
+                        artifact_path,
+                        writer_directory,
+                        run_descriptor=verified_run.descriptor,
+                    )
     except OSError as error:
         preflight = PytestPreflightObservation(
             "not_started",
@@ -609,10 +613,19 @@ def _isolated_environment(
 def _snapshot_artifact(
     artifact_path: Path,
     writer_directory: Path,
+    *,
+    run_descriptor: int | None = None,
 ) -> PytestArtifactObservation:
-    writer_ids, marker_diagnostic = _snapshot_writer_ids(writer_directory)
+    writer_ids, marker_diagnostic = _snapshot_writer_ids(
+        writer_directory,
+        run_descriptor=run_descriptor,
+    )
     try:
-        content = _read_regular_file(artifact_path, max_bytes=_MAX_ARTIFACT_BYTES)
+        content = _read_regular_file(
+            artifact_path,
+            max_bytes=_MAX_ARTIFACT_BYTES,
+            dir_fd=run_descriptor,
+        )
     except FileNotFoundError:
         return PytestArtifactObservation("missing", None, writer_ids, marker_diagnostic)
     except _UnsafePathError as error:
@@ -632,12 +645,31 @@ def _snapshot_artifact(
     return PytestArtifactObservation("snapshot", content, writer_ids, marker_diagnostic)
 
 
-def _snapshot_writer_ids(writer_directory: Path) -> tuple[tuple[str, ...], str | None]:
+def _snapshot_writer_ids(
+    writer_directory: Path,
+    *,
+    run_descriptor: int | None = None,
+) -> tuple[tuple[str, ...], str | None]:
     writer_id: str | None = None
     diagnostics: list[str] = []
+    writer_descriptor: int | None = None
     try:
-        entries = os.scandir(writer_directory)
+        if run_descriptor is None:
+            entries = os.scandir(writer_directory)
+        else:
+            writer_descriptor = os.open(
+                writer_directory.name,
+                _secure_directory_open_flags(),
+                dir_fd=run_descriptor,
+            )
+            os.set_inheritable(writer_descriptor, False)
+            entries = os.scandir(writer_descriptor)
     except OSError as error:
+        if writer_descriptor is not None:
+            try:
+                os.close(writer_descriptor)
+            except OSError:
+                pass
         return (), f"writer inventory failed: {error}"
     marker_seen = False
     try:
@@ -660,8 +692,11 @@ def _snapshot_writer_ids(writer_directory: Path) -> tuple[tuple[str, ...], str |
                 try:
                     loaded_document = _load_bounded_json(
                         _read_regular_file(
-                            Path(entry.path),
+                            Path(entry.path)
+                            if writer_descriptor is None
+                            else Path(entry.name),
                             max_bytes=_MAX_WRITER_MARKER_BYTES,
+                            dir_fd=writer_descriptor,
                         )
                     )
                 except (
@@ -1580,13 +1615,25 @@ class _BoundedReadError(OSError):
     """Raised when a regular evidence file exceeds its byte budget."""
 
 
-def _read_regular_file(path: Path, *, max_bytes: int) -> bytes:
+def _read_regular_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    dir_fd: int | None = None,
+) -> bytes:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     non_blocking = getattr(os, "O_NONBLOCK", None)
     if type(no_follow) is not int or type(non_blocking) is not int:
         raise _UnsafePathError("safe no-follow file opening is unavailable")
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+        if dir_fd is None:
+            descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+        else:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | no_follow | non_blocking,
+                dir_fd=dir_fd,
+            )
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise _UnsafePathError(f"path is not a regular file: {path.name}") from error

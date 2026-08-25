@@ -1088,7 +1088,7 @@ def test_artifact_read_failure_is_observed_and_cleanup_still_runs(
         *args: int,
         **kwargs: int | None,
     ) -> int:
-        if not args and not kwargs and Path(os.fsdecode(path)).name == "artifact.json":
+        if kwargs.get("dir_fd") is not None and os.fsdecode(path) == "artifact.json":
             raise PermissionError("artifact denied")
         return original_open(path, flags, *args, **kwargs)
 
@@ -1129,6 +1129,7 @@ def test_artifact_snapshot_reads_open_descriptor_when_path_is_replaced(
     replacement.write_bytes(b"attacker-content")
     open_calls: list[Path] = []
     original_open = pytest_execution.os.open
+    artifact_path: Path | None = None
 
     def replacement_race(
         path: str | bytes | os.PathLike[str],
@@ -1137,8 +1138,9 @@ def test_artifact_snapshot_reads_open_descriptor_when_path_is_replaced(
         **kwargs: int | None,
     ) -> int:
         descriptor = original_open(path, flags, *args, **kwargs)
-        target = Path(os.fsdecode(path))
-        if not args and not kwargs and target.name == "artifact.json":
+        if kwargs.get("dir_fd") is not None and os.fsdecode(path) == "artifact.json":
+            assert artifact_path is not None
+            target = artifact_path
             open_calls.append(target)
             target.unlink()
             target.symlink_to(replacement)
@@ -1154,9 +1156,11 @@ def test_artifact_snapshot_reads_open_descriptor_when_path_is_replaced(
         capture_output: bool = False,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        nonlocal artifact_path
         del cwd, check, capture_output
         if env is not None and command[1:3] == ("-m", "pytest"):
-            Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"captured-content")
+            artifact_path = Path(env["PYREPO_CHECK_PYTEST_JSON"])
+            artifact_path.write_bytes(b"captured-content")
         return completed(
             command,
             0,
@@ -1182,6 +1186,7 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
     )
     open_calls: list[Path] = []
     original_open = pytest_execution.os.open
+    marker_path: Path | None = None
 
     def replacement_race(
         path: str | bytes | os.PathLike[str],
@@ -1190,8 +1195,12 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
         **kwargs: int | None,
     ) -> int:
         descriptor = original_open(path, flags, *args, **kwargs)
-        target = Path(os.fsdecode(path))
-        if not args and not kwargs and target.name == "pytest-writer-safe.json":
+        if (
+            kwargs.get("dir_fd") is not None
+            and os.fsdecode(path) == "pytest-writer-safe.json"
+        ):
+            assert marker_path is not None
+            target = marker_path
             open_calls.append(target)
             target.unlink()
             target.symlink_to(replacement)
@@ -1207,11 +1216,13 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
         capture_output: bool = False,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        nonlocal marker_path
         del cwd, check, capture_output
         if env is not None and command[1:3] == ("-m", "pytest"):
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
-            (writer_directory / "pytest-writer-safe.json").write_text(
+            marker_path = writer_directory / "pytest-writer-safe.json"
+            marker_path.write_text(
                 '{"schema_version":1,"writer_id":"safe","pid":1}'
             )
         return completed(
@@ -2799,6 +2810,89 @@ def test_run_swap_inside_primary_retains_processes_without_snapshotting_replacem
         ExecutionResult((observation,), 2),
     )
     validate_report_v1(report)
+
+
+def test_snapshot_uses_held_run_descriptor_after_run_basename_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    displaced = run_directory.with_name(f"{run_directory.name}-displaced")
+    original_snapshot = pytest_execution._snapshot_artifact
+    trusted_content: bytes | None = None
+
+    def swap_run_at_snapshot_start(
+        artifact_path: Path,
+        writer_directory: Path,
+        *,
+        run_descriptor: int | None = None,
+    ) -> pytest_execution.PytestArtifactObservation:
+        nonlocal trusted_content
+        trusted_content = artifact_path.read_bytes()
+        trusted_document = json.loads(trusted_content)
+        trusted_document["forged"] = True
+        marker_path = next(writer_directory.glob("pytest-writer-*.json"))
+        marker_content = marker_path.read_bytes()
+
+        run_directory.rename(displaced)
+        run_directory.mkdir()
+        replacement_writer_directory = run_directory / "writers"
+        replacement_writer_directory.mkdir()
+        (run_directory / "artifact.json").write_text(
+            json.dumps(trusted_document, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        (replacement_writer_directory / marker_path.name).write_bytes(marker_content)
+
+        if run_descriptor is None:
+            return original_snapshot(artifact_path, writer_directory)
+        return original_snapshot(
+            artifact_path,
+            writer_directory,
+            run_descriptor=run_descriptor,
+        )
+
+    monkeypatch.setattr(pytest_execution, "_snapshot_artifact", swap_run_at_snapshot_start)
+
+    try:
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            output_format="json",
+            runner=RecordingRunner(publish_pytest_artifact=True),
+        )
+    finally:
+        shutil.rmtree(run_directory, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert trusted_content is not None
+    assert [process.role for process in observation.processes] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "supported"
+    assert observation.pytest.artifact.state == "snapshot"
+    assert observation.pytest.artifact.content == trusted_content
+    assert observation.pytest.cleanup_error is not None
+    assert "identity mismatch" in observation.pytest.cleanup_error
+
+    plan = RunPlan(
+        mode="focused",
+        targets=("tests",),
+        checks=(observation.planned,),
+        output_format="json",
+        pytest_args=("tests",),
+        planned_test_scope="partial",
+    )
+    report = build_run_report(tmp_path, plan, ExecutionResult((observation,), 0))
+    assert report.pytest is not None
+    assert report.pytest.status == "passed"
+    assert report.pytest.complete is True
+    assert report.pytest.evidence is not None
+    assert report.pytest.error is None
+    assert report.checks[0].error is not None
+    assert report.checks[0].error.code == "cleanup_failed"
+    assert report.complete is False
 
 
 def test_consumer_tmpdir_is_not_used_for_the_run_directory(
