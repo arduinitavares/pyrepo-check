@@ -85,7 +85,10 @@ pyrepo-check --format json --all
 Use `--format json` when an agent needs a machine-readable result. Its stdout
 is exactly one versioned JSON document followed by a newline; native tool
 stdout and stderr are captured inside that document. With pytest selected,
-C2 adds a non-null `pytest` result with trusted session evidence. For example:
+C2 adds a non-null `pytest` result with trusted session evidence. The valid
+JSON below is an abridged selection of fields from that full versioned document,
+not an exact complete stdout snapshot: required fields and additional list
+entries are omitted only for readability.
 
 ```bash
 pyrepo-check --format json pytest
