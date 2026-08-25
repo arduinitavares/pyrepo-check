@@ -151,14 +151,28 @@ signal errors, the CLI returns `2`.
 
 Captured process streams retain only their final 65,536 raw bytes. Production
 capture drains stdout and stderr concurrently with bounded tail buffers;
-injected test runners are outside that production memory guarantee. Structured
+reader-construction, reader-start, drain, and wait failures terminate and reap
+the child, close both pipes, and continue later checks through the existing
+`spawn_failed` result.
+Injected test runners are outside that production memory guarantee. Structured
 pytest artifacts and writer markers also have fixed read, nesting, and
-directory-inventory limits.
+directory-inventory limits. Their descriptor-safe reads are nonblocking, so a
+FIFO or other non-regular path fails closed instead of waiting for a writer.
 
 Structured pytest evidence requires descriptor-safe no-follow file opening and
-symlink-safe descriptor-relative recursive removal. Unsupported platforms fail
-closed before pytest starts; pyrepo-check does not fall back to path-based
-cleanup.
+bounded descriptor-relative recursive removal. Cleanup validates the complete
+tree before deletion, then removes it with streaming descriptor-relative
+operations. Each pass accepts at most 4,096 entries and depth 64; the complete
+cleanup has a five-second monotonic deadline. A single kernel call cannot be
+interrupted by that deadline. Unsupported platforms fail closed before pytest
+starts; pyrepo-check does not fall back to path-based cleanup.
+
+Cleanup failure keeps an already-captured pytest snapshot but makes the check
+an incomplete `cleanup_failed` error. The diagnostic names the retained run
+directory only when its device and inode were reverified through the recorded
+parent directory descriptor. A validation failure leaves the tree untouched;
+a race or I/O failure during the deletion pass can leave the verified root
+partially emptied for manual inspection.
 
 ## Project Configuration
 

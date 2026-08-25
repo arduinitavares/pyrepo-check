@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 import errno
 import json
@@ -13,7 +13,7 @@ import shutil
 import stat
 import tempfile
 import time
-from typing import Literal, cast
+from typing import Literal, Never, Protocol, cast
 
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
@@ -31,7 +31,16 @@ _MAX_WRITER_MARKER_BYTES = 4 * 1024
 _MAX_JSON_NESTING = 64
 _MAX_WRITER_DIRECTORY_ENTRIES = 1024
 _READ_CHUNK_BYTES = 64 * 1024
+_MAX_CLEANUP_ENTRIES = 4096
+_MAX_CLEANUP_DEPTH = 64
+_MAX_CLEANUP_DURATION_NS = 5_000_000_000
 _MINIMUM_PYTHON_VERSION = (3, 13, 15)
+_SCANDIR_SUPPORTS_FD = os.scandir in os.supports_fd
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_FOLLOW_SYMLINKS = os.stat in os.supports_follow_symlinks
+_UNLINK_SUPPORTS_DIR_FD = os.unlink in os.supports_dir_fd
+_RMDIR_SUPPORTS_DIR_FD = os.rmdir in os.supports_dir_fd
 _PREFLIGHT_PROBE = """import json
 import sys
 record = {"schema_version": 1, "python_version": list(sys.version_info[:3]), "pytest_available": False, "pytest_version": None}
@@ -102,6 +111,73 @@ class PytestExecutionObservation:
 class _RunDirectory:
     path: Path
     identity: tuple[int, int]
+    parent_identity: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.parent_identity is None:
+            object.__setattr__(
+                self,
+                "parent_identity",
+                _directory_identity(self.path.parent),
+            )
+
+
+CleanupFailureKind = Literal["budget_exceeded", "unsafe_tree", "io_failed"]
+
+
+class _ScandirIterator(Iterator[os.DirEntry[str]], Protocol):
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class _CleanupObservation:
+    kind: CleanupFailureKind
+    message: str
+    retained_path: Path | None
+
+
+class _CleanupFailure(OSError):
+    def __init__(self, kind: CleanupFailureKind, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+@dataclass
+class _CleanupBudget:
+    started_ns: int
+    clock_ns: Callable[[], int]
+    entries: int = 0
+
+    def observe_entry(self, *, depth: int) -> None:
+        self.entries += 1
+        if self.entries > _MAX_CLEANUP_ENTRIES:
+            raise _CleanupFailure(
+                "budget_exceeded",
+                f"cleanup entry limit exceeded ({_MAX_CLEANUP_ENTRIES})",
+            )
+        if depth > _MAX_CLEANUP_DEPTH:
+            raise _CleanupFailure(
+                "budget_exceeded",
+                f"cleanup depth limit exceeded ({_MAX_CLEANUP_DEPTH})",
+            )
+
+    def check_deadline(self) -> None:
+        if self.clock_ns() - self.started_ns > _MAX_CLEANUP_DURATION_NS:
+            raise _CleanupFailure(
+                "budget_exceeded",
+                f"cleanup duration limit exceeded ({_MAX_CLEANUP_DURATION_NS} ns)",
+            )
+
+
+@dataclass
+class _CleanupFrame:
+    descriptor: int
+    entries: _ScandirIterator
+    depth: int
+    name: str | None
+    identity: tuple[int, int]
+    parent_descriptor: int
 
 
 def execute_pytest(
@@ -202,9 +278,16 @@ def execute_pytest(
         )
     finally:
         try:
-            _remove_run_directory(run_directory, consumer_root=check.cwd)
+            cleanup_observation = _remove_run_directory(
+                run_directory,
+                consumer_root=check.cwd,
+                clock_ns=clock_ns,
+            )
         except OSError as error:
             cleanup_error = f"{type(error).__name__}: {error}"
+        else:
+            if cleanup_observation is not None:
+                cleanup_error = _cleanup_diagnostic(cleanup_observation)
     return ExecutedCheck(
         planned=check,
         processes=tuple(processes),
@@ -371,66 +454,80 @@ def _snapshot_writer_ids(writer_directory: Path) -> tuple[tuple[str, ...], str |
     except OSError as error:
         return (), f"writer inventory failed: {error}"
     marker_seen = False
-    with entries:
-        for entry_count, entry in enumerate(entries, start=1):
-            retained_ids = (writer_id,) if writer_id is not None else ()
-            if entry_count > _MAX_WRITER_DIRECTORY_ENTRIES:
-                diagnostics.append(
-                    f"writer directory contains more than {_MAX_WRITER_DIRECTORY_ENTRIES} entries"
-                )
-                return retained_ids, "; ".join(diagnostics)
-            marker_id = _marker_id(entry.name)
-            if marker_id is None:
-                continue
-            if marker_seen:
-                diagnostics.append("multiple writer markers were found")
-                return retained_ids, "; ".join(diagnostics)
-            marker_seen = True
-            try:
-                loaded_document = _load_bounded_json(
-                    _read_regular_file(
-                        Path(entry.path),
-                        max_bytes=_MAX_WRITER_MARKER_BYTES,
+    try:
+        with entries:
+            for entry_count, entry in enumerate(entries, start=1):
+                retained_ids = (writer_id,) if writer_id is not None else ()
+                if entry_count > _MAX_WRITER_DIRECTORY_ENTRIES:
+                    diagnostics.append(
+                        f"writer directory contains more than "
+                        f"{_MAX_WRITER_DIRECTORY_ENTRIES} entries"
                     )
-                )
-            except (
-                _UnsafePathError,
-                _BoundedReadError,
-                OSError,
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                ValueError,
-            ) as error:
-                diagnostics.append(f"writer marker is malformed: {entry.name}: {error}")
-                continue
-            if not isinstance(loaded_document, dict):
-                diagnostics.append(
-                    f"writer marker is malformed: {entry.name}: root must be an object"
-                )
-                continue
-            document = cast(dict[object, object], loaded_document)
-            schema_version = document.get("schema_version")
-            document_writer_id = document.get("writer_id")
-            pid = document.get("pid")
-            if type(schema_version) is not int or schema_version != 1:
-                diagnostics.append(
-                    f"writer marker is malformed: {entry.name}: schema_version must be integer 1"
-                )
-                continue
-            if not isinstance(document_writer_id, str):
-                diagnostics.append(
-                    f"writer marker is malformed: {entry.name}: writer_id must be a string"
-                )
-                continue
-            if type(pid) is not int or pid < 0:
-                diagnostics.append(
-                    f"writer marker is malformed: {entry.name}: pid must be a non-negative integer"
-                )
-                continue
-            if document_writer_id != marker_id:
-                diagnostics.append(f"writer marker ID mismatch: {entry.name}")
-                continue
-            writer_id = marker_id
+                    return retained_ids, "; ".join(diagnostics)
+                marker_id = _marker_id(entry.name)
+                if marker_id is None:
+                    continue
+                if marker_seen:
+                    diagnostics.append("multiple writer markers were found")
+                    return retained_ids, "; ".join(diagnostics)
+                marker_seen = True
+                try:
+                    loaded_document = _load_bounded_json(
+                        _read_regular_file(
+                            Path(entry.path),
+                            max_bytes=_MAX_WRITER_MARKER_BYTES,
+                        )
+                    )
+                except (
+                    _UnsafePathError,
+                    _BoundedReadError,
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    ValueError,
+                ) as error:
+                    diagnostics.append(f"writer marker is malformed: {entry.name}: {error}")
+                    continue
+                if not isinstance(loaded_document, dict):
+                    diagnostics.append(
+                        f"writer marker is malformed: {entry.name}: root must be an object"
+                    )
+                    continue
+                document = cast(dict[object, object], loaded_document)
+                schema_version = document.get("schema_version")
+                document_writer_id = document.get("writer_id")
+                pid = document.get("pid")
+                if type(schema_version) is not int or schema_version != 1:
+                    diagnostics.append(
+                        f"writer marker is malformed: {entry.name}: "
+                        "schema_version must be integer 1"
+                    )
+                    continue
+                if not isinstance(document_writer_id, str):
+                    diagnostics.append(
+                        f"writer marker is malformed: {entry.name}: "
+                        "writer_id must be a string"
+                    )
+                    continue
+                if type(pid) is not int or pid < 0:
+                    diagnostics.append(
+                        f"writer marker is malformed: {entry.name}: "
+                        "pid must be a non-negative integer"
+                    )
+                    continue
+                if document_writer_id != marker_id:
+                    diagnostics.append(f"writer marker ID mismatch: {entry.name}")
+                    continue
+                writer_id = marker_id
+    except OSError as error:
+        retained_ids = (writer_id,) if writer_id is not None else ()
+        qualification = (
+            f" after validated writer {writer_id}" if writer_id is not None else ""
+        )
+        diagnostics.append(
+            f"writer inventory failed{qualification}: {type(error).__name__}: {error}"
+        )
+        return retained_ids, "; ".join(diagnostics)
     return ((writer_id,) if writer_id is not None else ()), "; ".join(diagnostics) or None
 
 
@@ -448,61 +545,297 @@ def _marker_id(name: str) -> str | None:
     return marker_id
 
 
-def _remove_run_directory(run_directory: _RunDirectory, *, consumer_root: Path) -> None:
-    descriptor = _open_run_directory(run_directory)
+def _remove_run_directory(
+    run_directory: _RunDirectory,
+    *,
+    consumer_root: Path,
+    clock_ns: Callable[[], int] = time.monotonic_ns,
+) -> _CleanupObservation | None:
+    parent_descriptor: int | None = None
+    parent_verified = False
+    observation: _CleanupObservation | None = None
+    close_error: OSError | None = None
+    started_ns = clock_ns()
     try:
-        resolved_run_directory = run_directory.path.resolve(strict=True)
-        if _is_within(resolved_run_directory, consumer_root.resolve()):
-            raise OSError("refusing to remove consumer root or its contents")
-        if not shutil.rmtree.avoids_symlink_attacks:
-            raise OSError("symlink-safe recursive removal is unavailable")
-        _verify_directory_identity(run_directory.path, run_directory.identity)
-        try:
-            shutil.rmtree(
-                ".",
-                dir_fd=descriptor,
-                onexc=_retain_open_run_directory,
+        if _is_within(run_directory.path.absolute(), consumer_root.resolve()):
+            raise _CleanupFailure(
+                "unsafe_tree",
+                "refusing to remove consumer root or its contents",
             )
-        except _RecursiveCleanupFailure as failure:
-            raise failure.error from failure
-        _verify_directory_identity(run_directory.path, run_directory.identity)
-        os.rmdir(run_directory.path)
+        parent_descriptor = _open_verified_parent(run_directory)
+        parent_verified = True
+        _walk_cleanup_tree(
+            parent_descriptor,
+            run_directory.path.name,
+            run_directory.identity,
+            budget=_CleanupBudget(started_ns, clock_ns),
+            delete=False,
+        )
+        _walk_cleanup_tree(
+            parent_descriptor,
+            run_directory.path.name,
+            run_directory.identity,
+            budget=_CleanupBudget(started_ns, clock_ns),
+            delete=True,
+        )
+        deletion_budget = _CleanupBudget(started_ns, clock_ns)
+        deletion_budget.check_deadline()
+        _verify_relative_identity(
+            parent_descriptor,
+            run_directory.path.name,
+            run_directory.identity,
+            "run directory identity mismatch before root removal",
+        )
+        deletion_budget.check_deadline()
+        os.rmdir(run_directory.path.name, dir_fd=parent_descriptor)
+    except _CleanupFailure as error:
+        retained_path = _verified_retained_path(
+            run_directory,
+            parent_descriptor if parent_verified else None,
+        )
+        observation = _CleanupObservation(error.kind, error.message, retained_path)
+    except OSError as error:
+        retained_path = _verified_retained_path(
+            run_directory,
+            parent_descriptor if parent_verified else None,
+        )
+        observation = _CleanupObservation(
+            "io_failed",
+            f"{type(error).__name__}: {error}",
+            retained_path,
+        )
     finally:
-        os.close(descriptor)
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError as error:
+                close_error = error
+    if observation is not None:
+        return observation
+    if close_error is not None:
+        return _CleanupObservation(
+            "io_failed",
+            f"{type(close_error).__name__}: {close_error}",
+            None,
+        )
+    return None
 
 
-def _open_run_directory(run_directory: _RunDirectory) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    directory_only = getattr(os, "O_DIRECTORY", None)
-    if type(no_follow) is not int or type(directory_only) is not int:
-        raise OSError("safe directory opening is unavailable")
-    descriptor = os.open(
-        run_directory.path,
-        os.O_RDONLY | no_follow | directory_only,
-    )
+def _walk_cleanup_tree(
+    parent_descriptor: int,
+    root_name: str,
+    root_identity: tuple[int, int],
+    *,
+    budget: _CleanupBudget,
+    delete: bool,
+) -> None:
+    stack: list[_CleanupFrame] = []
+    try:
+        root_descriptor, root_status = _open_verified_relative_directory(
+            parent_descriptor,
+            root_name,
+            root_identity,
+            expected_device=root_identity[0],
+            budget=budget,
+        )
+        try:
+            budget.check_deadline()
+            root_entries = os.scandir(root_descriptor)
+        except BaseException:
+            try:
+                os.close(root_descriptor)
+            except BaseException:
+                pass
+            raise
+        stack.append(
+            _CleanupFrame(
+                root_descriptor,
+                root_entries,
+                0,
+                None,
+                _status_identity(root_status),
+                parent_descriptor,
+            )
+        )
+        while stack:
+            frame = stack[-1]
+            budget.check_deadline()
+            try:
+                entry = next(frame.entries)
+            except StopIteration:
+                frame.entries.close()
+                if frame.name is None:
+                    os.close(frame.descriptor)
+                    stack.pop()
+                    continue
+                if delete:
+                    budget.check_deadline()
+                    _verify_relative_identity(
+                        frame.parent_descriptor,
+                        frame.name,
+                        frame.identity,
+                        f"directory identity mismatch before removal: {frame.name}",
+                    )
+                os.close(frame.descriptor)
+                stack.pop()
+                if delete:
+                    budget.check_deadline()
+                    os.rmdir(frame.name, dir_fd=frame.parent_descriptor)
+                continue
+            child_depth = frame.depth + 1
+            budget.observe_entry(depth=child_depth)
+            budget.check_deadline()
+            child_status = os.stat(
+                entry.name,
+                dir_fd=frame.descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(child_status.st_mode):
+                child_identity = _status_identity(child_status)
+                child_descriptor, verified_status = _open_verified_relative_directory(
+                    frame.descriptor,
+                    entry.name,
+                    child_identity,
+                    expected_device=root_identity[0],
+                    budget=budget,
+                )
+                try:
+                    budget.check_deadline()
+                    child_entries = os.scandir(child_descriptor)
+                except BaseException:
+                    os.close(child_descriptor)
+                    raise
+                stack.append(
+                    _CleanupFrame(
+                        child_descriptor,
+                        child_entries,
+                        child_depth,
+                        entry.name,
+                        _status_identity(verified_status),
+                        frame.descriptor,
+                    )
+                )
+                continue
+            if delete:
+                budget.check_deadline()
+                os.unlink(entry.name, dir_fd=frame.descriptor)
+    finally:
+        for frame in reversed(stack):
+            try:
+                frame.entries.close()
+            except BaseException:
+                pass
+            try:
+                os.close(frame.descriptor)
+            except BaseException:
+                pass
+
+
+def _open_verified_parent(run_directory: _RunDirectory) -> int:
+    parent_identity = run_directory.parent_identity
+    if parent_identity is None:
+        raise _CleanupFailure("unsafe_tree", "run directory parent identity is unavailable")
+    descriptor = os.open(run_directory.path.parent, _secure_directory_open_flags())
     try:
         os.set_inheritable(descriptor, False)
-        identity = _status_identity(os.fstat(descriptor))
+        if _status_identity(os.fstat(descriptor)) != parent_identity:
+            raise _CleanupFailure("unsafe_tree", "run directory parent identity mismatch")
     except BaseException:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException:
+            pass
         raise
-    if identity != run_directory.identity:
-        os.close(descriptor)
-        raise OSError("run directory identity mismatch")
     return descriptor
 
 
-def _retain_open_run_directory(
-    function: Callable[..., object],
-    path: str,
-    error: BaseException,
+def _open_verified_relative_directory(
+    parent_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    expected_device: int,
+    budget: _CleanupBudget,
+) -> tuple[int, os.stat_result]:
+    budget.check_deadline()
+    try:
+        descriptor = os.open(
+            name,
+            _secure_directory_open_flags(),
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        kind: CleanupFailureKind = (
+            "unsafe_tree"
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}
+            else "io_failed"
+        )
+        raise _CleanupFailure(
+            kind,
+            f"could not safely open directory {name}: {type(error).__name__}: {error}",
+        ) from error
+    try:
+        os.set_inheritable(descriptor, False)
+        budget.check_deadline()
+        file_status = os.fstat(descriptor)
+        if file_status.st_dev != expected_device:
+            raise _CleanupFailure("unsafe_tree", f"cross-device directory rejected: {name}")
+        if _status_identity(file_status) != identity:
+            raise _CleanupFailure("unsafe_tree", f"directory identity mismatch: {name}")
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except BaseException:
+            pass
+        raise
+    return descriptor, file_status
+
+
+def _verify_relative_identity(
+    parent_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+    message: str,
 ) -> None:
-    if function is os.rmdir and path == "." and isinstance(error, OSError):
-        if error.errno == errno.EINVAL:
-            return
-    if isinstance(error, OSError):
-        raise _RecursiveCleanupFailure(error)
-    raise error
+    file_status = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if _status_identity(file_status) != identity or not stat.S_ISDIR(file_status.st_mode):
+        raise _CleanupFailure("unsafe_tree", message)
+
+
+def _verified_retained_path(
+    run_directory: _RunDirectory,
+    parent_descriptor: int | None,
+) -> Path | None:
+    if parent_descriptor is None:
+        return None
+    try:
+        file_status = os.stat(
+            run_directory.path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return None
+    if (
+        _status_identity(file_status) != run_directory.identity
+        or not stat.S_ISDIR(file_status.st_mode)
+    ):
+        return None
+    return run_directory.path
+
+
+def _secure_directory_open_flags() -> int:
+    directory_only = cast(int, getattr(os, "O_DIRECTORY"))
+    no_follow = cast(int, getattr(os, "O_NOFOLLOW"))
+    non_blocking = cast(int, getattr(os, "O_NONBLOCK"))
+    return os.O_RDONLY | directory_only | no_follow | non_blocking
+
+
+def _cleanup_diagnostic(observation: _CleanupObservation) -> str:
+    diagnostic = observation.message
+    if observation.retained_path is not None:
+        diagnostic = f"{diagnostic}; retained path: {observation.retained_path}"
+    return diagnostic
 
 
 def _remove_empty_created_run_directory(
@@ -551,20 +884,13 @@ class _BoundedReadError(OSError):
     """Raised when a regular evidence file exceeds its byte budget."""
 
 
-class _RecursiveCleanupFailure(Exception):
-    """Carry an inner cleanup error past shutil's root-path error rewriting."""
-
-    def __init__(self, error: OSError) -> None:
-        super().__init__(str(error))
-        self.error = error
-
-
 def _read_regular_file(path: Path, *, max_bytes: int) -> bytes:
     no_follow = getattr(os, "O_NOFOLLOW", None)
-    if type(no_follow) is not int:
+    non_blocking = getattr(os, "O_NONBLOCK", None)
+    if type(no_follow) is not int or type(non_blocking) is not int:
         raise _UnsafePathError("safe no-follow file opening is unavailable")
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow)
+        descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise _UnsafePathError(f"path is not a regular file: {path.name}") from error
@@ -613,20 +939,30 @@ def _load_bounded_json(content: bytes) -> object:
         elif byte in {ord("}"), ord("]")}:
             depth -= 1
     try:
-        return json.loads(content)
+        return json.loads(content, parse_constant=_reject_json_constant)
     except RecursionError as error:
         raise ValueError("JSON parsing exceeded the recursion limit") from error
+
+
+def _reject_json_constant(constant: str) -> Never:
+    raise ValueError(f"JSON constant {constant} is not permitted")
 
 
 def _platform_capability_error() -> str | None:
     if (
         type(getattr(os, "O_NOFOLLOW", None)) is not int
         or type(getattr(os, "O_DIRECTORY", None)) is not int
-        or shutil.rmtree.avoids_symlink_attacks is not True
+        or type(getattr(os, "O_NONBLOCK", None)) is not int
+        or not _SCANDIR_SUPPORTS_FD
+        or not _OPEN_SUPPORTS_DIR_FD
+        or not _STAT_SUPPORTS_DIR_FD
+        or not _STAT_SUPPORTS_FOLLOW_SYMLINKS
+        or not _UNLINK_SUPPORTS_DIR_FD
+        or not _RMDIR_SUPPORTS_DIR_FD
     ):
         return (
             "Structured pytest evidence requires descriptor-safe no-follow file opening "
-            "and symlink-safe descriptor-relative recursive removal."
+            "and bounded descriptor-relative recursive removal."
         )
     return None
 

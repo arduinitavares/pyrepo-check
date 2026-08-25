@@ -1500,7 +1500,12 @@ def _pytest_check_error(
     if result.error.code == "not_started":
         return CheckError("missing_primary_process", "No primary process observation was recorded.")
     if result.error.code == "spawn_failed":
-        return CheckError("spawn_failed", f"Could not start pytest: {result.error.message}")
+        prefix = (
+            "Pytest execution failed"
+            if _process_started_before_failure(result.error.message)
+            else "Could not start pytest"
+        )
+        return CheckError("spawn_failed", f"{prefix}: {result.error.message}")
     if result.error.code == "terminated_by_signal":
         return CheckError("terminated_by_signal", result.error.message)
     if result.error.code in {
@@ -1525,7 +1530,12 @@ def _build_process_result(
         signal = None
         status: CheckStatus = "error"
         error_message = observation.spawn_error or "Process failed to spawn."
-        error = CheckError("spawn_failed", f"Could not start process: {error_message}")
+        prefix = (
+            "Process execution failed"
+            if _process_started_before_failure(error_message)
+            else "Could not start process"
+        )
+        error = CheckError("spawn_failed", f"{prefix}: {error_message}")
     elif returncode < 0:
         outcome = "signaled"
         exit_code = None
@@ -1559,6 +1569,20 @@ def _build_process_result(
         ),
         status,
         error,
+    )
+
+
+def _process_started_before_failure(diagnostic: str) -> bool:
+    return diagnostic.startswith(
+        (
+            "stdout reader construction failed:",
+            "stderr reader construction failed:",
+            "stdout reader start failed:",
+            "stderr reader start failed:",
+            "stdout drain failed:",
+            "stderr drain failed:",
+            "wait failed:",
+        )
     )
 
 

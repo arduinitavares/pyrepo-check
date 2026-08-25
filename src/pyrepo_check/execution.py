@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import io
 from pathlib import Path
+import queue
 import shlex
 import subprocess  # nosec B404
 import threading
 import time
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from pyrepo_check.planning import PlannedCheck, RunPlan
 
@@ -23,6 +23,23 @@ ProcessRunner = Callable[
 
 CAPTURE_LIMIT_BYTES = 65_536
 _PIPE_READ_BYTES = 64 * 1024
+_FAILURE_CLEANUP_TIMEOUT_SECONDS = 0.2
+
+_ExecutionFailurePhase = Literal[
+    "stdout reader construction",
+    "stderr reader construction",
+    "stdout reader start",
+    "stderr reader start",
+    "stdout drain",
+    "stderr drain",
+    "wait",
+]
+
+
+class _ReadablePipe(Protocol):
+    def readinto(self, buffer: bytearray | memoryview) -> int: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -50,6 +67,19 @@ class _TailAccumulator:
     def finish(self) -> CapturedBytes:
         tail = bytes(self._tail)
         return CapturedBytes(tail, self._total_bytes - len(tail))
+
+
+@dataclass(frozen=True)
+class _ReaderResult:
+    stream: Literal["stdout", "stderr"]
+    error: BaseException | None
+
+
+class _ProcessExecutionFailure(Exception):
+    def __init__(self, phase: _ExecutionFailurePhase, error: OSError | RuntimeError) -> None:
+        super().__init__(f"{phase} failed: {type(error).__name__}: {error}")
+        self.phase = phase
+        self.error = error
 
 
 @dataclass(frozen=True)
@@ -183,6 +213,8 @@ def execute_process(
                 stderr = _normalize_buffered_output(
                     cast(bytes | str | None, completed.stderr)
                 )
+    except _ProcessExecutionFailure as error:
+        spawn_error = str(error)
     except OSError as error:
         spawn_error = f"{type(error).__name__}: {error}"
     if started_ns is None:
@@ -218,34 +250,129 @@ def _run_bounded_process(
 
     stdout_accumulator = _TailAccumulator()
     stderr_accumulator = _TailAccumulator()
-    stdout_thread = threading.Thread(
-        target=_drain_pipe,
-        args=(process.stdout, stdout_accumulator),
-        name="pyrepo-check-stdout",
+    results: queue.SimpleQueue[_ReaderResult] = queue.SimpleQueue()
+    started_threads: list[threading.Thread] = []
+    streams: tuple[
+        tuple[Literal["stdout", "stderr"], _ReadablePipe | None, _TailAccumulator],
+        ...,
+    ] = (
+        ("stdout", cast(_ReadablePipe | None, process.stdout), stdout_accumulator),
+        ("stderr", cast(_ReadablePipe | None, process.stderr), stderr_accumulator),
     )
-    stderr_thread = threading.Thread(
-        target=_drain_pipe,
-        args=(process.stderr, stderr_accumulator),
-        name="pyrepo-check-stderr",
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    returncode = process.wait()
-    stdout_thread.join()
-    stderr_thread.join()
+    try:
+        for stream, pipe, accumulator in streams:
+            try:
+                reader = threading.Thread(
+                    target=_run_pipe_reader,
+                    args=(stream, pipe, accumulator, results),
+                    name=f"pyrepo-check-{stream}",
+                )
+            except (OSError, RuntimeError) as error:
+                raise _ProcessExecutionFailure(
+                    cast(_ExecutionFailurePhase, f"{stream} reader construction"),
+                    error,
+                ) from error
+            try:
+                reader.start()
+            except (OSError, RuntimeError) as error:
+                raise _ProcessExecutionFailure(
+                    cast(_ExecutionFailurePhase, f"{stream} reader start"),
+                    error,
+                ) from error
+            started_threads.append(reader)
+
+        for _ in streams:
+            result = results.get()
+            if result.error is None:
+                continue
+            if isinstance(result.error, (OSError, RuntimeError)):
+                raise _ProcessExecutionFailure(
+                    cast(_ExecutionFailurePhase, f"{result.stream} drain"),
+                    result.error,
+                ) from result.error
+            raise result.error
+        for reader in started_threads:
+            reader.join()
+        try:
+            returncode = process.wait()
+        except (OSError, RuntimeError) as error:
+            raise _ProcessExecutionFailure("wait", error) from error
+    except BaseException:
+        _cleanup_failed_process(process, streams, started_threads)
+        raise
     return returncode, stdout_accumulator.finish(), stderr_accumulator.finish()
 
 
+def _run_pipe_reader(
+    stream: Literal["stdout", "stderr"],
+    pipe: _ReadablePipe | None,
+    accumulator: _TailAccumulator,
+    results: queue.SimpleQueue[_ReaderResult],
+) -> None:
+    error: BaseException | None = None
+    try:
+        _drain_pipe(pipe, accumulator)
+    except BaseException as caught:
+        error = caught
+    finally:
+        if pipe is not None:
+            try:
+                pipe.close()
+            except BaseException as caught:
+                if error is None:
+                    error = caught
+        results.put(_ReaderResult(stream, error))
+
+
+def _cleanup_failed_process(
+    process: subprocess.Popen[bytes],
+    streams: tuple[
+        tuple[Literal["stdout", "stderr"], _ReadablePipe | None, _TailAccumulator],
+        ...,
+    ],
+    started_threads: list[threading.Thread],
+) -> None:
+    reaped = False
+    try:
+        process.terminate()
+    except BaseException:
+        pass
+    try:
+        process.wait(timeout=_FAILURE_CLEANUP_TIMEOUT_SECONDS)
+        reaped = True
+    except BaseException:
+        pass
+    if not reaped:
+        try:
+            process.kill()
+        except BaseException:
+            pass
+        try:
+            process.wait(timeout=_FAILURE_CLEANUP_TIMEOUT_SECONDS)
+        except BaseException:
+            pass
+    for _stream, pipe, _accumulator in streams:
+        if pipe is not None:
+            try:
+                pipe.close()
+            except BaseException:
+                pass
+    for reader in started_threads:
+        try:
+            reader.join(timeout=_FAILURE_CLEANUP_TIMEOUT_SECONDS)
+        except BaseException:
+            pass
+
+
 def _drain_pipe(
-    pipe: io.BufferedReader | None,
+    pipe: _ReadablePipe | None,
     accumulator: _TailAccumulator,
 ) -> None:
     if pipe is None:
         return
     read_buffer = bytearray(_PIPE_READ_BYTES)
-    with pipe:
-        while (read_bytes := pipe.readinto(read_buffer)) != 0:
-            accumulator.feed(memoryview(read_buffer)[:read_bytes])
+    while (read_bytes := pipe.readinto(read_buffer)) != 0:
+        accumulator.feed(memoryview(read_buffer)[:read_bytes])
 
 
 def _normalize_buffered_output(output: bytes | str | None) -> CapturedBytes:

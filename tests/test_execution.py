@@ -5,9 +5,13 @@ from pathlib import Path
 import subprocess  # nosec B404
 import sys
 import signal
+import threading
+import tracemalloc
+from collections.abc import Callable
 
 import pytest
 
+from pyrepo_check import execution
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
@@ -77,6 +81,120 @@ def make_python_check_plan(tmp_path: Path, source: str) -> RunPlan:
     )
 
 
+class _VirtualPipe:
+    def __init__(
+        self,
+        total_bytes: int,
+        byte: int,
+        *,
+        barrier: threading.Barrier | None = None,
+        fail_after_reads: int | None = None,
+        blocked_after_failure: threading.Event | None = None,
+    ) -> None:
+        self.total_bytes = total_bytes
+        self.byte = byte
+        self.barrier = barrier
+        self.fail_after_reads = fail_after_reads
+        self.blocked_after_failure = blocked_after_failure
+        self.reads = 0
+        self.offset = 0
+        self.reader_ident: int | None = None
+        self.closed_by_reader = False
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        if self.reader_ident is None:
+            self.reader_ident = threading.get_ident()
+            if self.barrier is not None:
+                self.barrier.wait(timeout=1)
+        self.reads += 1
+        if self.fail_after_reads is not None and self.reads > self.fail_after_reads:
+            raise OSError("synthetic drain failure")
+        if self.blocked_after_failure is not None:
+            self.blocked_after_failure.wait(timeout=2)
+        remaining = self.total_bytes - self.offset
+        if remaining <= 0:
+            return 0
+        count = min(len(buffer), remaining)
+        buffer[:count] = bytes((self.byte,)) * count
+        self.offset += count
+        return count
+
+    def close(self) -> None:
+        self.closed_by_reader = True
+        if self.blocked_after_failure is not None:
+            self.blocked_after_failure.set()
+
+
+class _FakePopen:
+    def __init__(
+        self,
+        stdout: _VirtualPipe,
+        stderr: _VirtualPipe,
+        *,
+        returncode: int = 0,
+        wait_release: threading.Event | None = None,
+        cleanup_errors: bool = False,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.wait_release = wait_release
+        self.cleanup_errors = cleanup_errors
+        self.wait_calls: list[float | None] = []
+        self.terminated = False
+        self.killed = False
+
+    def communicate(self, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError("communicate must not buffer captured output")
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        effective_timeout = 2.0 if timeout is None else timeout
+        if self.wait_release is not None and not self.wait_release.wait(
+            timeout=effective_timeout
+        ):
+            raise subprocess.TimeoutExpired(("fake",), effective_timeout)
+        if self.cleanup_errors and timeout is not None:
+            raise OSError("synthetic cleanup wait failure")
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        if self.cleanup_errors:
+            raise OSError("synthetic terminate failure")
+        if self.wait_release is not None:
+            self.wait_release.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        if self.cleanup_errors:
+            raise OSError("synthetic kill failure")
+        if self.wait_release is not None:
+            self.wait_release.set()
+
+
+def _install_fake_popen(
+    monkeypatch: pytest.MonkeyPatch,
+    processes: list[_FakePopen],
+) -> None:
+    remaining = iter(processes)
+
+    def fake_popen(*_args: object, **kwargs: object) -> _FakePopen:
+        assert kwargs["stdout"] is subprocess.PIPE
+        assert kwargs["stderr"] is subprocess.PIPE
+        assert "text" not in kwargs and "encoding" not in kwargs
+        return next(remaining)
+
+    monkeypatch.setattr(execution.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        execution.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("subprocess.run must not buffer captured output")
+        ),
+    )
+
+
 def test_production_capture_drains_both_pipes_and_retains_exact_raw_tails(
     tmp_path: Path,
 ) -> None:
@@ -102,6 +220,269 @@ def test_production_capture_drains_both_pipes_and_retains_exact_raw_tails(
         tail=b"D" * CAPTURE_LIMIT_BYTES,
         omitted_bytes=stderr_size - CAPTURE_LIMIT_BYTES,
     )
+
+
+def test_capture_uses_concurrent_distinct_readers_and_exact_bounded_tails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    barrier = threading.Barrier(2)
+    stdout = _VirtualPipe(CAPTURE_LIMIT_BYTES + 11, ord("o"), barrier=barrier)
+    stderr = _VirtualPipe(CAPTURE_LIMIT_BYTES + 17, ord("e"), barrier=barrier)
+    process = _FakePopen(stdout, stderr)
+    _install_fake_popen(monkeypatch, [process])
+
+    result = execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+
+    captured = result.checks[0].processes[0]
+    assert stdout.reader_ident not in {None, threading.get_ident()}
+    assert stderr.reader_ident not in {None, threading.get_ident(), stdout.reader_ident}
+    assert captured.stdout == CapturedBytes(b"o" * CAPTURE_LIMIT_BYTES, 11)
+    assert captured.stderr == CapturedBytes(b"e" * CAPTURE_LIMIT_BYTES, 17)
+    assert stdout.closed_by_reader and stderr.closed_by_reader
+
+
+def test_capture_streams_virtual_multimegabyte_output_with_bounded_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    total_bytes = 24 * 1024 * 1024
+    accumulators: list[execution._TailAccumulator] = []
+    accumulator_type = execution._TailAccumulator
+
+    def make_accumulator() -> execution._TailAccumulator:
+        accumulator = accumulator_type()
+        accumulators.append(accumulator)
+        return accumulator
+
+    process = _FakePopen(
+        _VirtualPipe(total_bytes, ord("x")),
+        _VirtualPipe(total_bytes, ord("y")),
+    )
+    _install_fake_popen(monkeypatch, [process])
+    monkeypatch.setattr(execution, "_TailAccumulator", make_accumulator)
+
+    tracemalloc.start()
+    try:
+        result = execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    captured = result.checks[0].processes[0]
+    assert len(accumulators) == 2
+    assert peak_bytes < 4 * 1024 * 1024
+    assert captured.stdout == CapturedBytes(b"x" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES)
+    assert captured.stderr == CapturedBytes(b"y" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES)
+
+
+def test_stdout_drain_error_becomes_typed_process_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakePopen(
+        _VirtualPipe(1, ord("x"), fail_after_reads=0),
+        _VirtualPipe(0, ord("y")),
+    )
+    _install_fake_popen(monkeypatch, [process])
+
+    result = execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+
+    captured = result.checks[0].processes[0]
+    assert captured.returncode is None
+    assert captured.stdout is None and captured.stderr is None
+    assert captured.spawn_error == "stdout drain failed: OSError: synthetic drain failure"
+    assert result.exit_code == 2
+
+
+def test_drain_error_aborts_before_blocking_wait_and_reaps_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait_release = threading.Event()
+    stderr = _VirtualPipe(
+        32 * 1024 * 1024,
+        ord("y"),
+        blocked_after_failure=wait_release,
+    )
+    process = _FakePopen(
+        _VirtualPipe(1, ord("x"), fail_after_reads=0),
+        stderr,
+        wait_release=wait_release,
+    )
+    _install_fake_popen(monkeypatch, [process])
+    completed = threading.Event()
+    result_holder: list[ExecutionResult] = []
+
+    def invoke() -> None:
+        result_holder.append(
+            execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+        )
+        completed.set()
+
+    watchdog = threading.Thread(target=invoke)
+    watchdog.start()
+    try:
+        assert completed.wait(timeout=1), "capture failure hung before child cleanup"
+    finally:
+        wait_release.set()
+        watchdog.join(timeout=1)
+
+    assert not watchdog.is_alive()
+    assert process.terminated
+    assert process.wait_calls and process.wait_calls[0] is not None
+    assert result_holder[0].checks[0].processes[0].returncode is None
+
+
+def test_second_reader_start_failure_closes_and_reaps_without_masking_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = _VirtualPipe(0, ord("x"))
+    stderr = _VirtualPipe(0, ord("y"))
+    process = _FakePopen(stdout, stderr, cleanup_errors=True)
+    _install_fake_popen(monkeypatch, [process])
+    real_thread = threading.Thread
+    created_threads: list[threading.Thread] = []
+    start_calls = 0
+
+    class FailSecondStartThread(real_thread):
+        def __init__(
+            self,
+            *,
+            target: Callable[..., object] | None = None,
+            args: tuple[object, ...] = (),
+            name: str | None = None,
+        ) -> None:
+            super().__init__(target=target, args=args, name=name)
+            created_threads.append(self)
+
+        def start(self) -> None:
+            nonlocal start_calls
+            start_calls += 1
+            if start_calls == 2:
+                raise RuntimeError("synthetic stderr reader start failure")
+            super().start()
+
+    monkeypatch.setattr(execution.threading, "Thread", FailSecondStartThread)
+
+    result = execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+
+    captured = result.checks[0].processes[0]
+    assert captured.returncode is None
+    assert captured.spawn_error == (
+        "stderr reader start failed: RuntimeError: synthetic stderr reader start failure"
+    )
+    assert stdout.closed_by_reader and stderr.closed_by_reader
+    assert len(created_threads) == 2
+    assert not created_threads[0].is_alive()
+    assert created_threads[1].ident is None
+    assert process.terminated and process.killed
+
+
+def test_second_reader_construction_failure_is_typed_and_reaps_first_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = _VirtualPipe(0, ord("x"))
+    stderr = _VirtualPipe(0, ord("y"))
+    process = _FakePopen(stdout, stderr)
+    _install_fake_popen(monkeypatch, [process])
+    real_thread = threading.Thread
+    constructions = 0
+
+    def construct_thread(
+        *,
+        target: Callable[..., object] | None = None,
+        args: tuple[object, ...] = (),
+        name: str | None = None,
+    ) -> threading.Thread:
+        nonlocal constructions
+        constructions += 1
+        if constructions == 2:
+            raise RuntimeError("synthetic stderr reader construction failure")
+        return real_thread(target=target, args=args, name=name)
+
+    monkeypatch.setattr(execution.threading, "Thread", construct_thread)
+
+    result = execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+
+    captured = result.checks[0].processes[0]
+    assert captured.returncode is None
+    assert captured.spawn_error == (
+        "stderr reader construction failed: RuntimeError: "
+        "synthetic stderr reader construction failure"
+    )
+    assert process.terminated
+    assert stdout.closed_by_reader and stderr.closed_by_reader
+
+
+def test_wait_failure_is_typed_after_both_readers_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WaitFailurePopen(_FakePopen):
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            if timeout is None:
+                assert self.stdout.closed_by_reader and self.stderr.closed_by_reader
+                raise OSError("synthetic wait failure")
+            return 0
+
+    process = WaitFailurePopen(_VirtualPipe(0, ord("x")), _VirtualPipe(0, ord("y")))
+    _install_fake_popen(monkeypatch, [process])
+
+    result = execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+
+    captured = result.checks[0].processes[0]
+    assert captured.returncode is None
+    assert captured.spawn_error == "wait failed: OSError: synthetic wait failure"
+    assert process.terminated
+    assert process.wait_calls == [None, execution._FAILURE_CLEANUP_TIMEOUT_SECONDS]
+
+
+def test_unexpected_reader_programming_error_cleans_up_then_reraises_by_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = ValueError("synthetic reader bug")
+
+    class ProgrammingFailurePipe(_VirtualPipe):
+        def readinto(self, buffer: bytearray | memoryview) -> int:
+            del buffer
+            raise error
+
+    stdout = ProgrammingFailurePipe(0, ord("x"))
+    stderr = _VirtualPipe(0, ord("y"))
+    process = _FakePopen(stdout, stderr)
+    _install_fake_popen(monkeypatch, [process])
+
+    with pytest.raises(ValueError) as raised:
+        execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
+
+    assert raised.value is error
+    assert process.terminated
+    assert stdout.closed_by_reader and stderr.closed_by_reader
+
+
+def test_capture_failure_continues_and_later_positive_exit_still_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed = _FakePopen(
+        _VirtualPipe(1, ord("x"), fail_after_reads=0),
+        _VirtualPipe(0, ord("y")),
+    )
+    later = _FakePopen(_VirtualPipe(0, ord("x")), _VirtualPipe(0, ord("y")), returncode=7)
+    _install_fake_popen(monkeypatch, [failed, later])
+
+    result = execute_plan(make_json_plan(tmp_path), runner=None)
+
+    assert tuple(check.processes[0].returncode for check in result.checks) == (None, 7)
+    assert result.checks[0].processes[0].spawn_error == (
+        "stdout drain failed: OSError: synthetic drain failure"
+    )
+    assert result.exit_code == 7
 
 
 def test_injected_buffered_runner_output_is_normalized_immediately(

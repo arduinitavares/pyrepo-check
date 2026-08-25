@@ -566,9 +566,32 @@ runs never reuse or broadly scavenge it. No cleanup operation may target the
 consumer root, a glob, or a directory not created by the current invocation.
 
 Structured pytest evidence requires descriptor-safe no-follow file opening and
-symlink-safe descriptor-relative recursive removal. Unsupported platforms fail
-closed before pytest starts; pyrepo-check does not fall back to path-based
-cleanup.
+bounded descriptor-relative recursive removal. Platform preflight requires
+integer `O_DIRECTORY`, `O_NOFOLLOW`, and `O_NONBLOCK` flags; fd-based
+`scandir`; descriptor-relative `open`, `stat`, `unlink`, and `rmdir`; and
+`stat(..., follow_symlinks=False)`. Unsupported platforms fail closed before
+temporary-directory creation or process spawn; pyrepo-check has no path-based
+cleanup fallback.
+
+The run-directory record includes both the run directory's device/inode and
+its verified parent's device/inode. Cleanup opens the parent first, opens the
+run basename relative to that descriptor, and uses two iterative streaming DFS
+passes. The first pass validates the complete tree without deletion. The
+second pass unlinks leaves and removes verified directories postorder. Each
+pass accepts exactly 4,096 non-root entries and depth 64 with root at depth 0;
+the whole cleanup shares a five-second monotonic deadline. Deadline checks run
+between system calls because one in-progress kernel call cannot be interrupted.
+Directories must retain their no-follow stat/open identity and root device;
+symlinks and non-directories are descriptor-relative leaves. Final root removal
+is `rmdir(run_basename, dir_fd=verified_parent_fd)`.
+
+Budget, unsafe-tree, and I/O failures project to the existing public
+`cleanup_failed` code while preserving any otherwise valid `PytestResult`.
+The diagnostic includes the exact retained path only after revalidating the
+recorded root identity through the parent descriptor. Validation-pass failure
+leaves the tree untouched. A race or I/O failure during the deletion pass may
+leave that verified root partially emptied; cleanup never retries or traverses
+a replacement.
 
 ## Agent Report contract
 
@@ -1158,10 +1181,13 @@ identifies every truncated stream.
 Pytest artifact snapshots are limited to 128 MiB, writer-marker snapshots to
 4 KiB, JSON object/array nesting to 64 levels, and writer-directory inventories
 to 1,024 entries. Regular evidence files are opened without following symlinks,
-validated as regular files by descriptor, rejected from metadata when already
-oversized, and read in 64 KiB chunks up to one byte beyond the cap so growth
-after metadata validation also fails closed. Writer inventories stream through
-the directory, retain at most one marker candidate, and stop as soon as a
+with nonblocking reads, validated as regular files by descriptor, rejected from
+metadata when already oversized, and read in 64 KiB chunks up to one byte
+beyond the cap so growth after metadata validation also fails closed. FIFO and
+other non-regular paths therefore fail without waiting for a peer. JSON rejects
+`NaN`, `Infinity`, and `-Infinity`, including values in otherwise ignored
+metadata. Writer inventories stream through the directory, retain at most one
+validated marker candidate across iteration errors, and stop as soon as a
 second marker proves the evidence invalid.
 
 Array order is normative:

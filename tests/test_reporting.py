@@ -286,6 +286,53 @@ def test_json_spawn_failure_streams_are_captured_empty(tmp_path: Path) -> None:
     assert process.stderr == CapturedText(True, "", False, 0)
 
 
+def test_capture_failure_projects_existing_code_without_false_spawn_wording(
+    tmp_path: Path,
+) -> None:
+    check = planned_check(tmp_path, "ruff")
+    diagnostic = "stdout drain failed: OSError: synthetic drain failure"
+    observation = executed_check(
+        check,
+        None,
+        stdout=None,
+        stderr=None,
+        spawn_error=diagnostic,
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), output_format="json"),
+        ExecutionResult((observation,), 2),
+    )
+
+    assert report.checks[0].processes[0].outcome == "spawn_failed"
+    assert report.checks[0].error == CheckError(
+        "spawn_failed", f"Process execution failed: {diagnostic}"
+    )
+    assert validate_report_v1(report) is None
+
+
+def test_pytest_capture_failure_does_not_claim_pytest_never_started(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    diagnostic = "stderr drain failed: OSError: synthetic drain failure"
+    observation = executed_check(check, None, spawn_error=diagnostic)
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult((observation,), 2),
+    )
+
+    assert report.pytest is not None
+    assert report.pytest.error == PytestError("spawn_failed", diagnostic)
+    assert report.checks[0].error == CheckError(
+        "spawn_failed", f"Pytest execution failed: {diagnostic}"
+    )
+    assert validate_report_v1(report) is None
+
+
 @pytest.mark.parametrize(
     ("returncode", "status", "complete", "overall_status"),
     (

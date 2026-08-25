@@ -349,7 +349,7 @@ def test_artifact_json_nesting_64_is_valid_and_65_is_typed_invalid(
 def test_artifact_json_recursion_error_is_typed_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def recurse(_content: bytes) -> object:
+    def recurse(_content: bytes, **_kwargs: object) -> object:
         raise RecursionError("too deep")
 
     monkeypatch.setattr("pyrepo_check.pytest_execution.json.loads", recurse)
@@ -515,6 +515,61 @@ def test_finalized_artifact_observation_failures_are_invalid(state: ArtifactStat
 
     assert isinstance(result, PytestValidationFailure)
     assert result.code == "artifact_invalid"
+
+
+@pytest.mark.parametrize(
+    ("state", "diagnostic"),
+    (
+        ("unsafe_path", "path is not a regular file: artifact.json"),
+        ("read_failed", "artifact read failed: Permission denied"),
+    ),
+)
+def test_artifact_observation_failure_preserves_exact_diagnostic(
+    state: ArtifactState,
+    diagnostic: str,
+) -> None:
+    check = _check()
+    assert check.pytest is not None
+    result = validate_pytest_execution(
+        replace(
+            check,
+            pytest=replace(
+                check.pytest,
+                artifact=replace(
+                    check.pytest.artifact,
+                    state=state,
+                    content=None,
+                    diagnostic=diagnostic,
+                ),
+            ),
+        )
+    )
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == "artifact_invalid"
+    assert result.message == diagnostic
+
+
+@pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))
+def test_artifact_rejects_non_finite_ignored_metadata(constant: str) -> None:
+    check = _check()
+    assert check.pytest is not None
+    content = check.pytest.artifact.content
+    assert content is not None
+    injected = content[:-1] + f',"ignored":{constant}}}'.encode()
+    check = replace(
+        check,
+        pytest=replace(
+            check.pytest,
+            artifact=replace(check.pytest.artifact, content=injected),
+        ),
+    )
+
+    result = validate_pytest_execution(check)
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == "artifact_invalid"
+    assert result.message == "pytest artifact is not valid JSON"
 
 
 def test_expected_failure_shape_beats_parallelism_and_repeated_reports_are_retries() -> None:

@@ -186,7 +186,12 @@ def validate_pytest_execution(
     if artifact.state == "missing":
         return _failure("artifact_missing", "pytest artifact is missing", pytest_version, primary.returncode)
     if artifact.state != "snapshot" or artifact.content is None:
-        return _failure("artifact_invalid", "pytest artifact snapshot is invalid", pytest_version, primary.returncode)
+        return _failure(
+            "artifact_invalid",
+            artifact.diagnostic or "pytest artifact snapshot is invalid",
+            pytest_version,
+            primary.returncode,
+        )
     try:
         loaded_document = _load_bounded_json(artifact.content)
     except (UnicodeDecodeError, ValueError):
