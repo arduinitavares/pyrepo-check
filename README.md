@@ -149,6 +149,17 @@ The CLI keeps the first positive tool exit code in planned execution order.
 Checks continue after ordinary failures. If execution has only spawn or
 signal errors, the CLI returns `2`.
 
+Captured process streams retain only their final 65,536 raw bytes. Production
+capture drains stdout and stderr concurrently with bounded tail buffers;
+injected test runners are outside that production memory guarantee. Structured
+pytest artifacts and writer markers also have fixed read, nesting, and
+directory-inventory limits.
+
+Structured pytest evidence requires descriptor-safe no-follow file opening and
+symlink-safe descriptor-relative recursive removal. Unsupported platforms fail
+closed before pytest starts; pyrepo-check does not fall back to path-based
+cleanup.
+
 ## Project Configuration
 
 Each project can optionally configure focused-check paths in its

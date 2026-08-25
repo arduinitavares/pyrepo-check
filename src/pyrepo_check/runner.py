@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess  # nosec B404
 from typing import cast
 
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.execution import execute_plan
+from pyrepo_check.execution import ProcessRunner, execute_plan
 from pyrepo_check.planning import (
     CHECK_ORDER as CHECK_ORDER,
     SELECTABLE_CHECK_ORDER as SELECTABLE_CHECK_ORDER,
@@ -60,7 +59,7 @@ def run_checks(
     checks: Sequence[Check],
     *,
     cwd: Path,
-    runner: Callable[..., subprocess.CompletedProcess[tuple[str, ...]]] = subprocess.run,
+    runner: ProcessRunner | None = None,
 ) -> int:
     prepared = tuple(
         PlannedCheck(

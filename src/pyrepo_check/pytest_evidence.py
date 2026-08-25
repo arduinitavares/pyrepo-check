@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
-import json
 import math
 from types import MappingProxyType
 from typing import Literal, cast
 
 from pyrepo_check.execution import ExecutedCheck, ExecutedProcess
 from pyrepo_check.planning import RunPlan
+from pyrepo_check.pytest_execution import _load_bounded_json
 
 
 PytestErrorCode = Literal[
@@ -188,11 +188,12 @@ def validate_pytest_execution(
     if artifact.state != "snapshot" or artifact.content is None:
         return _failure("artifact_invalid", "pytest artifact snapshot is invalid", pytest_version, primary.returncode)
     try:
-        document = json.loads(artifact.content)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        loaded_document = _load_bounded_json(artifact.content)
+    except (UnicodeDecodeError, ValueError):
         return _failure("artifact_invalid", "pytest artifact is not valid JSON", pytest_version, primary.returncode)
-    if not isinstance(document, dict):
+    if not isinstance(loaded_document, dict):
         return _failure("artifact_invalid", "pytest artifact root must be an object", pytest_version, primary.returncode)
+    document = cast(dict[object, object], loaded_document)
     try:
         state = _string(_required(document, "state"), "state")
     except _ArtifactInvalid as error:

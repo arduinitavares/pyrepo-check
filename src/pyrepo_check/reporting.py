@@ -7,7 +7,13 @@ import re
 from typing import Literal, cast
 
 from pyrepo_check.config import TEST_SHORTCUT_NAME_PATTERN
-from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult
+from pyrepo_check.execution import (
+    CAPTURE_LIMIT_BYTES,
+    CapturedBytes,
+    ExecutedCheck,
+    ExecutedProcess,
+    ExecutionResult,
+)
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
@@ -52,7 +58,6 @@ AdvisoryCode = Literal[
 ]
 
 
-CAPTURE_LIMIT_BYTES = 65_536
 _CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CHECK_NAMES = frozenset(("ruff", "annotations", "annotations-fix", "ty", "bandit", "pytest"))
 _B_CANONICAL_CHECK_ORDER: tuple[CheckName, ...] = (
@@ -1273,11 +1278,19 @@ def _validate_exact_int(value: object, field: str) -> int:
     return cast(int, value)
 
 
-def capture_text(raw: bytes) -> CapturedText:
-    retained = raw[-CAPTURE_LIMIT_BYTES:]
-    omitted = len(raw) - len(retained)
-    text = strip_terminal_sequences(retained.decode("utf-8", errors="replace"))
-    return CapturedText(True, text, omitted > 0, omitted)
+def capture_text(raw: CapturedBytes | bytes) -> CapturedText:
+    if isinstance(raw, bytes):
+        retained = raw[-CAPTURE_LIMIT_BYTES:]
+        captured = CapturedBytes(retained, len(raw) - len(retained))
+    else:
+        captured = raw
+    text = strip_terminal_sequences(captured.tail.decode("utf-8", errors="replace"))
+    return CapturedText(
+        True,
+        text,
+        captured.omitted_bytes > 0,
+        captured.omitted_bytes,
+    )
 
 
 def strip_terminal_sequences(text: str) -> str:
@@ -1550,7 +1563,7 @@ def _build_process_result(
 
 
 def _captured_stream(
-    raw: bytes | None,
+    raw: CapturedBytes | None,
     *,
     output_format: OutputFormat,
 ) -> CapturedText:

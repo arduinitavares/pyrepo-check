@@ -6,16 +6,241 @@ from pathlib import Path
 import shutil
 import subprocess  # nosec B404
 import tempfile
-from typing import cast
+from typing import Never, cast
 
 import pytest
 
-from pyrepo_check.execution import execute_plan
+from pyrepo_check.execution import CapturedBytes, execute_plan
 from pyrepo_check.planning import OutputFormat, PlannedCheck, PytestExecutionPlan, RunPlan
 import pyrepo_check.pytest_execution as pytest_execution
 from pyrepo_check.pytest_execution import execute_pytest
 from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
 from tests.support import RecordingRunner
+
+
+def test_stage_two_resource_limits_are_exact() -> None:
+    assert pytest_execution._MAX_ARTIFACT_BYTES == 128 * 1024 * 1024
+    assert pytest_execution._MAX_WRITER_MARKER_BYTES == 4 * 1024
+    assert pytest_execution._MAX_JSON_NESTING == 64
+    assert pytest_execution._MAX_WRITER_DIRECTORY_ENTRIES == 1024
+    assert pytest_execution._READ_CHUNK_BYTES == 64 * 1024
+
+
+@pytest.mark.parametrize(
+    ("limit", "filename"),
+    (
+        (128 * 1024 * 1024, "artifact.json"),
+        (4 * 1024, "pytest-writer-one.json"),
+    ),
+    ids=("artifact", "writer-marker"),
+)
+def test_secure_regular_file_reader_accepts_exact_cap_and_rejects_one_over(
+    tmp_path: Path,
+    limit: int,
+    filename: str,
+) -> None:
+    exact = tmp_path / filename
+    with exact.open("wb") as file:
+        file.truncate(limit)
+    assert len(pytest_execution._read_regular_file(exact, max_bytes=limit)) == limit
+
+    oversized = tmp_path / f"oversized-{filename}"
+    with oversized.open("wb") as file:
+        file.truncate(limit + 1)
+    with pytest.raises(pytest_execution._BoundedReadError, match="exceeds"):
+        pytest_execution._read_regular_file(oversized, max_bytes=limit)
+
+
+def test_sparse_oversized_file_is_rejected_before_any_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.json"
+    with artifact.open("wb") as file:
+        file.truncate(pytest_execution._MAX_ARTIFACT_BYTES + 1)
+
+    def forbidden_read(_descriptor: int, _size: int) -> bytes:
+        raise AssertionError("oversized sparse file must not be read")
+
+    monkeypatch.setattr(pytest_execution.os, "read", forbidden_read)
+    with pytest.raises(pytest_execution._BoundedReadError, match="exceeds"):
+        pytest_execution._read_regular_file(
+            artifact,
+            max_bytes=pytest_execution._MAX_ARTIFACT_BYTES,
+        )
+
+
+def test_regular_file_growth_after_fstat_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "marker.json"
+    marker.write_bytes(b"x" * pytest_execution._MAX_WRITER_MARKER_BYTES)
+    original_read = pytest_execution.os.read
+    grown = False
+
+    def grow_before_first_read(descriptor: int, size: int) -> bytes:
+        nonlocal grown
+        if not grown:
+            grown = True
+            with marker.open("ab") as file:
+                file.write(b"!")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(pytest_execution.os, "read", grow_before_first_read)
+    with pytest.raises(pytest_execution._BoundedReadError, match="exceeds"):
+        pytest_execution._read_regular_file(
+            marker,
+            max_bytes=pytest_execution._MAX_WRITER_MARKER_BYTES,
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "accepted"),
+    (
+        (b"[" * 64 + b"0" + b"]" * 64, True),
+        (b"[" * 65 + b"0" + b"]" * 65, False),
+        (b'{"value":"[[[\\\"{[]}\\\"]]]"}', True),
+    ),
+    ids=("depth-64", "depth-65", "braces-and-escapes-in-string"),
+)
+def test_json_nesting_limit_respects_strings_and_escapes(
+    payload: bytes,
+    accepted: bool,
+) -> None:
+    if accepted:
+        pytest_execution._load_bounded_json(payload)
+    else:
+        with pytest.raises(ValueError, match="nesting"):
+            pytest_execution._load_bounded_json(payload)
+
+
+def test_bounded_json_converts_recursion_error_to_invalid_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def recurse(_payload: bytes) -> object:
+        raise RecursionError("too deep")
+
+    monkeypatch.setattr(pytest_execution.json, "loads", recurse)
+    with pytest.raises(ValueError, match="recursion"):
+        pytest_execution._load_bounded_json(b"{}")
+
+
+@pytest.mark.parametrize("entry_count", (1024, 1025))
+def test_writer_directory_entry_cap_is_exact(
+    tmp_path: Path,
+    entry_count: int,
+) -> None:
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    for index in range(entry_count):
+        (writer_directory / f"unrelated-{index}").touch()
+
+    writer_ids, diagnostic = pytest_execution._snapshot_writer_ids(writer_directory)
+
+    assert writer_ids == ()
+    if entry_count == 1024:
+        assert diagnostic is None
+    else:
+        assert diagnostic is not None
+        assert "more than 1024 entries" in diagnostic
+
+
+def test_second_writer_marker_stops_before_reading_any_later_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    marker = b'{"schema_version":1,"writer_id":"%s","pid":1}'
+    for writer_id in ("one", "two", "three"):
+        (writer_directory / f"pytest-writer-{writer_id}.json").write_bytes(
+            marker % writer_id.encode()
+        )
+    loads = 0
+    original_load = pytest_execution._load_bounded_json
+
+    def count_loads(content: bytes) -> object:
+        nonlocal loads
+        loads += 1
+        return original_load(content)
+
+    monkeypatch.setattr(pytest_execution, "_load_bounded_json", count_loads)
+
+    writer_ids, diagnostic = pytest_execution._snapshot_writer_ids(writer_directory)
+
+    assert len(writer_ids) == 1
+    assert diagnostic == "multiple writer markers were found"
+    assert loads == 1
+
+
+@pytest.mark.parametrize("missing_capability", ("O_NOFOLLOW", "O_DIRECTORY", "rmtree"))
+def test_missing_platform_capability_fails_before_temp_or_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_capability: str,
+) -> None:
+    if missing_capability == "rmtree":
+        monkeypatch.setattr(pytest_execution.shutil.rmtree, "avoids_symlink_attacks", False)
+    else:
+        monkeypatch.setattr(pytest_execution.os, missing_capability, None)
+
+    def forbid_temp(_root: Path) -> Never:
+        raise AssertionError("temporary directory must not be created")
+
+    def forbid_spawn(*_args: object, **_kwargs: object) -> Never:
+        raise AssertionError("process must not spawn")
+
+    monkeypatch.setattr(
+        pytest_execution,
+        "_create_run_directory",
+        forbid_temp,
+    )
+
+    observation = execute_pytest(
+        pytest_check(tmp_path),
+        output_format="json",
+        runner=forbid_spawn,
+    )
+
+    assert observation.processes == ()
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "not_started"
+    assert "requires" in (observation.pytest.preflight.diagnostic or "")
+
+
+def test_preflight_rejects_a_normalized_omitted_tail_before_json_parse(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        nonlocal calls
+        del cwd, check, capture_output, env
+        calls += 1
+        return completed(
+            command,
+            0,
+            stdout=b"x" + b" " * (65_536 - len(preflight_document())) + preflight_document(),
+            stderr=b"",
+        )
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert calls == 1
+    assert observation.processes[0].stdout == CapturedBytes(
+        tail=b" " * (65_536 - len(preflight_document())) + preflight_document(),
+        omitted_bytes=1,
+    )
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "preflight_invalid"
 
 
 def pytest_check(tmp_path: Path) -> PlannedCheck:
@@ -362,7 +587,8 @@ def test_duplicate_simulated_primaries_fail_closed_with_multiple_writers(
     validation = validate_pytest_execution(observation)
 
     assert observation.pytest is not None
-    assert len(observation.pytest.artifact.writer_ids) == 2
+    assert len(observation.pytest.artifact.writer_ids) == 1
+    assert observation.pytest.artifact.diagnostic == "multiple writer markers were found"
     assert isinstance(validation, PytestValidationFailure)
     assert validation.code == "artifact_invalid"
 
@@ -434,7 +660,8 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
     assert observation.pytest is not None
     assert observation.pytest.artifact.state == "snapshot"
     assert observation.pytest.artifact.content == b'{"raw":true}'
-    assert observation.pytest.artifact.writer_ids == ("a", "z")
+    assert observation.pytest.artifact.writer_ids in {("a",), ("z",)}
+    assert observation.pytest.artifact.diagnostic == "multiple writer markers were found"
     assert observation.pytest.cleanup_error is None
     assert not run_directory.exists()
 
@@ -462,7 +689,7 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
                 ),
             },
             ("a", "b"),
-            None,
+            "multiple writer markers",
         ),
         ({"pytest-writer-bad.json": "not-json"}, (), "malformed"),
         (
@@ -511,7 +738,10 @@ def test_writer_inventory_records_only_regular_valid_markers(
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.state == "snapshot"
-    assert observation.pytest.artifact.writer_ids == writer_ids
+    if len(writer_ids) == 2:
+        assert observation.pytest.artifact.writer_ids in {(writer_ids[0],), (writer_ids[1],)}
+    else:
+        assert observation.pytest.artifact.writer_ids == writer_ids
     if diagnostic is None:
         assert observation.pytest.artifact.diagnostic is None
     else:

@@ -9,7 +9,14 @@ import pytest
 
 import pyrepo_check.pytest_execution as pytest_execution
 import pyrepo_check.reporting as reporting
-from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult, execute_plan
+from pyrepo_check.execution import (
+    CAPTURE_LIMIT_BYTES,
+    CapturedBytes,
+    ExecutedCheck,
+    ExecutedProcess,
+    ExecutionResult,
+    execute_plan,
+)
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
@@ -79,8 +86,8 @@ def executed_check(
         cwd=planned.cwd,
         returncode=returncode,
         duration_ms=duration_ms,
-        stdout=stdout,
-        stderr=stderr,
+        stdout=_captured_bytes(stdout),
+        stderr=_captured_bytes(stderr),
         spawn_error=spawn_error,
     )
     if planned.name == "pytest":
@@ -93,6 +100,13 @@ def executed_check(
         planned=planned,
         processes=(primary,),
     )
+
+
+def _captured_bytes(raw: bytes | None) -> CapturedBytes | None:
+    if raw is None:
+        return None
+    tail = raw[-CAPTURE_LIMIT_BYTES:]
+    return CapturedBytes(tail, len(raw) - len(tail))
 
 
 def run_plan(
@@ -741,8 +755,8 @@ def test_rejects_non_primary_ordinary_process_observation(tmp_path: Path) -> Non
                 cwd=ruff.cwd,
                 returncode=0,
                 duration_ms=1,
-                stdout=b"",
-                stderr=b"",
+                stdout=CapturedBytes(b"", 0),
+                stderr=CapturedBytes(b"", 0),
                 spawn_error=None,
             ),
         ),
@@ -840,8 +854,8 @@ def pytest_preflight_process(check: PlannedCheck) -> ExecutedProcess:
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"preflight",
-        stderr=b"",
+        stdout=CapturedBytes(b"preflight", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
 
@@ -860,8 +874,8 @@ def pytest_report_for_exit(
         cwd=check.cwd,
         returncode=exit_code,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     return build_run_report(
@@ -892,8 +906,8 @@ def test_pytest_execution_bridge_projects_structured_evidence_and_both_processes
         cwd=check.cwd,
         returncode=0,
         duration_ms=7,
-        stdout=b"primary",
-        stderr=b"",
+        stdout=CapturedBytes(b"primary", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     observation = ExecutedCheck(
@@ -969,8 +983,8 @@ def test_pytest_cleanup_error_overrides_check_but_preserves_finalized_result(
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     observation = ExecutedCheck(
@@ -1001,8 +1015,8 @@ def test_terminal_renders_structured_pytest_special_slow_and_sorted_advisories(
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     observation = ExecutedCheck(
@@ -1076,8 +1090,8 @@ def test_validation_rejects_malformed_public_pytest_models(
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     observation = ExecutedCheck(
@@ -1101,8 +1115,8 @@ def test_validation_rejects_malformed_pytest_nested_values_as_reporting_error(
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     report = build_run_report(
@@ -1141,8 +1155,8 @@ def test_validation_rejects_pytest_primary_exit_mismatch(tmp_path: Path) -> None
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     report = build_run_report(
@@ -1173,8 +1187,8 @@ def test_validation_rejects_planned_selector_scope_mismatch(tmp_path: Path) -> N
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     report = build_run_report(
@@ -1208,8 +1222,8 @@ def test_validation_rejects_artifact_scope_reasons_when_evidence_is_null(
         cwd=check.cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     report = build_run_report(
@@ -1263,8 +1277,8 @@ def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failur
         cwd=check.cwd,
         returncode=1,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     cleanup_report = build_run_report(
@@ -2022,8 +2036,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
                 cwd=check.cwd,
                 returncode=0,
                 duration_ms=1,
-                stdout=b"",
-                stderr=b"",
+                stdout=CapturedBytes(b"", 0),
+                stderr=CapturedBytes(b"", 0),
                 spawn_error=None,
             ),
             pytest_preflight_process(check),
@@ -2036,8 +2050,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
                 cwd=check.cwd,
                 returncode=0,
                 duration_ms=1,
-                stdout=b"",
-                stderr=b"",
+                stdout=CapturedBytes(b"", 0),
+                stderr=CapturedBytes(b"", 0),
                 spawn_error=None,
             ),
             ExecutedProcess(
@@ -2046,8 +2060,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
                 cwd=check.cwd,
                 returncode=0,
                 duration_ms=1,
-                stdout=b"",
-                stderr=b"",
+                stdout=CapturedBytes(b"", 0),
+                stderr=CapturedBytes(b"", 0),
                 spawn_error=None,
             ),
         ),

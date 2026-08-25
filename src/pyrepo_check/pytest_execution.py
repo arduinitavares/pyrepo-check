@@ -11,16 +11,26 @@ from pathlib import Path
 import secrets
 import shutil
 import stat
-import subprocess  # nosec B404
 import tempfile
 import time
 from typing import Literal, cast
 
-from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ProcessRunner
+from pyrepo_check.execution import (
+    CAPTURE_LIMIT_BYTES,
+    CapturedBytes,
+    ExecutedCheck,
+    ExecutedProcess,
+    ProcessRunner,
+    execute_process,
+)
 from pyrepo_check.planning import OutputFormat, PlannedCheck
 
 
-_PREFLIGHT_LIMIT_BYTES = 65_536
+_MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+_MAX_WRITER_MARKER_BYTES = 4 * 1024
+_MAX_JSON_NESTING = 64
+_MAX_WRITER_DIRECTORY_ENTRIES = 1024
+_READ_CHUNK_BYTES = 64 * 1024
 _MINIMUM_PYTHON_VERSION = (3, 13, 15)
 _PREFLIGHT_PROBE = """import json
 import sys
@@ -98,7 +108,7 @@ def execute_pytest(
     check: PlannedCheck,
     *,
     output_format: OutputFormat,
-    runner: ProcessRunner = subprocess.run,
+    runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
 ) -> ExecutedCheck:
     """Run the consumer preflight probe and retain its typed observation."""
@@ -112,6 +122,21 @@ def execute_pytest(
         None,
         "pytest execution setup did not run",
     )
+    capability_error = _platform_capability_error()
+    if capability_error is not None:
+        return ExecutedCheck(
+            planned=check,
+            processes=(),
+            pytest=PytestExecutionObservation(
+                preflight=PytestPreflightObservation(
+                    "not_started",
+                    None,
+                    capability_error,
+                ),
+                artifact=artifact,
+                cleanup_error=None,
+            ),
+        )
     try:
         run_directory = _create_run_directory(check.cwd)
     except OSError as error:
@@ -195,37 +220,18 @@ def _run_preflight(
     *,
     command: tuple[str, ...],
     cwd: Path,
-    runner: ProcessRunner,
+    runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
     environment: Mapping[str, str],
 ) -> ExecutedProcess:
-    started_ns = clock_ns()
-    returncode: int | None = None
-    stdout: bytes | None = None
-    stderr: bytes | None = None
-    spawn_error: str | None = None
-    try:
-        completed = runner(
-            command,
-            cwd=cwd,
-            check=False,
-            capture_output=True,
-            env=environment,
-        )
-        returncode = completed.returncode
-        stdout = _as_bytes(cast(bytes | str | None, completed.stdout))
-        stderr = _as_bytes(cast(bytes | str | None, completed.stderr))
-    except OSError as error:
-        spawn_error = f"{type(error).__name__}: {error}"
-    return ExecutedProcess(
+    return execute_process(
         role="pytest_preflight",
         command=command,
         cwd=cwd,
-        returncode=returncode,
-        duration_ms=_duration_ms(started_ns, clock_ns()),
-        stdout=stdout,
-        stderr=stderr,
-        spawn_error=spawn_error,
+        capture_output=True,
+        runner=runner,
+        clock_ns=clock_ns,
+        environment=dict(environment),
     )
 
 
@@ -233,39 +239,19 @@ def _run_primary(
     *,
     command: tuple[str, ...],
     cwd: Path,
-    runner: ProcessRunner,
+    runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
     environment: Mapping[str, str],
     capture_output: bool,
 ) -> ExecutedProcess:
-    started_ns = clock_ns()
-    returncode: int | None = None
-    stdout: bytes | None = None
-    stderr: bytes | None = None
-    spawn_error: str | None = None
-    try:
-        completed = runner(
-            command,
-            cwd=cwd,
-            check=False,
-            capture_output=capture_output,
-            env=environment,
-        )
-        returncode = completed.returncode
-        if capture_output:
-            stdout = _as_bytes(cast(bytes | str | None, completed.stdout))
-            stderr = _as_bytes(cast(bytes | str | None, completed.stderr))
-    except OSError as error:
-        spawn_error = f"{type(error).__name__}: {error}"
-    return ExecutedProcess(
+    return execute_process(
         role="primary",
         command=command,
         cwd=cwd,
-        returncode=returncode,
-        duration_ms=_duration_ms(started_ns, clock_ns()),
-        stdout=stdout,
-        stderr=stderr,
-        spawn_error=spawn_error,
+        capture_output=capture_output,
+        runner=runner,
+        clock_ns=clock_ns,
+        environment=dict(environment),
     )
 
 
@@ -357,7 +343,7 @@ def _snapshot_artifact(
 ) -> PytestArtifactObservation:
     writer_ids, marker_diagnostic = _snapshot_writer_ids(writer_directory)
     try:
-        content = _read_regular_file(artifact_path)
+        content = _read_regular_file(artifact_path, max_bytes=_MAX_ARTIFACT_BYTES)
     except FileNotFoundError:
         return PytestArtifactObservation("missing", None, writer_ids, marker_diagnostic)
     except _UnsafePathError as error:
@@ -378,47 +364,74 @@ def _snapshot_artifact(
 
 
 def _snapshot_writer_ids(writer_directory: Path) -> tuple[tuple[str, ...], str | None]:
-    writer_ids: list[str] = []
+    writer_id: str | None = None
     diagnostics: list[str] = []
     try:
-        marker_paths = tuple(writer_directory.iterdir())
+        entries = os.scandir(writer_directory)
     except OSError as error:
         return (), f"writer inventory failed: {error}"
-    for marker_path in marker_paths:
-        marker_id = _marker_id(marker_path.name)
-        if marker_id is None:
-            continue
-        try:
-            document = json.loads(_read_regular_file(marker_path).decode("utf-8"))
-        except (_UnsafePathError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            diagnostics.append(f"writer marker is malformed: {marker_path.name}: {error}")
-            continue
-        if not isinstance(document, dict):
-            diagnostics.append(f"writer marker is malformed: {marker_path.name}: root must be an object")
-            continue
-        schema_version = document.get("schema_version")
-        writer_id = document.get("writer_id")
-        pid = document.get("pid")
-        if type(schema_version) is not int or schema_version != 1:
-            diagnostics.append(
-                f"writer marker is malformed: {marker_path.name}: schema_version must be integer 1"
-            )
-            continue
-        if not isinstance(writer_id, str):
-            diagnostics.append(
-                f"writer marker is malformed: {marker_path.name}: writer_id must be a string"
-            )
-            continue
-        if type(pid) is not int or pid < 0:
-            diagnostics.append(
-                f"writer marker is malformed: {marker_path.name}: pid must be a non-negative integer"
-            )
-            continue
-        if writer_id != marker_id:
-            diagnostics.append(f"writer marker ID mismatch: {marker_path.name}")
-            continue
-        writer_ids.append(marker_id)
-    return tuple(sorted(writer_ids)), "; ".join(diagnostics) or None
+    marker_seen = False
+    with entries:
+        for entry_count, entry in enumerate(entries, start=1):
+            retained_ids = (writer_id,) if writer_id is not None else ()
+            if entry_count > _MAX_WRITER_DIRECTORY_ENTRIES:
+                diagnostics.append(
+                    f"writer directory contains more than {_MAX_WRITER_DIRECTORY_ENTRIES} entries"
+                )
+                return retained_ids, "; ".join(diagnostics)
+            marker_id = _marker_id(entry.name)
+            if marker_id is None:
+                continue
+            if marker_seen:
+                diagnostics.append("multiple writer markers were found")
+                return retained_ids, "; ".join(diagnostics)
+            marker_seen = True
+            try:
+                loaded_document = _load_bounded_json(
+                    _read_regular_file(
+                        Path(entry.path),
+                        max_bytes=_MAX_WRITER_MARKER_BYTES,
+                    )
+                )
+            except (
+                _UnsafePathError,
+                _BoundedReadError,
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as error:
+                diagnostics.append(f"writer marker is malformed: {entry.name}: {error}")
+                continue
+            if not isinstance(loaded_document, dict):
+                diagnostics.append(
+                    f"writer marker is malformed: {entry.name}: root must be an object"
+                )
+                continue
+            document = cast(dict[object, object], loaded_document)
+            schema_version = document.get("schema_version")
+            document_writer_id = document.get("writer_id")
+            pid = document.get("pid")
+            if type(schema_version) is not int or schema_version != 1:
+                diagnostics.append(
+                    f"writer marker is malformed: {entry.name}: schema_version must be integer 1"
+                )
+                continue
+            if not isinstance(document_writer_id, str):
+                diagnostics.append(
+                    f"writer marker is malformed: {entry.name}: writer_id must be a string"
+                )
+                continue
+            if type(pid) is not int or pid < 0:
+                diagnostics.append(
+                    f"writer marker is malformed: {entry.name}: pid must be a non-negative integer"
+                )
+                continue
+            if document_writer_id != marker_id:
+                diagnostics.append(f"writer marker ID mismatch: {entry.name}")
+                continue
+            writer_id = marker_id
+    return ((writer_id,) if writer_id is not None else ()), "; ".join(diagnostics) or None
 
 
 def _marker_id(name: str) -> str | None:
@@ -534,6 +547,10 @@ class _UnsafePathError(OSError):
     """Raised when descriptor-safe regular-file reading is unavailable or fails."""
 
 
+class _BoundedReadError(OSError):
+    """Raised when a regular evidence file exceeds its byte budget."""
+
+
 class _RecursiveCleanupFailure(Exception):
     """Carry an inner cleanup error past shutil's root-path error rewriting."""
 
@@ -542,7 +559,7 @@ class _RecursiveCleanupFailure(Exception):
         self.error = error
 
 
-def _read_regular_file(path: Path) -> bytes:
+def _read_regular_file(path: Path, *, max_bytes: int) -> bytes:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if type(no_follow) is not int:
         raise _UnsafePathError("safe no-follow file opening is unavailable")
@@ -553,14 +570,65 @@ def _read_regular_file(path: Path) -> bytes:
             raise _UnsafePathError(f"path is not a regular file: {path.name}") from error
         raise
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
             raise _UnsafePathError(f"path is not a regular file: {path.name}")
-        with os.fdopen(descriptor, "rb") as file:
-            descriptor = -1
-            return file.read()
+        if file_status.st_size > max_bytes:
+            raise _BoundedReadError(f"{path.name} exceeds the {max_bytes}-byte limit")
+        content = bytearray()
+        while len(content) <= max_bytes:
+            remaining = max_bytes + 1 - len(content)
+            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > max_bytes:
+            raise _BoundedReadError(f"{path.name} exceeds the {max_bytes}-byte limit")
+        return bytes(content)
     finally:
-        if descriptor != -1:
-            os.close(descriptor)
+        os.close(descriptor)
+
+
+def _load_bounded_json(content: bytes) -> object:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in content:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                in_string = False
+            continue
+        if byte == ord('"'):
+            in_string = True
+        elif byte in {ord("{"), ord("[")}:
+            depth += 1
+            if depth > _MAX_JSON_NESTING:
+                raise ValueError(
+                    f"JSON nesting exceeds the {_MAX_JSON_NESTING}-level limit"
+                )
+        elif byte in {ord("}"), ord("]")}:
+            depth -= 1
+    try:
+        return json.loads(content)
+    except RecursionError as error:
+        raise ValueError("JSON parsing exceeded the recursion limit") from error
+
+
+def _platform_capability_error() -> str | None:
+    if (
+        type(getattr(os, "O_NOFOLLOW", None)) is not int
+        or type(getattr(os, "O_DIRECTORY", None)) is not int
+        or shutil.rmtree.avoids_symlink_attacks is not True
+    ):
+        return (
+            "Structured pytest evidence requires descriptor-safe no-follow file opening "
+            "and symlink-safe descriptor-relative recursive removal."
+        )
+    return None
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -586,14 +654,11 @@ def _classify_preflight(process: ExecutedProcess) -> PytestPreflightObservation:
             None,
             f"preflight exited with code {process.returncode}",
         )
-    if any(
-        stream is not None and len(stream) > _PREFLIGHT_LIMIT_BYTES
-        for stream in (process.stdout, process.stderr)
-    ):
+    if any(stream is not None and stream.omitted_bytes > 0 for stream in (process.stdout, process.stderr)):
         return PytestPreflightObservation(
             "preflight_invalid",
             None,
-            "preflight output exceeds 65536 bytes",
+            f"preflight output exceeds {CAPTURE_LIMIT_BYTES} bytes",
         )
     try:
         record = _parse_preflight_record(process.stdout)
@@ -608,13 +673,13 @@ def _classify_preflight(process: ExecutedProcess) -> PytestPreflightObservation:
     return PytestPreflightObservation("supported", record, None)
 
 
-def _parse_preflight_record(output: bytes | None) -> PytestPreflightRecord:
+def _parse_preflight_record(output: CapturedBytes | None) -> PytestPreflightRecord:
     if output is None:
         raise ValueError("preflight emitted no output")
-    if len(output) > _PREFLIGHT_LIMIT_BYTES:
-        raise ValueError("preflight output exceeds 65536 bytes")
+    if output.omitted_bytes > 0:
+        raise ValueError(f"preflight output exceeds {CAPTURE_LIMIT_BYTES} bytes")
     try:
-        lines = output.decode("utf-8").splitlines()
+        lines = output.tail.decode("utf-8").splitlines()
     except UnicodeDecodeError as error:
         raise ValueError("preflight output is not valid UTF-8") from error
     if len(lines) != 1:
@@ -655,10 +720,6 @@ def _parse_version(value: object) -> tuple[int, int, int]:
             raise ValueError("preflight JSON does not match schema version 1")
         version.append(piece)
     return (version[0], version[1], version[2])
-
-
-def _as_bytes(output: bytes | str | None) -> bytes | None:
-    return output.encode() if isinstance(output, str) else output
 
 
 def _duration_ms(started_ns: int, ended_ns: int) -> int:

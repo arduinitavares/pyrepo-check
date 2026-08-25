@@ -155,8 +155,13 @@ Plan types live with the planner rather than in a generic models module.
 The executor owns subprocess invocation, working directory, duration
 measurement, stdout/stderr policy, continue-after-failure behavior, and exit
 aggregation. Every command is an argument vector executed without a shell.
-Production uses a subprocess adapter. Tests use one recording adapter rather
-than repeating raw `CompletedProcess` fakes.
+Production uses `subprocess.Popen` in binary mode and drains captured stdout and
+stderr concurrently with one reader thread per pipe. Each reader retains only
+the final 65,536 raw bytes in a fixed-size tail accumulator and records the
+exact omitted raw-byte count. Tests use one recording adapter rather than
+repeating raw `CompletedProcess` fakes; injected runners are outside the
+production memory guarantee and their buffered results are normalized
+immediately to the same bounded observation.
 
 Terminal mode streams tool output so diagnostics remain readable as checks run.
 JSON mode captures tool output so stdout contains exactly one JSON document;
@@ -559,6 +564,11 @@ the execution observation, is an execution error, and makes the run
 incomplete. An uncatchable process kill may leave an OS-temp directory; later
 runs never reuse or broadly scavenge it. No cleanup operation may target the
 consumer root, a glob, or a directory not created by the current invocation.
+
+Structured pytest evidence requires descriptor-safe no-follow file opening and
+symlink-safe descriptor-relative recursive removal. Unsupported platforms fail
+closed before pytest starts; pyrepo-check does not fall back to path-based
+cleanup.
 
 ## Agent Report contract
 
@@ -1144,6 +1154,15 @@ sequences. `omitted_bytes` is the discarded raw-byte count and is zero exactly
 when `truncated` is false. JSON mode captures primary processes as well, so all
 of its process streams use `captured: true`; an `output_truncated` advisory
 identifies every truncated stream.
+
+Pytest artifact snapshots are limited to 128 MiB, writer-marker snapshots to
+4 KiB, JSON object/array nesting to 64 levels, and writer-directory inventories
+to 1,024 entries. Regular evidence files are opened without following symlinks,
+validated as regular files by descriptor, rejected from metadata when already
+oversized, and read in 64 KiB chunks up to one byte beyond the cap so growth
+after metadata validation also fails closed. Writer inventories stream through
+the directory, retain at most one marker candidate, and stop as soon as a
+second marker proves the evidence invalid.
 
 Array order is normative:
 

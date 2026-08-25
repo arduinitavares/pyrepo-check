@@ -3,10 +3,18 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 import subprocess  # nosec B404
+import sys
+import signal
 
 import pytest
 
-from pyrepo_check.execution import ExecutedProcess, ExecutionResult, execute_plan
+from pyrepo_check.execution import (
+    CAPTURE_LIMIT_BYTES,
+    CapturedBytes,
+    ExecutedProcess,
+    ExecutionResult,
+    execute_plan,
+)
 from pyrepo_check.planning import OutputFormat, PlannedCheck, RunPlan
 from tests.support import RecordingRunner
 
@@ -52,6 +60,131 @@ def make_single_check_plan(
         checks=plan.checks[:1],
         output_format=output_format,
     )
+
+
+def make_python_check_plan(tmp_path: Path, source: str) -> RunPlan:
+    return RunPlan(
+        mode="focused",
+        targets=(),
+        checks=(
+            PlannedCheck(
+                name="ruff",
+                command=(sys.executable, "-c", source),
+                cwd=tmp_path,
+            ),
+        ),
+        output_format="json",
+    )
+
+
+def test_production_capture_drains_both_pipes_and_retains_exact_raw_tails(
+    tmp_path: Path,
+) -> None:
+    stdout_size = 3 * 1024 * 1024 + 17
+    stderr_size = 2 * 1024 * 1024 + 29
+    source = (
+        "import os\n"
+        f"os.write(1, b'A' * {stdout_size - CAPTURE_LIMIT_BYTES} + "
+        f"b'B' * {CAPTURE_LIMIT_BYTES})\n"
+        f"os.write(2, b'C' * {stderr_size - CAPTURE_LIMIT_BYTES} + "
+        f"b'D' * {CAPTURE_LIMIT_BYTES})\n"
+    )
+
+    result = execute_plan(make_python_check_plan(tmp_path, source), runner=None)
+
+    process = result.checks[0].processes[0]
+    assert process.returncode == 0
+    assert process.stdout == CapturedBytes(
+        tail=b"B" * CAPTURE_LIMIT_BYTES,
+        omitted_bytes=stdout_size - CAPTURE_LIMIT_BYTES,
+    )
+    assert process.stderr == CapturedBytes(
+        tail=b"D" * CAPTURE_LIMIT_BYTES,
+        omitted_bytes=stderr_size - CAPTURE_LIMIT_BYTES,
+    )
+
+
+def test_injected_buffered_runner_output_is_normalized_immediately(
+    tmp_path: Path,
+) -> None:
+    stdout = b"prefix" + b"x" * CAPTURE_LIMIT_BYTES
+    stderr = b"error"
+
+    result = execute_plan(
+        make_single_check_plan(tmp_path, output_format="json"),
+        runner=RecordingRunner(stdout=(stdout,), stderr=(stderr,)),
+    )
+
+    process = result.checks[0].processes[0]
+    assert process.stdout == CapturedBytes(
+        tail=b"x" * CAPTURE_LIMIT_BYTES,
+        omitted_bytes=len(b"prefix"),
+    )
+    assert process.stderr == CapturedBytes(tail=stderr, omitted_bytes=0)
+
+
+def test_production_spawn_failure_and_signal_preserve_continuation_and_exit_order(
+    tmp_path: Path,
+) -> None:
+    missing = PlannedCheck(
+        name="ruff",
+        command=(str(tmp_path / "missing-executable"),),
+        cwd=tmp_path,
+    )
+    signaled = PlannedCheck(
+        name="ty",
+        command=(
+            sys.executable,
+            "-c",
+            f"import os; os.kill(os.getpid(), {signal.SIGTERM})",
+        ),
+        cwd=tmp_path,
+    )
+    completed = PlannedCheck(
+        name="bandit",
+        command=(sys.executable, "-c", "raise SystemExit(7)"),
+        cwd=tmp_path,
+    )
+
+    result = execute_plan(
+        RunPlan(
+            mode="focused",
+            targets=(),
+            checks=(missing, signaled, completed),
+            output_format="json",
+        ),
+        runner=None,
+    )
+
+    processes = tuple(check.processes[0] for check in result.checks)
+    assert processes[0].returncode is None
+    assert processes[0].spawn_error is not None
+    assert processes[1].returncode == -signal.SIGTERM
+    assert processes[2].returncode == 7
+    assert result.exit_code == 7
+
+
+def test_production_terminal_output_remains_inherited(
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    check = PlannedCheck(
+        name="ruff",
+        command=(sys.executable, "-c", "import os; os.write(1, b'inherited-output\\n')"),
+        cwd=tmp_path,
+    )
+
+    result = execute_plan(
+        RunPlan(mode="focused", targets=(), checks=(check,)),
+        runner=None,
+    )
+
+    process = result.checks[0].processes[0]
+    captured = capfd.readouterr()
+    assert process.returncode == 0
+    assert process.stdout is None
+    assert process.stderr is None
+    assert "inherited-output\n" in captured.out
 
 
 def test_zero_return_codes_produce_exit_zero(tmp_path: Path) -> None:
@@ -122,8 +255,8 @@ def test_json_commands_capture_output_without_printing_banner(
     assert [call.capture_output for call in runner.calls] == [True, True]
     assert capsys.readouterr().out == ""
     assert [(check.processes[0].stdout, check.processes[0].stderr) for check in result.checks] == [
-        (b"first", b""),
-        (b"second", b"error"),
+        (CapturedBytes(b"first", 0), CapturedBytes(b"", 0)),
+        (CapturedBytes(b"second", 0), CapturedBytes(b"error", 0)),
     ]
 
 

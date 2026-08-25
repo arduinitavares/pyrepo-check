@@ -4,7 +4,8 @@
 
 **Milestone:** C2 — structured pytest evidence
 
-**Decision status:** Research recommendation only; no dependency or implementation decision is committed
+**Decision status:** Historical research recommendation, now implemented by C2
+with the approved standalone plugin and no external reporting dependency
 
 ## Conclusion
 

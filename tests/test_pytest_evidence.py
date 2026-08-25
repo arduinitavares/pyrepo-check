@@ -7,7 +7,7 @@ from typing import cast
 
 import pytest
 
-from pyrepo_check.execution import ExecutedCheck, ExecutedProcess
+from pyrepo_check.execution import CapturedBytes, ExecutedCheck, ExecutedProcess
 from pyrepo_check.planning import PlannedCheck, PlannedTestScope, PytestExecutionPlan, RunPlan
 from pyrepo_check.pytest_execution import (
     ArtifactState,
@@ -179,8 +179,8 @@ def _check(
         cwd=cwd,
         returncode=0,
         duration_ms=1,
-        stdout=b"",
-        stderr=b"",
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
         spawn_error=None,
     )
     raw_artifact = {
@@ -323,6 +323,41 @@ def test_validation_keeps_a_valid_snapshot_despite_cleanup_error() -> None:
     assert not isinstance(result, PytestValidationFailure)
     assert result.pytest_version == "8.4.2"
     assert result.exit_code == 0
+
+
+@pytest.mark.parametrize(("list_depth", "valid"), ((63, True), (64, False)))
+def test_artifact_json_nesting_64_is_valid_and_65_is_typed_invalid(
+    list_depth: int,
+    valid: bool,
+) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    nested: object = 0
+    for _ in range(list_depth):
+        nested = [nested]
+    document["unknown_nested_metadata"] = nested
+
+    result = validate_pytest_execution(_with_document(check, document))
+
+    if valid:
+        assert isinstance(result, ValidatedPytestSession)
+    else:
+        assert isinstance(result, PytestValidationFailure)
+        assert result.code == "artifact_invalid"
+
+
+def test_artifact_json_recursion_error_is_typed_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def recurse(_content: bytes) -> object:
+        raise RecursionError("too deep")
+
+    monkeypatch.setattr("pyrepo_check.pytest_execution.json.loads", recurse)
+
+    result = validate_pytest_execution(_check())
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == "artifact_invalid"
 
 
 def _artifact_document(check: ExecutedCheck) -> dict[str, object]:

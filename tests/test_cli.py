@@ -1,12 +1,20 @@
 from pathlib import Path
 import json
 import subprocess  # nosec B404
+import sys
 
 import pytest
 
 from pyrepo_check.cli import main
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult, ProcessRunner
+from pyrepo_check.execution import (
+    CAPTURE_LIMIT_BYTES,
+    CapturedBytes,
+    ExecutedCheck,
+    ExecutedProcess,
+    ExecutionResult,
+    ProcessRunner,
+)
 from pyrepo_check.planning import (
     PlannedCheck,
     PlanningFacts,
@@ -219,12 +227,19 @@ def executed_check(
                 cwd=planned.cwd,
                 returncode=returncode,
                 duration_ms=duration_ms,
-                stdout=stdout,
-                stderr=stderr,
+                stdout=_captured_bytes(stdout),
+                stderr=_captured_bytes(stderr),
                 spawn_error=spawn_error,
             ),
         ),
     )
+
+
+def _captured_bytes(raw: bytes | None) -> CapturedBytes | None:
+    if raw is None:
+        return None
+    tail = raw[-CAPTURE_LIMIT_BYTES:]
+    return CapturedBytes(tail, len(raw) - len(tail))
 
 
 def test_cli_builds_request_and_executes_plan(
@@ -658,6 +673,57 @@ def test_json_is_one_isolated_utf8_document_with_captured_process_streams(
         "later {stdout}\n"
     )
     assert payload["checks"][1]["processes"][0]["stderr"]["text"] == "}\n"
+
+
+def test_real_large_output_json_mode_emits_one_parseable_bounded_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    (tmp_path / "src").mkdir()
+    source = (
+        "import os\n"
+        "os.write(1, b'raw-stdout-prefix' + b'x' * (2 * 1024 * 1024))\n"
+        "os.write(2, b'raw-stderr-prefix' + b'y' * (2 * 1024 * 1024))\n"
+    )
+
+    def real_process_plan(
+        request: RunRequest,
+        config: ProjectConfig,
+        facts: PlanningFacts,
+    ) -> RunPlan:
+        del request, facts
+        return RunPlan(
+            mode="focused",
+            targets=(),
+            checks=(
+                PlannedCheck(
+                    name="ruff",
+                    command=(sys.executable, "-c", source),
+                    cwd=config.root,
+                ),
+            ),
+            output_format="json",
+        )
+
+    monkeypatch.setattr("pyrepo_check.cli.plan_run", real_process_plan)
+
+    result = main(["--root", str(tmp_path), "--format", "json", "ruff"])
+
+    captured = capsysbinary.readouterr()
+    payload = json.loads(captured.out)
+    process = payload["checks"][0]["processes"][0]
+    assert result == 0
+    assert captured.err == b""
+    assert captured.out.endswith(b"\n")
+    assert process["stdout"]["omitted_bytes"] == (
+        len(b"raw-stdout-prefix") + 2 * 1024 * 1024 - 65_536
+    )
+    assert process["stderr"]["omitted_bytes"] == (
+        len(b"raw-stderr-prefix") + 2 * 1024 * 1024 - 65_536
+    )
+    assert process["stdout"]["text"] == "x" * 65_536
+    assert process["stderr"]["text"] == "y" * 65_536
 
 
 def test_json_planning_error_is_one_document_and_spawns_nothing(

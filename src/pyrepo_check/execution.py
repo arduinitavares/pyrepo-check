@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import io
 from pathlib import Path
 import shlex
 import subprocess  # nosec B404
+import threading
 import time
 from typing import TYPE_CHECKING, cast
 
@@ -19,6 +21,36 @@ ProcessRunner = Callable[
     subprocess.CompletedProcess[tuple[str, ...]],
 ]
 
+CAPTURE_LIMIT_BYTES = 65_536
+_PIPE_READ_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class CapturedBytes:
+    tail: bytes
+    omitted_bytes: int
+
+
+class _TailAccumulator:
+    def __init__(self) -> None:
+        self._tail = bytearray()
+        self._total_bytes = 0
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> None:
+        chunk_size = len(chunk)
+        self._total_bytes += chunk_size
+        if chunk_size >= CAPTURE_LIMIT_BYTES:
+            self._tail[:] = chunk[-CAPTURE_LIMIT_BYTES:]
+            return
+        overflow = len(self._tail) + chunk_size - CAPTURE_LIMIT_BYTES
+        if overflow > 0:
+            del self._tail[:overflow]
+        self._tail.extend(chunk)
+
+    def finish(self) -> CapturedBytes:
+        tail = bytes(self._tail)
+        return CapturedBytes(tail, self._total_bytes - len(tail))
+
 
 @dataclass(frozen=True)
 class ExecutedProcess:
@@ -27,8 +59,8 @@ class ExecutedProcess:
     cwd: Path
     returncode: int | None
     duration_ms: int
-    stdout: bytes | None
-    stderr: bytes | None
+    stdout: CapturedBytes | None
+    stderr: CapturedBytes | None
     spawn_error: str | None
 
 
@@ -48,7 +80,7 @@ class ExecutionResult:
 def execute_plan(
     plan: RunPlan,
     *,
-    runner: ProcessRunner = subprocess.run,
+    runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
 ) -> ExecutionResult:
     executed: list[ExecutedCheck] = []
@@ -70,49 +102,17 @@ def execute_plan(
             )
             continue
 
-        returncode: int | None = None
-        stdout: bytes | None = None
-        stderr: bytes | None = None
-        spawn_error: str | None = None
-        started_ns: int | None = None
-        duration_ms = 0
-        try:
-            if is_json:
-                started_ns = clock_ns()
-                completed = runner(
-                    check.command,
-                    cwd=check.cwd,
-                    check=False,
-                    capture_output=True,
-                )
-                stdout = _as_bytes(cast(bytes | str | None, completed.stdout))
-                stderr = _as_bytes(cast(bytes | str | None, completed.stderr))
-                returncode = completed.returncode
-            else:
-                started_ns = clock_ns()
-                completed = runner(check.command, cwd=check.cwd, check=False)
-                returncode = completed.returncode
-        except OSError as error:
-            if started_ns is None:
-                raise
-            spawn_error = f"{type(error).__name__}: {error}"
-        finally:
-            if started_ns is not None:
-                duration_ms = _duration_ms(started_ns, clock_ns())
-
         executed.append(
             ExecutedCheck(
                 planned=check,
                 processes=(
-                    ExecutedProcess(
+                    execute_process(
                         role="primary",
                         command=check.command,
                         cwd=check.cwd,
-                        returncode=returncode,
-                        duration_ms=duration_ms,
-                        stdout=stdout,
-                        stderr=stderr,
-                        spawn_error=spawn_error,
+                        capture_output=is_json,
+                        runner=runner,
+                        clock_ns=clock_ns,
                     ),
                 ),
             )
@@ -141,10 +141,117 @@ def execute_plan(
     return ExecutionResult(checks=tuple(executed), exit_code=exit_code)
 
 
-def _as_bytes(output: bytes | str | None) -> bytes | None:
-    if isinstance(output, str):
-        return output.encode()
-    return output
+def execute_process(
+    *,
+    role: str,
+    command: tuple[str, ...],
+    cwd: Path,
+    capture_output: bool,
+    runner: ProcessRunner | None,
+    clock_ns: Callable[[], int],
+    environment: dict[str, str] | None = None,
+) -> ExecutedProcess:
+    started_ns: int | None = None
+    returncode: int | None = None
+    stdout: CapturedBytes | None = None
+    stderr: CapturedBytes | None = None
+    spawn_error: str | None = None
+    try:
+        if runner is None:
+            started_ns = clock_ns()
+            returncode, stdout, stderr = _run_bounded_process(
+                command,
+                cwd=cwd,
+                capture_output=capture_output,
+                environment=environment,
+            )
+        else:
+            runner_kwargs: dict[str, object] = {
+                "cwd": cwd,
+                "check": False,
+                "capture_output": capture_output,
+            }
+            if environment is not None:
+                runner_kwargs["env"] = environment
+            started_ns = clock_ns()
+            completed = runner(command, **runner_kwargs)
+            returncode = completed.returncode
+            if capture_output:
+                stdout = _normalize_buffered_output(
+                    cast(bytes | str | None, completed.stdout)
+                )
+                stderr = _normalize_buffered_output(
+                    cast(bytes | str | None, completed.stderr)
+                )
+    except OSError as error:
+        spawn_error = f"{type(error).__name__}: {error}"
+    if started_ns is None:
+        raise RuntimeError("process clock did not start")
+    return ExecutedProcess(
+        role=role,
+        command=command,
+        cwd=cwd,
+        returncode=returncode,
+        duration_ms=_duration_ms(started_ns, clock_ns()),
+        stdout=stdout,
+        stderr=stderr,
+        spawn_error=spawn_error,
+    )
+
+
+def _run_bounded_process(
+    command: tuple[str, ...],
+    *,
+    cwd: Path,
+    capture_output: bool,
+    environment: dict[str, str] | None,
+) -> tuple[int, CapturedBytes | None, CapturedBytes | None]:
+    process = subprocess.Popen(  # nosec B603
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+    )
+    if not capture_output:
+        return process.wait(), None, None
+
+    stdout_accumulator = _TailAccumulator()
+    stderr_accumulator = _TailAccumulator()
+    stdout_thread = threading.Thread(
+        target=_drain_pipe,
+        args=(process.stdout, stdout_accumulator),
+        name="pyrepo-check-stdout",
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_pipe,
+        args=(process.stderr, stderr_accumulator),
+        name="pyrepo-check-stderr",
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    returncode = process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    return returncode, stdout_accumulator.finish(), stderr_accumulator.finish()
+
+
+def _drain_pipe(
+    pipe: io.BufferedReader | None,
+    accumulator: _TailAccumulator,
+) -> None:
+    if pipe is None:
+        return
+    read_buffer = bytearray(_PIPE_READ_BYTES)
+    with pipe:
+        while (read_bytes := pipe.readinto(read_buffer)) != 0:
+            accumulator.feed(memoryview(read_buffer)[:read_bytes])
+
+
+def _normalize_buffered_output(output: bytes | str | None) -> CapturedBytes:
+    raw = output.encode() if isinstance(output, str) else output or b""
+    retained = raw[-CAPTURE_LIMIT_BYTES:]
+    return CapturedBytes(retained, len(raw) - len(retained))
 
 
 def _duration_ms(started_ns: int, ended_ns: int) -> int:

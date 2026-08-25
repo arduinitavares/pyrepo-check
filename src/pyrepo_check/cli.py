@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 import argparse
-import subprocess  # nosec B404
 import sys
 from typing import cast
 
@@ -69,7 +68,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(
     argv: Sequence[str] | None = None,
     *,
-    runner: ProcessRunner = subprocess.run,
+    runner: ProcessRunner | None = None,
 ) -> int:
     args = parse_args(argv)
     output_format = cast(OutputFormat, args.format)
