@@ -469,6 +469,8 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
             ["tests/test_coverage_consumer.py"],
             ["tests/test_coverage_consumer.py"],
             "partial",
+            "guidance",
+            "partial_run",
         ),
         (
             "node target",
@@ -485,6 +487,8 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
             ["tests/test_coverage_consumer.py::test_positive_value"],
             ["tests/test_coverage_consumer.py::test_positive_value"],
             "partial",
+            "guidance",
+            "partial_run",
         ),
         (
             "shortcut",
@@ -495,6 +499,20 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
             ["tests/test_coverage_consumer.py::test_positive_value"],
             [],
             "partial",
+            "guidance",
+            "partial_run",
+        ),
+        (
+            "target-free explicit pytest coverage",
+            ("--format", "json", "pytest", "--coverage"),
+            "focused",
+            ["pytest"],
+            None,
+            [],
+            [],
+            "complete",
+            "guidance",
+            "focused_run",
         ),
         (
             "bare coverage",
@@ -505,6 +523,8 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
             [],
             [],
             "complete",
+            "passed",
+            None,
         ),
     )
 
@@ -517,6 +537,8 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
         pytest_args,
         targets,
         expected_scope,
+        expected_coverage_status,
+        expected_threshold_skip,
     ) in modes:
         completed = subprocess.run(  # nosec B603
             (str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"), *arguments),
@@ -546,11 +568,11 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
             "planned_coverage_scope": expected_scope,
         }, name
         assert payload["pytest"]["status"] == "passed", name
+        assert payload["pytest"]["complete"] is True, name
         assert payload["pytest"]["scope"] == expected_scope, name
-        assert payload["coverage"]["status"] == (
-            "passed" if expected_scope == "complete" else "guidance"
-        ), name
+        assert payload["coverage"]["status"] == expected_coverage_status, name
         assert payload["coverage"]["scope"] == expected_scope, name
+        assert payload["coverage"]["evidence_complete"] is True, name
         assert payload["coverage"]["threshold"] == (
             {
                 "configured": True,
@@ -559,13 +581,13 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
                 "passed": True,
                 "skipped_reason": None,
             }
-            if expected_scope == "complete"
+            if expected_threshold_skip is None
             else {
                 "configured": True,
                 "value": 100,
                 "evaluated": False,
                 "passed": None,
-                "skipped_reason": "partial_run",
+                "skipped_reason": expected_threshold_skip,
             }
         ), name
         assert [process["role"] for process in processes] == [
@@ -1050,6 +1072,85 @@ def test_external_coverage_statuses_remain_independent(
     assert primary_processes[0]["cwd"] == str(consumer)
     assert primary_processes[0]["exit_code"] == case.expected_primary_exit
     assert processes[-1]["exit_code"] == case.expected_coverage_json_exit
+    _assert_coverage_consumer_unchanged(consumer, before)
+
+
+def test_external_coverage_shard_fails_closed_without_a_plain_fallback(
+    tmp_path: Path,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_coverage_all_consumer(consumer)
+    _write_coverage_test_source(
+        consumer,
+        '''"""Create a run-owned Coverage.py shard after coverage starts."""
+
+import os
+from pathlib import Path
+
+from coverage_consumer import classify
+
+
+def test_creates_a_coverage_shard() -> None:
+    """Leave a sibling shard beside Coverage.py's run-owned data file."""
+    coverage_file = Path(os.environ["COVERAGE_FILE"])
+    coverage_file.with_name(f"{coverage_file.name}.worker").write_bytes(b"shard")
+    assert classify(1) == "positive"
+''',
+    )
+    before = _lock_and_snapshot_consumer(consumer)
+
+    completed, payload = _run_external_json(consumer, "pytest", "--coverage")
+    pytest_check = payload["checks"][0]
+    processes = pytest_check["processes"]
+    primary_processes = [process for process in processes if process["role"] == "primary"]
+    pytest_roles = [
+        process["role"]
+        for process in processes
+        if any(
+            pair == ("-m", "pytest")
+            for pair in zip(process["argv"], process["argv"][1:])
+        )
+    ]
+
+    assert completed.returncode == 2
+    assert completed.stderr == b""
+    assert payload["overall_status"] == "error"
+    assert payload["complete"] is False
+    assert payload["pytest"]["status"] == "passed"
+    assert payload["pytest"]["complete"] is True
+    assert pytest_check["status"] == "passed"
+    assert pytest_check["error"] is None
+    assert payload["coverage"]["status"] == "error"
+    assert payload["coverage"]["error"]["code"] == "unexpected_parallel_data"
+    assert payload["coverage"]["scope"] == "partial"
+    assert payload["coverage"]["evidence_complete"] is False
+    assert payload["coverage"]["gate_eligible"] is False
+    assert payload["coverage"]["threshold"] == {
+        "configured": True,
+        "value": 100,
+        "evaluated": False,
+        "passed": None,
+        "skipped_reason": "evidence_error",
+    }
+    assert [process["role"] for process in processes] == [
+        "pytest_preflight",
+        "coverage_preflight",
+        "primary",
+    ]
+    assert len(primary_processes) == 1
+    assert pytest_roles == ["primary"]
+    assert primary_processes[0]["cwd"] == str(consumer)
+    assert primary_processes[0]["argv"][:7] == [
+        "uv",
+        "run",
+        "--frozen",
+        "python",
+        "-m",
+        "coverage",
+        "run",
+    ]
+    assert not [process for process in processes if process["role"] == "coverage_json"]
     _assert_coverage_consumer_unchanged(consumer, before)
 
 
