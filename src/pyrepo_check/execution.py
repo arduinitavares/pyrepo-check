@@ -246,7 +246,15 @@ def _run_bounded_process(
         stderr=subprocess.PIPE if capture_output else None,
     )
     if not capture_output:
-        return process.wait(), None, None
+        try:
+            try:
+                returncode = process.wait()
+            except (OSError, RuntimeError) as error:
+                raise _ProcessExecutionFailure("wait", error) from error
+        except BaseException:
+            _cleanup_failed_process(process, (), [])
+            raise
+        return returncode, None, None
 
     stdout_accumulator = _TailAccumulator()
     stderr_accumulator = _TailAccumulator()

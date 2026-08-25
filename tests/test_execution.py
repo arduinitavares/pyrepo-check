@@ -180,12 +180,15 @@ class _FakePopen:
 def _install_fake_popen(
     monkeypatch: pytest.MonkeyPatch,
     processes: list[_FakePopen],
+    *,
+    capture_output: bool = True,
 ) -> None:
     remaining = iter(processes)
 
     def fake_popen(*_args: object, **kwargs: object) -> _FakePopen:
-        assert kwargs["stdout"] is subprocess.PIPE
-        assert kwargs["stderr"] is subprocess.PIPE
+        expected_pipe = subprocess.PIPE if capture_output else None
+        assert kwargs["stdout"] is expected_pipe
+        assert kwargs["stderr"] is expected_pipe
         assert "text" not in kwargs and "encoding" not in kwargs
         return next(remaining)
 
@@ -663,6 +666,38 @@ def test_wait_failure_is_typed_after_both_readers_finish(
     assert process.wait_calls[0] is None
     assert process.wait_calls[1] is not None
     assert 0 < process.wait_calls[1] <= execution._FAILURE_CLEANUP_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize("error_type", (OSError, RuntimeError))
+def test_terminal_wait_failure_is_contained_and_later_check_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError] | type[RuntimeError],
+) -> None:
+    class WaitFailurePopen(_FakePopen):
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls.append(timeout)
+            if timeout is None:
+                raise error_type("synthetic terminal wait failure")
+            return self.returncode
+
+    failed = WaitFailurePopen(_VirtualPipe(0, ord("x")), _VirtualPipe(0, ord("y")))
+    later = _FakePopen(_VirtualPipe(0, ord("x")), _VirtualPipe(0, ord("y")), returncode=7)
+    _install_fake_popen(monkeypatch, [failed, later], capture_output=False)
+
+    result = execute_plan(make_plan(tmp_path), runner=None)
+
+    first, second = (check.processes[0] for check in result.checks)
+    assert first.returncode is None
+    assert first.spawn_error == (
+        f"wait failed: {error_type.__name__}: synthetic terminal wait failure"
+    )
+    assert second.returncode == 7
+    assert failed.terminated
+    assert failed.wait_calls[0] is None
+    assert failed.wait_calls[1] is not None
+    assert 0 < failed.wait_calls[1] <= execution._FAILURE_CLEANUP_TIMEOUT_SECONDS
+    assert result.exit_code == 7
 
 
 def test_unexpected_reader_programming_error_cleans_up_then_reraises_by_identity(
