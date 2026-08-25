@@ -29,13 +29,16 @@ def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
 
     assert result == 0
     assert [call.command for call in runner.calls] == [
+        ("uv", "run", "python", "-c", runner.calls[0].command[-1]),
         (
             "uv",
             "run",
-            "python",
-            "-m",
-            "pytest",
-            "tests/test_example.py::test_exact_behavior",
+                "python",
+                "-m",
+                "pytest",
+                "-p",
+                "pyrepo_check_pytest_evidence_plugin",
+                "tests/test_example.py::test_exact_behavior",
         )
     ]
 
@@ -61,7 +64,7 @@ def test_legacy_exit_code_classifies_spawn_and_negative_outcomes(
     result = main(["--root", str(tmp_path), "--all"], runner=runner)
 
     assert result == expected
-    assert len(runner.calls) == 5
+    assert len(runner.calls) == 6
 
 
 def test_spawn_exception_is_recorded_and_later_checks_continue(
@@ -80,7 +83,7 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
     result = main(["--root", str(tmp_path), "--all"], runner=runner)
 
     assert result == 2
-    assert len(runner.calls) == 5
+    assert len(runner.calls) == 6
     assert stdout_at_spawn == [
         "\n==> ruff: uv run python -m ruff check .\n",
         (
@@ -90,6 +93,7 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
         "\n==> ty: uv run python -m ty check\n",
         "\n==> bandit: uv run python -m bandit -c pyproject.toml -r .\n",
         "\n==> pytest: uv run python -m pytest\n",
+        "",
     ]
     assert capsys.readouterr().out == (
         "\n==> pyrepo-check summary: error (incomplete)\n"

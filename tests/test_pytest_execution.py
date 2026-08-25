@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess  # nosec B404
+import tempfile
 from typing import cast
 
 import pytest
@@ -56,6 +58,17 @@ def completed(
         subprocess.CompletedProcess[tuple[str, ...]],
         subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=stderr),
     )
+
+
+def safe_run_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    run_directory = Path(tempfile.mkdtemp(prefix="pyrepo-check-test-"))
+    assert not run_directory.is_relative_to(tmp_path)
+    monkeypatch.setattr(
+        pytest_execution,
+        "_create_run_directory",
+        lambda _consumer_root: run_directory,
+    )
+    return run_directory
 
 
 @pytest.mark.parametrize(
@@ -158,6 +171,55 @@ def test_supported_preflight_records_typed_version_data(tmp_path: Path) -> None:
     assert observation.pytest.preflight.record.pytest_version == (8, 4, 2)
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0], ids=("boolean", "float"))
+def test_preflight_rejects_non_integer_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, env
+        assert capture_output
+        return completed(command, 0, stdout=preflight_document(schema_version=schema_version))
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "preflight_invalid"
+    assert len(observation.processes) == 1
+
+
+def test_preflight_rejects_oversized_stderr(tmp_path: Path) -> None:
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, env
+        assert capture_output
+        return completed(
+            command,
+            0,
+            stdout=preflight_document(),
+            stderr=b"x" * 65_537,
+        )
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "preflight_invalid"
+    assert len(observation.processes) == 1
+
+
 @pytest.mark.parametrize(("output_format", "primary_capture"), [("json", True), ("terminal", False)])
 def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     tmp_path: Path,
@@ -248,9 +310,7 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_directory = tmp_path / "run-directory"
-    run_directory.mkdir()
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", lambda **_kwargs: str(run_directory))
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
 
     def runner(
         command: tuple[str, ...],
@@ -309,9 +369,7 @@ def test_writer_inventory_records_only_regular_valid_markers(
     writer_ids: tuple[str, ...],
     diagnostic: str | None,
 ) -> None:
-    run_directory = tmp_path / "run-directory"
-    run_directory.mkdir()
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", lambda **_kwargs: str(run_directory))
+    safe_run_directory(tmp_path, monkeypatch)
 
     def runner(
         command: tuple[str, ...],
@@ -363,9 +421,7 @@ def test_artifact_snapshot_handles_missing_signal_and_unsafe_paths(
     spawn: bool,
     state: str,
 ) -> None:
-    run_directory = tmp_path / "run-directory"
-    run_directory.mkdir()
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", lambda **_kwargs: str(run_directory))
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
     outside_artifact = tmp_path / "outside-artifact"
     outside_artifact.write_bytes(b"outside")
 
@@ -402,17 +458,20 @@ def test_artifact_read_failure_is_observed_and_cleanup_still_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_directory = tmp_path / "run-directory"
-    run_directory.mkdir()
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", lambda **_kwargs: str(run_directory))
-    original_read_bytes = Path.read_bytes
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
+    original_open = pytest_execution.os.open
 
-    def read_bytes(path: Path) -> bytes:
-        if path.name == "artifact.json":
+    def deny_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: int,
+        **kwargs: int | None,
+    ) -> int:
+        if not args and not kwargs and Path(os.fsdecode(path)).name == "artifact.json":
             raise PermissionError("artifact denied")
-        return original_read_bytes(path)
+        return original_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(pytest_execution.os, "open", deny_open)
 
     def runner(
         command: tuple[str, ...],
@@ -440,13 +499,115 @@ def test_artifact_read_failure_is_observed_and_cleanup_still_runs(
     assert not run_directory.exists()
 
 
+def test_artifact_snapshot_reads_open_descriptor_when_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_run_directory(tmp_path, monkeypatch)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"attacker-content")
+    open_calls: list[Path] = []
+    original_open = pytest_execution.os.open
+
+    def replacement_race(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: int,
+        **kwargs: int | None,
+    ) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        target = Path(os.fsdecode(path))
+        if not args and not kwargs and target.name == "artifact.json":
+            open_calls.append(target)
+            target.unlink()
+            target.symlink_to(replacement)
+        return descriptor
+
+    monkeypatch.setattr(pytest_execution.os, "open", replacement_race)
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output
+        if env is not None and command[1:3] == ("-m", "pytest"):
+            Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"captured-content")
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+        )
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert open_calls
+    assert observation.pytest is not None
+    assert observation.pytest.artifact.state == "snapshot"
+    assert observation.pytest.artifact.content == b"captured-content"
+
+
+def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_run_directory(tmp_path, monkeypatch)
+    replacement = tmp_path / "replacement"
+    replacement.write_text('{"writer_id":"attacker"}')
+    open_calls: list[Path] = []
+    original_open = pytest_execution.os.open
+
+    def replacement_race(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: int,
+        **kwargs: int | None,
+    ) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        target = Path(os.fsdecode(path))
+        if not args and not kwargs and target.name == "pytest-writer-safe.json":
+            open_calls.append(target)
+            target.unlink()
+            target.symlink_to(replacement)
+        return descriptor
+
+    monkeypatch.setattr(pytest_execution.os, "open", replacement_race)
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output
+        if env is not None and command[1:3] == ("-m", "pytest"):
+            Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
+            writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
+            (writer_directory / "pytest-writer-safe.json").write_text('{"writer_id":"safe"}')
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+        )
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert open_calls
+    assert observation.pytest is not None
+    assert observation.pytest.artifact.state == "snapshot"
+    assert observation.pytest.artifact.writer_ids == ("safe",)
+
+
 def test_cleanup_failure_is_observed_without_losing_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_directory = tmp_path / "run-directory"
-    run_directory.mkdir()
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", lambda **_kwargs: str(run_directory))
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
 
     def failing_cleanup(path: Path, *, consumer_root: Path) -> None:
         del path, consumer_root
@@ -486,9 +647,7 @@ def test_setup_failure_is_observed_and_the_created_run_directory_is_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_directory = tmp_path / "run-directory"
-    run_directory.mkdir()
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", lambda **_kwargs: str(run_directory))
+    run_directory = safe_run_directory(tmp_path, monkeypatch)
 
     def fail_copy(source: Path, destination: Path) -> None:
         del source, destination
@@ -503,3 +662,53 @@ def test_setup_failure_is_observed_and_the_created_run_directory_is_removed(
     assert observation.pytest.preflight.classification == "spawn_failed"
     assert observation.pytest.artifact.state == "not_attempted"
     assert not run_directory.exists()
+
+
+def test_consumer_tmpdir_is_not_used_for_the_run_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pytest_execution.tempfile, "gettempdir", lambda: str(tmp_path))
+    run_directories: list[Path] = []
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output
+        if env is not None:
+            run_directories.append(Path(env["PYREPO_CHECK_PYTEST_JSON"]).parent)
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+        )
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "supported"
+    assert run_directories
+    assert all(not directory.is_relative_to(tmp_path) for directory in run_directories)
+
+
+def test_run_directory_creation_failure_is_typed_not_started(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_mkdtemp(**_kwargs: object) -> str:
+        raise PermissionError("temporary directory denied")
+
+    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", fail_mkdtemp)
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json")
+
+    assert observation.processes == ()
+    assert observation.pytest is not None
+    assert observation.pytest.preflight.classification == "not_started"
+    assert observation.pytest.preflight.diagnostic == "PermissionError: temporary directory denied"
+    assert observation.pytest.artifact.state == "not_attempted"

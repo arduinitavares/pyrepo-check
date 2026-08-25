@@ -357,7 +357,19 @@ def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
     captured = capsysbinary.readouterr()
     assert result == 0
     assert [call.command for call in runner.calls] == [
-        ("uv", "run", "python", "-m", "pytest", "tests/unit", "-m", "not slow")
+        ("uv", "run", "python", "-c", runner.calls[0].command[-1]),
+        (
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            "pyrepo_check_pytest_evidence_plugin",
+            "tests/unit",
+            "-m",
+            "not slow",
+        )
     ]
     if output_format == "json":
         assert captured.err == b""

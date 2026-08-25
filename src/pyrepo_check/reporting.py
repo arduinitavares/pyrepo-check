@@ -734,10 +734,24 @@ def _build_check_result(
             ),
         )
 
-    if len(observation.processes) != 1 or observation.processes[0].role != "primary":
+    if planned.pytest is not None:
+        primary = _project_pytest_primary(observation)
+        if primary is None:
+            return CheckResult(
+                name=planned.name,
+                status="error",
+                processes=(),
+                error=CheckError(
+                    code="missing_primary_process",
+                    message="No primary process observation was recorded.",
+                ),
+            )
+    elif len(observation.processes) == 1 and observation.processes[0].role == "primary":
+        primary = observation.processes[0]
+    else:
         raise ReportingError("ordinary check must contain exactly one primary process")
     process, status, error = _build_process_result(
-        observation.processes[0],
+        primary,
         output_format=output_format,
     )
     return CheckResult(
@@ -746,6 +760,17 @@ def _build_check_result(
         processes=(process,),
         error=error,
     )
+
+
+def _project_pytest_primary(observation: ExecutedCheck) -> ExecutedProcess | None:
+    processes = observation.processes
+    if not processes or processes[0].role != "pytest_preflight":
+        raise ReportingError("pytest execution process order must start with preflight")
+    if len(processes) == 1:
+        return None
+    if len(processes) == 2 and processes[1].role == "primary":
+        return processes[1]
+    raise ReportingError("pytest execution process order must be preflight then primary")
 
 
 def _build_process_result(

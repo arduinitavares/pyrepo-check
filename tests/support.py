@@ -7,6 +7,12 @@ import subprocess  # nosec B404
 from typing import cast
 
 
+_SUPPORTED_PYTEST_PREFLIGHT = (
+    b'{"schema_version":1,"python_version":[3,13,15],'
+    b'"pytest_available":true,"pytest_version":[8,4,2]}'
+)
+
+
 @dataclass(frozen=True)
 class RecordedCall:
     command: tuple[str, ...]
@@ -74,6 +80,8 @@ class RecordingRunner:
                 stdout=(
                     self.stdout[returncode_index]
                     if returncode_index < len(self.stdout)
+                    else _SUPPORTED_PYTEST_PREFLIGHT
+                    if "-c" in command
                     else None
                 ),
                 stderr=(

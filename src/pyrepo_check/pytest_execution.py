@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,7 @@ PreflightClassification = Literal[
     "preflight_invalid",
     "spawn_failed",
     "terminated_by_signal",
+    "not_started",
 ]
 ArtifactState = Literal[
     "not_attempted",
@@ -97,15 +99,31 @@ def execute_pytest(
     pytest_plan = check.pytest
     if pytest_plan is None:
         raise ValueError("pytest execution requires PlannedCheck.pytest metadata")
-    run_directory = Path(tempfile.mkdtemp(prefix="pyrepo-check-pytest-"))
     artifact = PytestArtifactObservation("not_attempted", None, (), None)
-    cleanup_error: str | None = None
     processes: list[ExecutedProcess] = []
     preflight = PytestPreflightObservation(
-        "spawn_failed",
+        "not_started",
         None,
         "pytest execution setup did not run",
     )
+    try:
+        run_directory = _create_run_directory(check.cwd)
+    except OSError as error:
+        return ExecutedCheck(
+            planned=check,
+            processes=(),
+            pytest=PytestExecutionObservation(
+                preflight=PytestPreflightObservation(
+                    "not_started",
+                    None,
+                    f"{type(error).__name__}: {error}",
+                ),
+                artifact=artifact,
+                cleanup_error=None,
+            ),
+        )
+
+    cleanup_error: str | None = None
     try:
         artifact_path, writer_directory = _prepare_run_directory(run_directory)
         environment = _isolated_environment(
@@ -251,6 +269,41 @@ def _prepare_run_directory(run_directory: Path) -> tuple[Path, Path]:
     return run_directory / "artifact.json", writer_directory
 
 
+def _create_run_directory(consumer_root: Path) -> Path:
+    resolved_root = consumer_root.resolve()
+    candidates = (Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp"))  # nosec B108
+    last_error: OSError | None = None
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            base = candidate.resolve(strict=True)
+        except OSError as error:
+            last_error = error
+            continue
+        if base in seen or not base.is_dir() or _is_within(base, resolved_root):
+            continue
+        seen.add(base)
+        try:
+            run_directory = Path(
+                tempfile.mkdtemp(prefix="pyrepo-check-pytest-", dir=base)
+            )
+        except OSError as error:
+            last_error = error
+            continue
+        try:
+            resolved_run_directory = run_directory.resolve(strict=True)
+        except OSError as error:
+            last_error = error
+            continue
+        if _is_within(resolved_run_directory, resolved_root):
+            last_error = OSError("refusing run directory inside consumer root")
+            continue
+        return run_directory
+    if last_error is not None:
+        raise last_error
+    raise OSError("no safe operating-system temporary directory is available")
+
+
 def _isolated_environment(
     run_directory: Path,
     artifact_path: Path,
@@ -278,25 +331,16 @@ def _snapshot_artifact(
 ) -> PytestArtifactObservation:
     writer_ids, marker_diagnostic = _snapshot_writer_ids(writer_directory)
     try:
-        artifact_stat = artifact_path.lstat()
+        content = _read_regular_file(artifact_path)
     except FileNotFoundError:
         return PytestArtifactObservation("missing", None, writer_ids, marker_diagnostic)
-    except OSError as error:
-        return PytestArtifactObservation(
-            "read_failed",
-            None,
-            writer_ids,
-            _combine_diagnostic(marker_diagnostic, f"artifact lstat failed: {error}"),
-        )
-    if not stat.S_ISREG(artifact_stat.st_mode):
+    except _UnsafePathError as error:
         return PytestArtifactObservation(
             "unsafe_path",
             None,
             writer_ids,
-            _combine_diagnostic(marker_diagnostic, "artifact is not a regular file"),
+            _combine_diagnostic(marker_diagnostic, str(error)),
         )
-    try:
-        content = artifact_path.read_bytes()
     except OSError as error:
         return PytestArtifactObservation(
             "read_failed",
@@ -319,16 +363,8 @@ def _snapshot_writer_ids(writer_directory: Path) -> tuple[tuple[str, ...], str |
         if marker_id is None:
             continue
         try:
-            marker_stat = marker_path.lstat()
-        except OSError as error:
-            diagnostics.append(f"writer marker lstat failed: {marker_path.name}: {error}")
-            continue
-        if not stat.S_ISREG(marker_stat.st_mode):
-            diagnostics.append(f"writer marker is not a regular file: {marker_path.name}")
-            continue
-        try:
-            document = json.loads(marker_path.read_bytes().decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            document = json.loads(_read_regular_file(marker_path).decode("utf-8"))
+        except (_UnsafePathError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             diagnostics.append(f"writer marker is malformed: {marker_path.name}: {error}")
             continue
         if not isinstance(document, dict) or document.get("writer_id") != marker_id:
@@ -353,9 +389,39 @@ def _marker_id(name: str) -> str | None:
 
 
 def _remove_run_directory(run_directory: Path, *, consumer_root: Path) -> None:
-    if run_directory.resolve() == consumer_root.resolve():
-        raise OSError("refusing to remove consumer root")
+    resolved_run_directory = run_directory.resolve(strict=True)
+    if _is_within(resolved_run_directory, consumer_root.resolve()):
+        raise OSError("refusing to remove consumer root or its contents")
     shutil.rmtree(run_directory)
+
+
+class _UnsafePathError(OSError):
+    """Raised when descriptor-safe regular-file reading is unavailable or fails."""
+
+
+def _read_regular_file(path: Path) -> bytes:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if type(no_follow) is not int:
+        raise _UnsafePathError("safe no-follow file opening is unavailable")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise _UnsafePathError(f"path is not a regular file: {path.name}") from error
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise _UnsafePathError(f"path is not a regular file: {path.name}")
+        with os.fdopen(descriptor, "rb") as file:
+            descriptor = -1
+            return file.read()
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path.is_relative_to(root)
 
 
 def _combine_diagnostic(first: str | None, second: str) -> str:
@@ -376,6 +442,15 @@ def _classify_preflight(process: ExecutedProcess) -> PytestPreflightObservation:
             "preflight_invalid",
             None,
             f"preflight exited with code {process.returncode}",
+        )
+    if any(
+        stream is not None and len(stream) > _PREFLIGHT_LIMIT_BYTES
+        for stream in (process.stdout, process.stderr)
+    ):
+        return PytestPreflightObservation(
+            "preflight_invalid",
+            None,
+            "preflight output exceeds 65536 bytes",
         )
     try:
         record = _parse_preflight_record(process.stdout)
@@ -412,7 +487,7 @@ def _parse_preflight_record(output: bytes | None) -> PytestPreflightRecord:
         "pytest_version",
     }:
         raise ValueError("preflight JSON does not match schema version 1")
-    if document["schema_version"] != 1:
+    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
         raise ValueError("preflight JSON does not match schema version 1")
     python_version = _parse_version(document["python_version"])
     pytest_available = document["pytest_available"]

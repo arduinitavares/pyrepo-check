@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
@@ -15,6 +16,12 @@ from pyrepo_check.planning import (
     PlannedTestScope,
     RunMode,
     RunPlan,
+    PytestExecutionPlan,
+)
+from pyrepo_check.pytest_execution import (
+    PytestArtifactObservation,
+    PytestExecutionObservation,
+    PytestPreflightObservation,
 )
 from pyrepo_check.reporting import (
     Advisory,
@@ -775,6 +782,124 @@ def test_rejects_non_primary_ordinary_process_observation(tmp_path: Path) -> Non
             tmp_path,
             run_plan((ruff,)),
             ExecutionResult((observation,), 0),
+        )
+
+
+def pytest_execution_observation() -> PytestExecutionObservation:
+    return PytestExecutionObservation(
+        preflight=PytestPreflightObservation("supported", None, None),
+        artifact=PytestArtifactObservation("not_attempted", None, (), None),
+        cleanup_error=None,
+    )
+
+
+def pytest_planned_check(root: Path) -> PlannedCheck:
+    pytest_plan = PytestExecutionPlan(("uv", "run", "python"), ("tests",))
+    return PlannedCheck(
+        name="pytest",
+        command=(*pytest_plan.consumer_python, "-m", "pytest", *pytest_plan.pytest_args),
+        cwd=root,
+        pytest=pytest_plan,
+    )
+
+
+def pytest_preflight_process(check: PlannedCheck) -> ExecutedProcess:
+    return ExecutedProcess(
+        role="pytest_preflight",
+        command=("uv", "run", "python", "-c", "probe"),
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"preflight",
+        stderr=b"",
+        spawn_error=None,
+    )
+
+
+def test_pytest_execution_bridge_projects_only_primary_process(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=7,
+        stdout=b"primary",
+        stderr=b"",
+        spawn_error=None,
+    )
+    observation = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check), primary),
+        pytest=pytest_execution_observation(),
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult((observation,), 0),
+    )
+
+    assert report.pytest is None
+    assert len(report.checks[0].processes) == 1
+    assert report.checks[0].processes[0].role == "primary"
+    assert report.checks[0].processes[0].argv == check.command
+
+
+def test_pytest_execution_bridge_keeps_missing_primary_model(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+    observation = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check),),
+        pytest=pytest_execution_observation(),
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,)),
+        ExecutionResult((observation,), 2),
+    )
+
+    assert report.pytest is None
+    assert report.checks[0].error == CheckError(
+        "missing_primary_process",
+        "No primary process observation was recorded.",
+    )
+
+
+@pytest.mark.parametrize(
+    "processes",
+    [
+        lambda check: (ExecutedProcess(
+            role="primary", command=check.command, cwd=check.cwd, returncode=0,
+            duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
+        ), pytest_preflight_process(check)),
+        lambda check: (pytest_preflight_process(check), ExecutedProcess(
+            role="primary", command=check.command, cwd=check.cwd, returncode=0,
+            duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
+        ), ExecutedProcess(
+            role="primary", command=check.command, cwd=check.cwd, returncode=0,
+            duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
+        )),
+    ],
+    ids=("primary-before-preflight", "two-primary-processes"),
+)
+def test_pytest_execution_bridge_rejects_noncanonical_internal_order(
+    tmp_path: Path,
+    processes: Callable[[PlannedCheck], tuple[ExecutedProcess, ...]],
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    observation = ExecutedCheck(
+        planned=check,
+        processes=processes(check),
+        pytest=pytest_execution_observation(),
+    )
+
+    with pytest.raises(ReportingError, match="pytest execution process order"):
+        build_run_report(
+            tmp_path,
+            run_plan((check,)),
+            ExecutionResult((observation,), 2),
         )
 
 
