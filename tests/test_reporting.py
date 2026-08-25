@@ -23,6 +23,14 @@ from pyrepo_check.pytest_execution import (
     PytestArtifactObservation,
     PytestExecutionObservation,
     PytestPreflightObservation,
+    PytestPreflightRecord,
+)
+from pyrepo_check.pytest_evidence import (
+    PytestCounts,
+    PytestError,
+    PytestEvidence,
+    SlowTest,
+    SpecialTestOutcome,
 )
 from pyrepo_check.reporting import (
     Advisory,
@@ -46,10 +54,12 @@ from pyrepo_check.reporting import (
 
 
 def planned_check(root: Path, name: CheckName) -> PlannedCheck:
+    pytest_plan = PytestExecutionPlan(("uv", "run", "python"), ()) if name == "pytest" else None
     return PlannedCheck(
         name=name,
         command=("uv", "run", "python", "-m", name),
         cwd=root,
+        pytest=pytest_plan,
     )
 
 
@@ -62,20 +72,25 @@ def executed_check(
     stderr: bytes | None = b"",
     spawn_error: str | None = None,
 ) -> ExecutedCheck:
+    primary = ExecutedProcess(
+        role="primary",
+        command=planned.command,
+        cwd=planned.cwd,
+        returncode=returncode,
+        duration_ms=duration_ms,
+        stdout=stdout,
+        stderr=stderr,
+        spawn_error=spawn_error,
+    )
+    if planned.name == "pytest":
+        return ExecutedCheck(
+            planned=planned,
+            processes=(pytest_preflight_process(planned), primary),
+            pytest=finalized_pytest_execution_observation(exit_code=returncode or 0),
+        )
     return ExecutedCheck(
         planned=planned,
-        processes=(
-            ExecutedProcess(
-                role="primary",
-                command=planned.command,
-                cwd=planned.cwd,
-                returncode=returncode,
-                duration_ms=duration_ms,
-                stdout=stdout,
-                stderr=stderr,
-                spawn_error=spawn_error,
-            ),
-        ),
+        processes=(primary,),
     )
 
 
@@ -94,11 +109,7 @@ def run_plan(
         pytest_args = targets if pytest_selected else None
     if planned_test_scope is None:
         planned_test_scope = (
-            "not_selected"
-            if not pytest_selected
-            else "partial"
-            if targets
-            else "complete"
+            "not_selected" if not pytest_selected else "partial" if targets else "complete"
         )
     return RunPlan(
         mode=mode,
@@ -140,118 +151,95 @@ def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> 
 
     report = build_run_report(unresolved_root, plan, execution)
 
-    assert report == RunReportV1(
-        schema_version=1,
-        kind="run",
-        project_root=str(unresolved_root.resolve()),
-        mode="focused",
-        overall_status="error",
-        complete=False,
-        selection=Selection(
-            checks=("ruff", "ty", "bandit", "pytest"),
-            targets=("tests/a.py", "tests/a.py"),
-            test_shortcut=None,
-            pytest_args=("tests/a.py", "tests/a.py"),
-            planned_test_scope="partial",
-            planned_coverage_scope="not_requested",
-        ),
-        checks=(
-            CheckResult(
-                name="ruff",
-                status="passed",
-                processes=(
-                    ProcessResult(
-                        role="primary",
-                        argv=ruff.command,
-                        cwd=str(unresolved_root.resolve()),
-                        outcome="exited",
-                        exit_code=0,
-                        signal=None,
-                        duration_ms=11,
-                        stdout=CapturedText(True, "ruff ok\n", False, 0),
-                        stderr=CapturedText(True, "", False, 0),
-                        error_message=None,
-                    ),
-                ),
-                error=None,
-            ),
-            CheckResult(
-                name="ty",
-                status="failed",
-                processes=(
-                    ProcessResult(
-                        role="primary",
-                        argv=ty.command,
-                        cwd=str(unresolved_root.resolve()),
-                        outcome="exited",
-                        exit_code=3,
-                        signal=None,
-                        duration_ms=12,
-                        stdout=CapturedText(True, "", False, 0),
-                        stderr=CapturedText(True, "type failure\n", False, 0),
-                        error_message=None,
-                    ),
-                ),
-                error=None,
-            ),
-            CheckResult(
-                name="bandit",
-                status="error",
-                processes=(
-                    ProcessResult(
-                        role="primary",
-                        argv=bandit.command,
-                        cwd=str(unresolved_root.resolve()),
-                        outcome="signaled",
-                        exit_code=None,
-                        signal=9,
-                        duration_ms=13,
-                        stdout=CapturedText(True, "partial", False, 0),
-                        stderr=CapturedText(True, "", False, 0),
-                        error_message="Process terminated by signal 9.",
-                    ),
-                ),
-                error=CheckError(
-                    "terminated_by_signal",
-                    "Primary process terminated by signal 9.",
-                ),
-            ),
-            CheckResult(
-                name="pytest",
-                status="error",
-                processes=(
-                    ProcessResult(
-                        role="primary",
-                        argv=pytest_check.command,
-                        cwd=str(unresolved_root.resolve()),
-                        outcome="spawn_failed",
-                        exit_code=None,
-                        signal=None,
-                        duration_ms=14,
-                        stdout=CapturedText(True, "", False, 0),
-                        stderr=CapturedText(True, "", False, 0),
-                        error_message="FileNotFoundError: uv",
-                    ),
-                ),
-                error=CheckError(
-                    "spawn_failed",
-                    "Could not start process: FileNotFoundError: uv",
-                ),
-            ),
-        ),
-        pytest=None,
-        coverage=None,
-        advisories=(),
+    assert report.selection == Selection(
+        checks=("ruff", "ty", "bandit", "pytest"),
+        targets=("tests/a.py", "tests/a.py"),
+        test_shortcut=None,
+        pytest_args=("tests/a.py", "tests/a.py"),
+        planned_test_scope="partial",
+        planned_coverage_scope="not_requested",
     )
+    assert report.checks[:3] == (
+        CheckResult(
+            name="ruff",
+            status="passed",
+            processes=(
+                ProcessResult(
+                    role="primary",
+                    argv=ruff.command,
+                    cwd=str(unresolved_root.resolve()),
+                    outcome="exited",
+                    exit_code=0,
+                    signal=None,
+                    duration_ms=11,
+                    stdout=CapturedText(True, "ruff ok\n", False, 0),
+                    stderr=CapturedText(True, "", False, 0),
+                    error_message=None,
+                ),
+            ),
+            error=None,
+        ),
+        CheckResult(
+            name="ty",
+            status="failed",
+            processes=(
+                ProcessResult(
+                    role="primary",
+                    argv=ty.command,
+                    cwd=str(unresolved_root.resolve()),
+                    outcome="exited",
+                    exit_code=3,
+                    signal=None,
+                    duration_ms=12,
+                    stdout=CapturedText(True, "", False, 0),
+                    stderr=CapturedText(True, "type failure\n", False, 0),
+                    error_message=None,
+                ),
+            ),
+            error=None,
+        ),
+        CheckResult(
+            name="bandit",
+            status="error",
+            processes=(
+                ProcessResult(
+                    role="primary",
+                    argv=bandit.command,
+                    cwd=str(unresolved_root.resolve()),
+                    outcome="signaled",
+                    exit_code=None,
+                    signal=9,
+                    duration_ms=13,
+                    stdout=CapturedText(True, "partial", False, 0),
+                    stderr=CapturedText(True, "", False, 0),
+                    error_message="Process terminated by signal 9.",
+                ),
+            ),
+            error=CheckError(
+                "terminated_by_signal",
+                "Primary process terminated by signal 9.",
+            ),
+        ),
+    )
+    assert report.checks[3].status == "error"
+    assert [process.role for process in report.checks[3].processes] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    assert report.checks[3].error == CheckError(
+        "spawn_failed", "Could not start pytest: FileNotFoundError: uv"
+    )
+    assert report.pytest is not None
+    assert report.pytest.error == reporting.PytestError("spawn_failed", "FileNotFoundError: uv")
+    assert report.coverage is None
+    assert report.advisories == ()
 
 
 def test_terminal_observations_are_explicitly_uncaptured(tmp_path: Path) -> None:
     check = planned_check(tmp_path, "ruff")
     plan = run_plan((check,), output_format="terminal")
     execution = ExecutionResult(
-        checks=(
-            executed_check(check, 0, stdout=None, stderr=None),
-        ),
+        checks=(executed_check(check, 0, stdout=None, stderr=None),),
         exit_code=0,
     )
 
@@ -340,7 +328,8 @@ def test_selected_pytest_projects_exact_arguments_and_scope(
 
     assert report.selection.pytest_args == pytest_args
     assert report.selection.planned_test_scope == planned_test_scope
-    assert report.pytest is None
+    assert report.pytest is not None
+    assert report.pytest.scope == ("complete" if not targets else "partial")
     assert report.coverage is None
 
 
@@ -449,9 +438,7 @@ def test_render_terminal_snapshot_for_passed_run(tmp_path: Path) -> None:
     )
 
     assert render_terminal(report) == (
-        "\n"
-        "==> pyrepo-check summary: passed (complete)\n"
-        "    passed: ruff, ty\n"
+        "\n==> pyrepo-check summary: passed (complete)\n    passed: ruff, ty\n"
     )
 
 
@@ -587,24 +574,27 @@ def test_serialize_json_projects_test_shortcut_selection_in_normative_order(
         planned_test_scope="partial",
         planned_coverage_scope="not_requested",
     )
-    expected = (
-        b'{"schema_version":1,"kind":"run","project_root":"'
-        + root
-        + b'","mode":"focused","overall_status":"passed","complete":true,'
-        b'"selection":{"checks":["pytest"],"targets":[],"test_shortcut":"unit",'
-        b'"pytest_args":["tests/unit","-m","not slow"],"planned_test_scope":"partial",'
-        b'"planned_coverage_scope":"not_requested"},"checks":[{"name":"pytest",'
-        b'"status":"passed","processes":[{"role":"primary","argv":["uv","run",'
-        b'"python","-m","pytest"],"cwd":"'
-        + root
-        + b'","outcome":"exited","exit_code":0,"signal":null,"duration_ms":7,'
-        b'"stdout":{"captured":true,"text":"","truncated":false,"omitted_bytes":0},'
-        b'"stderr":{"captured":true,"text":"","truncated":false,"omitted_bytes":0},'
-        b'"error_message":null}],"error":null}],"pytest":null,"coverage":null,'
-        b'"advisories":[]}\n'
-    )
-
-    assert serialize_json(report) == expected
+    payload = reporting.json.loads(serialize_json(report))
+    assert list(payload) == [
+        "schema_version",
+        "kind",
+        "project_root",
+        "mode",
+        "overall_status",
+        "complete",
+        "selection",
+        "checks",
+        "pytest",
+        "coverage",
+        "advisories",
+    ]
+    assert payload["project_root"] == root.decode()
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    assert payload["pytest"]["scope_reasons"] == ["planned_selector"]
+    assert payload["coverage"] is None
 
 
 @pytest.mark.parametrize("code", ("unknown_test_shortcut", "invalid_test_shortcut"))
@@ -612,9 +602,7 @@ def test_serialize_json_accepts_test_shortcut_planning_errors(code: str) -> None
     report = build_planning_error_report(cast(Any, code), "shortcut planning failed")
 
     assert validate_report_v1(report) is None
-    assert serialize_json(report).startswith(
-        b'{"schema_version":1,"kind":"planning_error"'
-    )
+    assert serialize_json(report).startswith(b'{"schema_version":1,"kind":"planning_error"')
 
 
 def test_serialize_json_validates_before_encoding_and_returns_no_bytes_on_failure(
@@ -661,7 +649,9 @@ def test_select_exit_code_preserves_first_positive_process_code(tmp_path: Path) 
     assert select_exit_code(report) == 7
 
 
-def test_select_exit_code_uses_report_status_when_no_positive_process_exists(tmp_path: Path) -> None:
+def test_select_exit_code_uses_report_status_when_no_positive_process_exists(
+    tmp_path: Path,
+) -> None:
     passed_check = planned_check(tmp_path, "ruff")
     passed = build_run_report(
         tmp_path,
@@ -694,7 +684,9 @@ def test_select_exit_code_uses_report_status_when_no_positive_process_exists(tmp
                 "ruff",
                 "error",
                 (),
-                CheckError("missing_primary_process", "No primary process observation was recorded."),
+                CheckError(
+                    "missing_primary_process", "No primary process observation was recorded."
+                ),
             ),
         ),
         pytest=None,
@@ -778,7 +770,9 @@ def test_rejects_non_primary_ordinary_process_observation(tmp_path: Path) -> Non
         ),
     )
 
-    with pytest.raises(ReportingError, match="ordinary check must contain exactly one primary process"):
+    with pytest.raises(
+        ReportingError, match="ordinary check must contain exactly one primary process"
+    ):
         build_run_report(
             tmp_path,
             run_plan((ruff,)),
@@ -791,6 +785,63 @@ def pytest_execution_observation() -> PytestExecutionObservation:
         preflight=PytestPreflightObservation("supported", None, None),
         artifact=PytestArtifactObservation("not_attempted", None, (), None),
         cleanup_error=None,
+    )
+
+
+def finalized_pytest_execution_observation(
+    *, cleanup_error: str | None = None, exit_code: int = 0
+) -> PytestExecutionObservation:
+    artifact = {
+        "schema_version": 1,
+        "state": "finalized",
+        "writer_id": "writer-1",
+        "pytest_version": "8.4.2",
+        "session": {
+            "starts": 1,
+            "finishes": 1,
+            "exit_code": exit_code,
+            "collection_completed": True,
+            "stopped_early": False,
+        },
+        "effective_args": [],
+        "semantic_options": {
+            "collection_paths": [],
+            "keyword": "",
+            "markexpr": "",
+            "deselect": [],
+            "ignore": [],
+            "ignore_glob": [],
+            "lf": False,
+            "pyargs": False,
+            "collectonly": False,
+            "setuponly": False,
+            "setupplan": False,
+        },
+        "collection": {
+            "initial_nodeids": [],
+            "final_nodeids": [],
+            "deselected_nodeids": [],
+            "uncovered_removed_nodeids": [],
+            "errors": [],
+            "skips": [],
+        },
+        "reports": [],
+        "flags": {
+            "unsupported_parallelism": False,
+            "unsupported_retries": False,
+            "worker_metadata": False,
+        },
+    }
+    return PytestExecutionObservation(
+        preflight=PytestPreflightObservation(
+            "supported",
+            PytestPreflightRecord((3, 13, 15), True, (8, 4, 2)),
+            None,
+        ),
+        artifact=PytestArtifactObservation(
+            "snapshot", reporting.json.dumps(artifact).encode(), ("writer-1",), None
+        ),
+        cleanup_error=cleanup_error,
     )
 
 
@@ -817,7 +868,9 @@ def pytest_preflight_process(check: PlannedCheck) -> ExecutedProcess:
     )
 
 
-def test_pytest_execution_bridge_projects_only_primary_process(tmp_path: Path) -> None:
+def test_pytest_execution_bridge_projects_structured_evidence_and_both_processes(
+    tmp_path: Path,
+) -> None:
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
@@ -832,7 +885,7 @@ def test_pytest_execution_bridge_projects_only_primary_process(tmp_path: Path) -
     observation = ExecutedCheck(
         planned=check,
         processes=(pytest_preflight_process(check), primary),
-        pytest=pytest_execution_observation(),
+        pytest=finalized_pytest_execution_observation(),
     )
 
     report = build_run_report(
@@ -841,18 +894,23 @@ def test_pytest_execution_bridge_projects_only_primary_process(tmp_path: Path) -
         ExecutionResult((observation,), 0),
     )
 
-    assert report.pytest is None
-    assert len(report.checks[0].processes) == 1
-    assert report.checks[0].processes[0].role == "primary"
-    assert report.checks[0].processes[0].argv == check.command
+    assert report.pytest is not None
+    assert report.pytest.status == "passed"
+    assert report.pytest.complete is True
+    assert report.pytest.exit_code == 0
+    assert [process.role for process in report.checks[0].processes] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    assert report.checks[0].processes[1].argv == check.command
 
 
-def test_pytest_execution_bridge_keeps_missing_primary_model(tmp_path: Path) -> None:
+def test_pytest_execution_bridge_projects_missing_primary_as_not_started(tmp_path: Path) -> None:
     check = pytest_planned_check(tmp_path)
     observation = ExecutedCheck(
         planned=check,
         processes=(pytest_preflight_process(check),),
-        pytest=pytest_execution_observation(),
+        pytest=finalized_pytest_execution_observation(),
     )
 
     report = build_run_report(
@@ -861,11 +919,162 @@ def test_pytest_execution_bridge_keeps_missing_primary_model(tmp_path: Path) -> 
         ExecutionResult((observation,), 2),
     )
 
-    assert report.pytest is None
+    assert report.pytest is not None
+    assert report.pytest.error is not None
+    assert report.pytest.error.code == "not_started"
     assert report.checks[0].error == CheckError(
         "missing_primary_process",
         "No primary process observation was recorded.",
     )
+
+
+def test_selected_pytest_without_observation_is_not_started_and_incomplete(tmp_path: Path) -> None:
+    check = pytest_planned_check(tmp_path)
+
+    report = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((), 0))
+
+    assert report.overall_status == "error"
+    assert report.complete is False
+    assert report.pytest is not None
+    assert report.pytest.error == reporting.PytestError(
+        "not_started", "pytest execution was not observed"
+    )
+    assert report.checks[0].processes == ()
+    assert report.checks[0].error == CheckError(
+        "missing_primary_process", "No primary process observation was recorded."
+    )
+
+
+def test_pytest_cleanup_error_overrides_check_but_preserves_finalized_result(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    observation = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check), primary),
+        pytest=finalized_pytest_execution_observation(cleanup_error="PermissionError: denied"),
+    )
+
+    report = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((observation,), 0))
+
+    assert report.pytest is not None
+    assert report.pytest.status == "passed"
+    assert report.pytest.complete is True
+    assert report.checks[0].status == "error"
+    assert report.checks[0].error == CheckError(
+        "cleanup_failed", "Could not clean up pytest evidence: PermissionError: denied"
+    )
+    assert report.complete is False
+
+
+def test_terminal_renders_structured_pytest_special_slow_and_sorted_advisories(
+    tmp_path: Path,
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    observation = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check), primary),
+        pytest=finalized_pytest_execution_observation(),
+    )
+    report = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((observation,), 0))
+    assert report.pytest is not None
+    evidence = PytestEvidence(
+        effective_args=(),
+        collected=2,
+        deselected=0,
+        counts=PytestCounts(0, 0, 0, 2, 0, 0),
+        collection_errors=(),
+        collection_skips=(),
+        slowest=(SlowTest("z::slow", 20), SlowTest("a::slow", 10)),
+        special_outcomes=(
+            SpecialTestOutcome("a::skip", "skipped", None, None, False, 10),
+            SpecialTestOutcome("z::skip", "skipped", "because", None, False, 20),
+        ),
+    )
+    pytest_result = replace(report.pytest, evidence=evidence)
+    report = replace(
+        report,
+        pytest=pytest_result,
+        advisories=reporting._build_advisories(report.checks, pytest_result),
+    )
+
+    assert render_terminal(report) == (
+        "\n==> pyrepo-check summary: passed (complete)\n"
+        "    special: pytest skipped: a::skip\n"
+        "    special: pytest skipped: z::skip (because)\n"
+        "    slow: pytest z::slow (20 ms)\n"
+        "    slow: pytest a::slow (10 ms)\n"
+        "    advisory: pytest skipped has no reason: a::skip.\n"
+        "    passed: pytest\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda report: replace(report, pytest=None),
+        lambda report: replace(
+            report,
+            pytest=replace(
+                report.pytest, complete=True, error=PytestError("internal_error", "bad")
+            ),
+        ),
+        lambda report: replace(
+            report,
+            pytest=replace(
+                report.pytest,
+                evidence=replace(
+                    report.pytest.evidence,
+                    counts=replace(report.pytest.evidence.counts, passed=cast(Any, True)),
+                ),
+            ),
+        ),
+    ),
+    ids=("selected-null", "complete-error", "boolean-count"),
+)
+def test_validation_rejects_malformed_public_pytest_models(
+    tmp_path: Path, mutate: Callable[[RunReportV1], RunReportV1]
+) -> None:
+    check = pytest_planned_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=b"",
+        stderr=b"",
+        spawn_error=None,
+    )
+    observation = ExecutedCheck(
+        planned=check,
+        processes=(pytest_preflight_process(check), primary),
+        pytest=finalized_pytest_execution_observation(),
+    )
+    report = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((observation,), 0))
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(mutate(report))
 
 
 def test_pytest_setup_not_started_projects_missing_primary_model(
@@ -885,7 +1094,9 @@ def test_pytest_setup_not_started_projects_missing_primary_model(
     assert execution.checks[0].processes == ()
     assert execution.checks[0].pytest is not None
     assert execution.checks[0].pytest.preflight.classification == "not_started"
-    assert report.pytest is None
+    assert report.pytest is not None
+    assert report.pytest.error is not None
+    assert report.pytest.error.code == "not_started"
     assert report.checks[0].error == CheckError(
         "missing_primary_process",
         "No primary process observation was recorded.",
@@ -896,17 +1107,42 @@ def test_pytest_setup_not_started_projects_missing_primary_model(
     "processes",
     [
         lambda check: (),
-        lambda check: (ExecutedProcess(
-            role="primary", command=check.command, cwd=check.cwd, returncode=0,
-            duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
-        ), pytest_preflight_process(check)),
-        lambda check: (pytest_preflight_process(check), ExecutedProcess(
-            role="primary", command=check.command, cwd=check.cwd, returncode=0,
-            duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
-        ), ExecutedProcess(
-            role="primary", command=check.command, cwd=check.cwd, returncode=0,
-            duration_ms=1, stdout=b"", stderr=b"", spawn_error=None,
-        )),
+        lambda check: (
+            ExecutedProcess(
+                role="primary",
+                command=check.command,
+                cwd=check.cwd,
+                returncode=0,
+                duration_ms=1,
+                stdout=b"",
+                stderr=b"",
+                spawn_error=None,
+            ),
+            pytest_preflight_process(check),
+        ),
+        lambda check: (
+            pytest_preflight_process(check),
+            ExecutedProcess(
+                role="primary",
+                command=check.command,
+                cwd=check.cwd,
+                returncode=0,
+                duration_ms=1,
+                stdout=b"",
+                stderr=b"",
+                spawn_error=None,
+            ),
+            ExecutedProcess(
+                role="primary",
+                command=check.command,
+                cwd=check.cwd,
+                returncode=0,
+                duration_ms=1,
+                stdout=b"",
+                stderr=b"",
+                spawn_error=None,
+            ),
+        ),
     ],
     ids=("empty-supported-observation", "primary-before-preflight", "two-primary-processes"),
 )
@@ -1516,7 +1752,9 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
     if case == "positive-exit-claimed-passed":
         failed_process = failed.checks[0].processes[0]
         result = replace(failed.checks[0], status="passed", error=None)
-        return replace(failed, overall_status="passed", checks=(replace(result, processes=(failed_process,)),))
+        return replace(
+            failed, overall_status="passed", checks=(replace(result, processes=(failed_process,)),)
+        )
     if case == "zero-exit-claimed-failed":
         result = replace(passed.checks[0], status="failed", error=None)
         return replace(passed, overall_status="failed", checks=(result,))
