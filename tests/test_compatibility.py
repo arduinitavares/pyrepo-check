@@ -1,21 +1,120 @@
 from pathlib import Path
+import json
+import os
+import subprocess  # nosec B404
 import sys
 import tomllib
 
 import pytest
 
 from pyrepo_check.cli import main, parse_args
-from tests.support import RecordingRunner
+from tests.support import RecordedCall, RecordingRunner
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_external_consumer(root: Path) -> None:
+    (root / "tests").mkdir()
+    (root / "support").mkdir()
+    (root / ".gitignore").write_text(".venv/\n.pytest_cache/\n__pycache__/\n", encoding="utf-8")
+    (root / "pyproject.toml").write_text(
+        """[project]
+name = "c2-external-consumer"
+version = "0.0.0"
+requires-python = ">=3.13.15"
+dependencies = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+""",
+        encoding="utf-8",
+    )
+    (root / "support" / "support_marker.py").write_text(
+        "VALUE = 'inherited-pythonpath'\n", encoding="utf-8"
+    )
+    (root / "consumer_marker.py").write_text("VALUE = 'consumer'\n", encoding="utf-8")
+    (root / "tests" / "test_consumer.py").write_text(
+        """from pathlib import Path
+import consumer_marker
+import importlib.util
+import os
+import support_marker
+import sys
+
+
+def test_consumer_execution_is_owned_by_the_consumer() -> None:
+    assert Path.cwd() == Path(__file__).parents[1]
+    assert consumer_marker.VALUE == "consumer"
+    assert support_marker.VALUE == "inherited-pythonpath"
+    assert str(Path.cwd()) in sys.path
+    assert importlib.util.find_spec("pyrepo_check") is None
+    assert "COVERAGE_PROCESS_START" not in os.environ
+    assert "COVERAGE_PROCESS_CONFIG" not in os.environ
+""",
+        encoding="utf-8",
+    )
+
+
+def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
+    tmp_path: Path,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_external_consumer(consumer)
+    subprocess.run(("uv", "lock"), cwd=consumer, check=True, capture_output=True)  # nosec B603
+    subprocess.run(("git", "init", "-q"), cwd=consumer, check=True)  # nosec B603
+    before_status = subprocess.run(  # nosec B603
+        ("git", "status", "--short"),
+        cwd=consumer,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    environment = dict(os.environ)
+    environment["COVERAGE_PROCESS_START"] = str(consumer / "coverage.toml")
+    environment["COVERAGE_PROCESS_CONFIG"] = str(consumer / "coverage.toml")
+    environment["COVERAGE_FILE"] = str(consumer / ".coverage")
+    environment["PYTHONPATH"] = str(consumer / "support")
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--format",
+            "json",
+            "pytest",
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+
+    payload = json.loads(completed.stdout)
+    after_status = subprocess.run(  # nosec B603
+        ("git", "status", "--short"),
+        cwd=consumer,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    assert payload["pytest"]["evidence"] is not None
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
+        "pytest_preflight",
+        "primary",
+    ]
+    assert after_status == before_status
+    assert not list(consumer.rglob(".coverage*"))
+    assert not list(consumer.rglob("pyrepo_check_pytest_*.py"))
 
 
 def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
     test_file = tmp_path / "tests" / "test_example.py"
     test_file.parent.mkdir()
     test_file.write_text("", encoding="utf-8")
-    runner = RecordingRunner()
+    runner = RecordingRunner(publish_pytest_artifact=True)
 
     result = main(
         [
@@ -41,6 +140,29 @@ def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
                 "tests/test_example.py::test_exact_behavior",
         )
     ]
+
+
+def test_recording_runner_opt_in_publishes_raw_pytest_protocol(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "artifact.json"
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    runner = RecordingRunner(publish_pytest_artifact=True)
+
+    runner(
+        ("consumer-python", "-m", "pytest", "-p", "owned_plugin", "tests"),
+        cwd=tmp_path,
+        check=False,
+        env={
+            "PYREPO_CHECK_PYTEST_JSON": str(artifact_path),
+            "PYREPO_CHECK_PYTEST_WRITER_DIR": str(writer_directory),
+        },
+    )
+
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    markers = list(writer_directory.glob("pytest-writer-*.json"))
+    assert artifact["state"] == "finalized"
+    assert artifact["effective_args"] == ["tests"]
+    assert artifact["writer_id"] == json.loads(markers[0].read_text())["writer_id"]
 
 
 @pytest.mark.parametrize(
@@ -74,10 +196,15 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
     (tmp_path / "src").mkdir()
     error = FileNotFoundError("uv")
     stdout_at_spawn: list[str] = []
+
+    def record_spawn(call: RecordedCall) -> None:
+        stdout_at_spawn.append(capsys.readouterr().out)
+
     runner = RecordingRunner(
         raise_on_call=2,
         exception=error,
-        on_call=lambda _call: stdout_at_spawn.append(capsys.readouterr().out),
+        on_call=record_spawn,
+        publish_pytest_artifact=True,
     )
 
     result = main(["--root", str(tmp_path), "--all"], runner=runner)

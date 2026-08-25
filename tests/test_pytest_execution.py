@@ -233,6 +233,7 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     primary_capture: bool,
 ) -> None:
     monkeypatch.setenv("PYTHONPATH", "consumer-path")
+    monkeypatch.setenv("COVERAGE_PROCESS_CONFIG", "consumer-coverage-config")
     monkeypatch.setenv("COVERAGE_PROCESS_START", "consumer-coverage")
     monkeypatch.setenv("COV_CORE_SOURCE", "consumer-source")
     calls: list[tuple[tuple[str, ...], Path, bool, dict[str, str] | None]] = []
@@ -263,13 +264,20 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     assert [call[1] for call in calls] == [tmp_path, tmp_path]
     assert [call[2] for call in calls] == [True, primary_capture]
     assert all(call[3] is not None for call in calls)
+    environments = [call[3] for call in calls]
+    assert all(environment is not None for environment in environments)
+    assert all(
+        "COVERAGE_PROCESS_CONFIG" not in environment
+        and "COVERAGE_PROCESS_START" not in environment
+        and "COV_CORE_SOURCE" not in environment
+        for environment in environments
+        if environment is not None
+    )
     environment = calls[1][3]
     assert environment is not None
     assert environment["PYTHONPATH"].split(":")[0] == "consumer-path"
     assert not Path(environment["PYREPO_CHECK_PYTEST_JSON"]).is_relative_to(tmp_path)
     assert not Path(environment["PYREPO_CHECK_PYTEST_WRITER_DIR"]).is_relative_to(tmp_path)
-    assert "COVERAGE_PROCESS_START" not in environment
-    assert "COV_CORE_SOURCE" not in environment
     assert [process.role for process in result.checks[0].processes] == [
         "pytest_preflight",
         "primary",

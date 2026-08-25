@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import subprocess  # nosec B404
 from typing import cast
@@ -32,6 +33,7 @@ class RecordingRunner:
         raise_on_call: int | None = None,
         exception: Exception | None = None,
         on_call: Callable[[RecordedCall], None] | None = None,
+        publish_pytest_artifact: bool = False,
     ) -> None:
         self.returncodes = returncodes
         self.stdout = stdout
@@ -39,6 +41,7 @@ class RecordingRunner:
         self.raise_on_call = raise_on_call
         self.exception = exception
         self.on_call = on_call
+        self.publish_pytest_artifact = publish_pytest_artifact
         self.calls: list[RecordedCall] = []
 
     def __call__(
@@ -72,6 +75,8 @@ class RecordingRunner:
             if returncode_index < len(self.returncodes)
             else 0
         )
+        if self.publish_pytest_artifact:
+            _publish_pytest_artifact(command, env, returncode)
         return cast(
             subprocess.CompletedProcess[tuple[str, ...]],
             subprocess.CompletedProcess(
@@ -91,3 +96,65 @@ class RecordingRunner:
                 ),
             ),
         )
+
+
+def _publish_pytest_artifact(
+    command: tuple[str, ...],
+    environment: Mapping[str, str] | None,
+    returncode: int,
+) -> None:
+    if environment is None or "-m" not in command:
+        return
+    module_index = command.index("-m")
+    if command[module_index + 1] != "pytest":
+        return
+    plugin_index = command.index("-p", module_index + 2)
+    artifact_path = Path(environment["PYREPO_CHECK_PYTEST_JSON"])
+    writer_directory = Path(environment["PYREPO_CHECK_PYTEST_WRITER_DIR"])
+    writer_id = "recording-runner"
+    artifact = {
+        "schema_version": 1,
+        "state": "finalized",
+        "writer_id": writer_id,
+        "pytest_version": "8.4.2",
+        "session": {
+            "starts": 1,
+            "finishes": 1,
+            "exit_code": returncode,
+            "collection_completed": True,
+            "stopped_early": False,
+        },
+        "effective_args": list(command[plugin_index + 2 :]),
+        "semantic_options": {
+            "collection_paths": [],
+            "keyword": "",
+            "markexpr": "",
+            "deselect": [],
+            "ignore": [],
+            "ignore_glob": [],
+            "lf": False,
+            "pyargs": False,
+            "collectonly": False,
+            "setuponly": False,
+            "setupplan": False,
+        },
+        "collection": {
+            "initial_nodeids": [],
+            "final_nodeids": [],
+            "deselected_nodeids": [],
+            "uncovered_removed_nodeids": [],
+            "errors": [],
+            "skips": [],
+        },
+        "reports": [],
+        "flags": {
+            "unsupported_parallelism": False,
+            "unsupported_retries": False,
+            "worker_metadata": False,
+        },
+    }
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    (writer_directory / f"pytest-writer-{writer_id}.json").write_text(
+        json.dumps({"schema_version": 1, "writer_id": writer_id, "pid": 1}),
+        encoding="utf-8",
+    )

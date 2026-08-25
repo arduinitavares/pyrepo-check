@@ -328,7 +328,9 @@ def _isolated_environment(
 ) -> dict[str, str]:
     environment = dict(os.environ)
     for name in tuple(environment):
-        if name == "COVERAGE_PROCESS_START" or name.startswith("COV_CORE_"):
+        if name in {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"} or name.startswith(
+            "COV_CORE_"
+        ):
             del environment[name]
     existing_pythonpath = environment.get("PYTHONPATH")
     plugin_path = str(run_directory)

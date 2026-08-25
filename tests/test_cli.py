@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import subprocess  # nosec B404
 
 import pytest
 
@@ -16,6 +17,9 @@ from pyrepo_check.planning import (
 from tests.support import RecordingRunner
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _write_test_shortcuts(root: Path, shortcuts: dict[str, object]) -> None:
     shortcut_toml = "\n".join(
         f"{json.dumps(name)} = {json.dumps(args)}"
@@ -25,6 +29,109 @@ def _write_test_shortcuts(root: Path, shortcuts: dict[str, object]) -> None:
         "[tool.pyrepo-check.test-shortcuts]\n" + shortcut_toml,
         encoding="utf-8",
     )
+
+
+def _write_live_pytest_consumer(root: Path, *, include_pytest: bool = True) -> None:
+    dependencies = '["pytest>=8,<9"]' if include_pytest else "[]"
+    shortcut = (
+        "\n[tool.pyrepo-check.test-shortcuts]\nunit = [\"tests/test_sample.py::test_selected\"]\n"
+        if include_pytest
+        else ""
+    )
+    (root / "pyproject.toml").write_text(
+        "[project]\n"
+        "name = \"task-8-live-consumer\"\n"
+        "version = \"0.0.0\"\n"
+        "requires-python = \">=3.13.15\"\n"
+        f"dependencies = {dependencies}\n"
+        "\n[tool.pytest.ini_options]\n"
+        "testpaths = [\"tests\"]\n"
+        + shortcut,
+        encoding="utf-8",
+    )
+    if include_pytest:
+        (root / "tests").mkdir()
+        (root / "tests" / "test_sample.py").write_text(
+            "def test_selected():\n    assert True\n\n\ndef test_other():\n    assert True\n",
+            encoding="utf-8",
+        )
+    subprocess.run(("uv", "lock"), cwd=root, check=True, capture_output=True)  # nosec B603
+
+
+@pytest.mark.parametrize(
+    ("output_format", "pytest_args", "expected_args"),
+    (
+        ("terminal", ("tests/test_sample.py::test_selected",), ["tests/test_sample.py::test_selected"]),
+        ("json", ("--shortcut", "unit"), ["tests/test_sample.py::test_selected"]),
+    ),
+)
+def test_structured_pytest_cli_runs_a_real_consumer_with_one_primary(
+    tmp_path: Path,
+    output_format: str,
+    pytest_args: tuple[str, ...],
+    expected_args: list[str],
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_live_pytest_consumer(consumer)
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--root",
+            str(consumer),
+            "--format",
+            output_format,
+            "pytest",
+            *pytest_args,
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0
+    if output_format == "terminal":
+        assert b"VIRTUAL_ENV" in completed.stderr
+        assert b"==> pyrepo-check summary: passed (complete)" in completed.stdout
+        return
+    assert completed.stderr == b""
+    payload = json.loads(completed.stdout)
+    assert payload["selection"]["pytest_args"] == expected_args
+    assert payload["pytest"]["scope"] == "partial"
+    assert payload["pytest"]["evidence"] is not None
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
+        "pytest_preflight",
+        "primary",
+    ]
+
+
+def test_structured_pytest_cli_stops_after_unsupported_preflight(tmp_path: Path) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_live_pytest_consumer(consumer, include_pytest=False)
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--root",
+            str(consumer),
+            "--format",
+            "json",
+            "pytest",
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 2
+    assert completed.stderr == b""
+    assert payload["pytest"]["error"]["code"] == "module_unavailable"
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
+        "pytest_preflight",
+    ]
 
 
 def _assert_planning_error_output(
@@ -346,7 +453,7 @@ def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
 ) -> None:
     (tmp_path / "tests" / "unit").mkdir(parents=True)
     _write_test_shortcuts(tmp_path, {"unit": ["tests/unit", "-m", "not slow"]})
-    runner = RecordingRunner()
+    runner = RecordingRunner(publish_pytest_artifact=True)
     argv = ["--root", str(tmp_path)]
     if output_format == "json":
         argv.extend(("--format", "json"))
