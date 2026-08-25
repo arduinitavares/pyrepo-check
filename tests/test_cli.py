@@ -114,7 +114,7 @@ def test_structured_pytest_cli_runs_a_real_consumer_with_one_primary(
     assert completed.returncode == 0
     if output_format == "terminal":
         assert b"VIRTUAL_ENV" in completed.stderr
-        assert b"==> pyrepo-check summary: passed (complete)" in completed.stdout
+        assert b"==> pyrepo-check summary: passed (focused)" in completed.stdout
         return
     assert completed.stderr == b""
     payload = json.loads(completed.stdout)
@@ -1007,7 +1007,7 @@ def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
     else:
         assert captured.err == b""
         assert captured.out.endswith(
-            b"\n==> pyrepo-check summary: passed (complete)\n    passed: pytest\n"
+            b"\n==> pyrepo-check summary: passed (focused)\n    passed: pytest\n"
         )
 
 
@@ -1030,7 +1030,7 @@ def test_terminal_summary_is_written_only_after_final_runner_call(
         "\n==> ty: uv run python -m ty check\n",
     ]
     assert capsys.readouterr().out == (
-        "\n==> pyrepo-check summary: failed (complete)\n"
+        "\n==> pyrepo-check summary: failed (focused)\n"
         "    failed: ty (exit 7)\n"
         "    passed: ruff\n"
     )
@@ -1039,12 +1039,12 @@ def test_terminal_summary_is_written_only_after_final_runner_call(
 @pytest.mark.parametrize(
     ("returncode", "expected_exit", "expected_summary"),
     (
-        (0, 0, "passed (complete)\n    passed: ruff"),
-        (4, 4, "failed (complete)\n    failed: ruff (exit 4)"),
+        (0, 0, "passed (focused)\n    passed: ruff"),
+        (4, 4, "failed (focused)\n    failed: ruff (exit 4)"),
         (
             -15,
             2,
-            "error (incomplete)\n"
+            "error (focused, incomplete)\n"
             "    error: ruff: Primary process terminated by signal 15.",
         ),
     ),

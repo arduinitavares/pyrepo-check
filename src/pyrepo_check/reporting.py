@@ -114,6 +114,7 @@ _ADVISORY_CODES = frozenset(
         "output_truncated",
     )
 )
+_TERMINAL_COVERAGE_FILE_LIMIT = 3
 _PYTEST_SCOPE_REASONS: tuple[str, ...] = (
     "planned_selector",
     "effective_narrowing_option",
@@ -382,8 +383,10 @@ def render_terminal(report: AgentReportV1) -> str:
             lines.append(f"Hint: {report.error.hint}")
         return "\n".join(lines) + "\n"
 
-    completeness = "complete" if report.complete else "incomplete"
-    lines = ["", f"==> pyrepo-check summary: {report.overall_status} ({completeness})"]
+    run_context = report.mode.replace("_", " ")
+    if not report.complete:
+        run_context = f"{run_context}, incomplete"
+    lines = ["", f"==> pyrepo-check summary: {report.overall_status} ({run_context})"]
     if report.pytest is not None and (
         not report.pytest.complete or report.pytest.status == "error"
     ):
@@ -424,7 +427,7 @@ def render_terminal(report: AgentReportV1) -> str:
     if report.coverage is not None and report.coverage.status == "failed":
         _append_failed_line(lines, "coverage", None)
     if report.coverage is not None and report.coverage.totals is not None:
-        _append_coverage_gaps(lines, report.coverage)
+        _append_coverage_summary(lines, report.coverage)
     if report.pytest is not None and report.pytest.evidence is not None:
         for outcome in report.pytest.evidence.special_outcomes:
             reason = f" ({outcome.reason})" if outcome.reason else ""
@@ -432,6 +435,12 @@ def render_terminal(report: AgentReportV1) -> str:
         for slow_test in report.pytest.evidence.slowest:
             lines.append(f"    slow: pytest {slow_test.nodeid} ({slow_test.duration_ms} ms)")
     for advisory in report.advisories:
+        if (
+            advisory.code == "coverage_threshold_not_applied"
+            and report.coverage is not None
+            and report.coverage.totals is not None
+        ):
+            continue
         lines.append(f"    advisory: {advisory.message}")
     passed_checks = [check.name for check in report.checks if check.status == "passed"]
     if passed_checks:
@@ -446,23 +455,91 @@ def _append_failed_line(lines: list[str], name: str, exit_code: int | None) -> N
         lines.append(f"    failed: {name} (exit {exit_code})")
 
 
-def _append_coverage_gaps(lines: list[str], coverage: CoverageResult) -> None:
-    for file in coverage.files:
-        line_percentage = _coverage_percentage(file.statements.covered, file.statements.missing)
-        branch_percentage = _coverage_percentage(file.branches.covered, file.branches.missing)
-        lines.append(
-            f"    coverage: {file.path} ({line_percentage} lines, {branch_percentage} branches)"
+def _append_coverage_summary(lines: list[str], coverage: CoverageResult) -> None:
+    totals = coverage.totals
+    if totals is None:
+        return
+
+    lines.append(
+        f"    coverage: {coverage.status} ({coverage.scope}); "
+        f"{_coverage_threshold_summary(coverage)}"
+    )
+    files_with_gaps = tuple(
+        file
+        for file in coverage.files
+        if file.statements.missing or file.branches.missing
+    )
+    focus_files = files_with_gaps[:_TERMINAL_COVERAGE_FILE_LIMIT]
+    rows = [
+        (
+            file.path,
+            file.statements.covered + file.statements.missing,
+            file.statements.missing,
+            file.branches.covered + file.branches.missing,
+            file.branches.missing,
+            _coverage_percentage(
+                file.statements.covered + file.branches.covered,
+                file.statements.missing + file.branches.missing,
+            ),
         )
-        if file.statements.missing_lines:
-            lines.append(
-                "    coverage: missing lines: "
-                + ", ".join(str(line) for line in file.statements.missing_lines)
-            )
-        if file.branches.missing_arcs:
-            lines.append(
-                "    coverage: missing branches: "
-                + ", ".join(f"{source}->{destination}" for source, destination in file.branches.missing_arcs)
-            )
+        for file in focus_files
+    ]
+    total_row = (
+        "TOTAL",
+        totals.statements.covered + totals.statements.missing,
+        totals.statements.missing,
+        totals.branches.covered + totals.branches.missing,
+        totals.branches.missing,
+        _coverage_percentage(
+            totals.statements.covered + totals.branches.covered,
+            totals.statements.missing + totals.branches.missing,
+        ),
+    )
+    _append_coverage_table(lines, rows, total_row)
+    omitted = len(files_with_gaps) - len(focus_files)
+    if omitted:
+        lines.append(f"      ... {omitted} more files with gaps")
+    if files_with_gaps:
+        lines.append(
+            "    coverage details: use --format json for exact missing lines and branches"
+        )
+
+
+def _coverage_threshold_summary(coverage: CoverageResult) -> str:
+    threshold = coverage.threshold
+    if not threshold.configured or threshold.value is None:
+        return "no minimum configured"
+    value = f"{threshold.value:g}%"
+    if not threshold.evaluated:
+        return f"minimum {value} not applied"
+    outcome = "passed" if threshold.passed else "failed"
+    return f"minimum {value} {outcome}"
+
+
+def _append_coverage_table(
+    lines: list[str],
+    rows: list[tuple[str, int, int, int, int, str]],
+    total_row: tuple[str, int, int, int, int, str],
+) -> None:
+    name_width = max(len("Name"), *(len(row[0]) for row in (*rows, total_row)))
+    header = (
+        f"      {'Name':<{name_width}}  {'Stmts':>5}  {'Miss':>4}  "
+        f"{'Branch':>6}  {'BrMiss':>6}  {'Cover':>7}"
+    )
+    separator = "      " + "-" * (len(header) - 6)
+    lines.extend(("    coverage:", header, separator))
+    for name, statements, missing, branches, branch_missing, cover in rows:
+        lines.append(
+            f"      {name:<{name_width}}  {statements:>5}  {missing:>4}  "
+            f"{branches:>6}  {branch_missing:>6}  {cover:>7}"
+        )
+    if rows:
+        lines.append(separator)
+    name, statements, missing, branches, branch_missing, cover = total_row
+    lines.append(
+        f"      {name:<{name_width}}  {statements:>5}  {missing:>4}  "
+        f"{branches:>6}  {branch_missing:>6}  {cover:>7}"
+    )
 
 
 def _coverage_percentage(covered: int, missing: int) -> str:

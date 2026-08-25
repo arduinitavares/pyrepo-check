@@ -1513,7 +1513,7 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
         "",
     ]
     assert capsys.readouterr().out == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (strict aggregate, incomplete)\n"
         "    error: annotations: Could not start process: FileNotFoundError: uv\n"
         "    advisory: Coverage guidance is unavailable because native Coverage.py configuration is absent.\n"
         "    passed: ruff, ty, bandit, pytest\n"

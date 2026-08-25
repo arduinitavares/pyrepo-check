@@ -561,7 +561,7 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
     check = pytest_planned_check(tmp_path)
     assert check.pytest is not None
     coverage_plan = CoverageExecutionPlan(
-        check.pytest.consumer_python, tmp_path / "pyproject.toml", 90
+        check.pytest.consumer_python, tmp_path / "pyproject.toml", 70
     )
     check = replace(check, pytest=replace(check.pytest, coverage=coverage_plan))
     coverage_json = {
@@ -637,7 +637,10 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
         ),
     )
 
-    assert report.coverage == coverage_result()
+    assert report.coverage == replace(
+        coverage_result(),
+        threshold=CoverageThreshold(True, 70, True, True, None),
+    )
     assert tuple(report.selection.__dataclass_fields__) == (
         "checks",
         "targets",
@@ -659,13 +662,29 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
         "coverage",
         "advisories",
     )
-    assert render_terminal(report) == (
-        "\n==> pyrepo-check summary: passed (complete)\n"
-        "    coverage: src/example.py (80.00% lines, 50.00% branches)\n"
-        "    coverage: missing lines: 7\n"
-        "    coverage: missing branches: 7->8\n"
-        "    passed: pytest\n"
+    terminal = render_terminal(report)
+    assert terminal.startswith(
+        "\n==> pyrepo-check summary: passed (strict aggregate)\n"
+        "    coverage: passed (complete); minimum 70% passed\n"
+        "    coverage:\n"
     )
+    assert "Name" in terminal
+    assert "Stmts" in terminal
+    assert "Miss" in terminal
+    assert "Branch" in terminal
+    assert "BrMiss" in terminal
+    assert "Cover" in terminal
+    assert "src/example.py" in terminal
+    assert "TOTAL" in terminal
+    assert "71.43%" in terminal
+    assert "coverage: missing lines:" not in terminal
+    assert "coverage: missing branches:" not in terminal
+    assert "7->8" not in terminal
+    assert (
+        "    coverage details: use --format json for exact missing lines and branches\n"
+        in terminal
+    )
+    assert terminal.endswith("    passed: pytest\n")
     payload = reporting.json.loads(serialize_json(report))
     assert list(payload["coverage"]) == [
         "status",
@@ -699,6 +718,129 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
     assert threshold_report.checks[0].status == "passed"
     assert validate_report_v1(threshold_report) is None
     assert select_exit_code(threshold_report) == 2
+
+
+def test_terminal_coverage_summary_caps_ranked_files_and_keeps_exact_json_gaps(
+    tmp_path: Path,
+) -> None:
+    source_directory = tmp_path / "src"
+    source_directory.mkdir()
+    sources = {
+        name: source_directory / name
+        for name in ("alpha.py", "beta.py", "gamma.py", "delta.py", "epsilon.py")
+    }
+    for source in sources.values():
+        source.write_text("value = 1\n", encoding="utf-8")
+    coverage_json = {
+        "meta": {"format": 3, "version": "7.15.2", "branch_coverage": True},
+        "files": {
+            str(sources["alpha.py"]): {
+                "summary": {
+                    "covered_lines": 10,
+                    "missing_lines": 6,
+                    "num_statements": 16,
+                    "covered_branches": 6,
+                    "missing_branches": 4,
+                    "num_branches": 10,
+                },
+                "missing_lines": [101, 102, 103, 104, 105, 106],
+                "missing_branches": [[201, -1], [202, 203], [204, 205], [206, 207]],
+            },
+            str(sources["beta.py"]): {
+                "summary": {
+                    "covered_lines": 10,
+                    "missing_lines": 5,
+                    "num_statements": 15,
+                    "covered_branches": 6,
+                    "missing_branches": 3,
+                    "num_branches": 9,
+                },
+                "missing_lines": [301, 302, 303, 304, 305],
+                "missing_branches": [[401, 402], [403, 404], [405, 406]],
+            },
+            str(sources["gamma.py"]): {
+                "summary": {
+                    "covered_lines": 10,
+                    "missing_lines": 4,
+                    "num_statements": 14,
+                    "covered_branches": 6,
+                    "missing_branches": 2,
+                    "num_branches": 8,
+                },
+                "missing_lines": [501, 502, 503, 504],
+                "missing_branches": [[601, 602], [603, 604]],
+            },
+            str(sources["delta.py"]): {
+                "summary": {
+                    "covered_lines": 10,
+                    "missing_lines": 3,
+                    "num_statements": 13,
+                    "covered_branches": 6,
+                    "missing_branches": 1,
+                    "num_branches": 7,
+                },
+                "missing_lines": [701, 702, 703],
+                "missing_branches": [[801, 802]],
+            },
+            str(sources["epsilon.py"]): {
+                "summary": {
+                    "covered_lines": 10,
+                    "missing_lines": 2,
+                    "num_statements": 12,
+                    "covered_branches": 6,
+                    "missing_branches": 1,
+                    "num_branches": 7,
+                },
+                "missing_lines": [901, 902],
+                "missing_branches": [[903, 904]],
+            },
+        },
+        "totals": {
+            "covered_lines": 50,
+            "missing_lines": 20,
+            "num_statements": 70,
+            "covered_branches": 30,
+            "missing_branches": 11,
+            "num_branches": 41,
+        },
+    }
+    report = build_coverage_report(
+        tmp_path,
+        mode="focused",
+        targets=("tests/test_reporting.py",),
+        coverage_content=reporting.json.dumps(coverage_json).encode(),
+    )
+
+    terminal = render_terminal(report)
+
+    assert terminal.startswith(
+        "\n==> pyrepo-check summary: passed (focused)\n"
+        "    coverage: guidance (partial); minimum 90% not applied\n"
+        "    coverage:\n"
+    )
+    assert "src/alpha.py" in terminal
+    assert "src/beta.py" in terminal
+    assert "src/gamma.py" in terminal
+    assert "src/delta.py" not in terminal
+    assert "src/epsilon.py" not in terminal
+    assert "      ... 2 more files with gaps\n" in terminal
+    assert "201->-1" not in terminal
+    assert "coverage: missing lines:" not in terminal
+    assert "coverage: missing branches:" not in terminal
+    assert max(len(line) for line in terminal.splitlines()) <= 100
+    payload = reporting.json.loads(serialize_json(report))
+    assert payload["coverage"]["files"][0]["statements"]["missing_lines"] == [
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+    ]
+    assert payload["coverage"]["files"][0]["branches"]["missing_arcs"][0] == [
+        201,
+        -1,
+    ]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permits literal backslashes and drive-like names")
@@ -826,7 +968,10 @@ def test_unconfigured_coverage_guidance_builds_valid_report_and_renders(
         False, None, False, None, "not_configured"
     )
     assert validate_report_v1(report) is None
-    assert "coverage: src/example.py" in render_terminal(report)
+    terminal = render_terminal(report)
+    assert f"coverage: guidance ({expected_scope}); no minimum configured" in terminal
+    assert "src/example.py" not in terminal
+    assert "TOTAL" in terminal
     payload = reporting.json.loads(serialize_json(report))
     assert payload["coverage"]["threshold"] == {
         "configured": False,
@@ -1457,7 +1602,7 @@ def test_terminal_renders_post_primary_coverage_json_diagnostics_once(tmp_path: 
     assert report.coverage.status == "error"
     assert report.checks[0].status == "passed"
     assert render_terminal(report) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (strict aggregate, incomplete)\n"
         "    error: coverage evidence: coverage JSON generation exited with code 1\n"
         "    diagnostic: pytest coverage_json stdout: coverage stdout\n"
         "    diagnostic: pytest coverage_json stderr: coverage stderr\n"
@@ -1829,7 +1974,7 @@ def test_render_terminal_snapshot_for_passed_run(tmp_path: Path) -> None:
     )
 
     assert render_terminal(report) == (
-        "\n==> pyrepo-check summary: passed (complete)\n    passed: ruff, ty\n"
+        "\n==> pyrepo-check summary: passed (focused)\n    passed: ruff, ty\n"
     )
 
 
@@ -1860,7 +2005,7 @@ def test_render_terminal_snapshot_orders_errors_failures_advisories_and_passes(
 
     assert render_terminal(report) == (
         "\n"
-        "==> pyrepo-check summary: error (incomplete)\n"
+        "==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: ruff: Could not start process: FileNotFoundError: uv\n"
         "    failed: annotations (exit 1)\n"
         "    advisory: annotations process 1 (primary) stderr omitted 1 byte(s); "
@@ -2426,7 +2571,7 @@ def test_terminal_renders_structured_pytest_special_slow_and_sorted_advisories(
     )
 
     assert render_terminal(report) == (
-        "\n==> pyrepo-check summary: passed (complete)\n"
+        "\n==> pyrepo-check summary: passed (focused)\n"
         "    special: pytest skipped: a::skip\n"
         "    special: pytest skipped: z::skip (because)\n"
         "    slow: pytest z::slow (20 ms)\n"
@@ -2678,7 +2823,7 @@ def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failur
     )
 
     assert render_terminal(cleanup_report) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest: Could not clean up pytest evidence: PermissionError: denied\n"
         "    diagnostic: pytest pytest_preflight stdout: preflight\n"
         "    failed: pytest (exit 1)\n"
@@ -2694,7 +2839,7 @@ def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failur
     )
 
     assert render_terminal(preflight_report) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest evidence: supported preflight has no pytest version\n"
         "    diagnostic: pytest pytest_preflight stdout: preflight\n"
     )
@@ -2715,17 +2860,17 @@ def test_terminal_projects_each_logical_pytest_error_once(tmp_path: Path) -> Non
     not_started = build_run_report(tmp_path, run_plan((check,)), ExecutionResult((), 0))
 
     assert render_terminal(interrupted) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest evidence: pytest execution was interrupted\n"
         "    diagnostic: pytest pytest_preflight stdout: preflight\n"
     )
     assert render_terminal(artifact_missing) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest evidence: pytest artifact is missing\n"
         "    diagnostic: pytest pytest_preflight stdout: preflight\n"
     )
     assert render_terminal(not_started) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest evidence: pytest execution was not observed\n"
     )
 
@@ -3017,7 +3162,7 @@ def test_pytest_early_stop_keeps_partial_failed_evidence_and_terminal_attention(
     assert report.overall_status == "error"
     assert report.complete is False
     assert render_terminal(report) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest evidence: pytest session stopped before all selected tests completed\n"
         "    failed: pytest (exit 1)\n"
     )
@@ -3049,7 +3194,7 @@ def test_incomplete_trusted_pytest_evidence_gets_attention_after_exit_zero(
         CollectionIssue("test_collect", "ImportError: missing dependency"),
     )
     assert render_terminal(report) == (
-        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "\n==> pyrepo-check summary: error (focused, incomplete)\n"
         "    error: pytest evidence is incomplete.\n"
         "    passed: pytest\n"
     )
@@ -3169,7 +3314,7 @@ def test_terminal_does_not_render_empty_test_reason_parentheses(tmp_path: Path) 
     terminal = render_terminal(report)
 
     assert terminal == (
-        "\n==> pyrepo-check summary: passed (complete)\n"
+        "\n==> pyrepo-check summary: passed (focused)\n"
         "    special: pytest skipped: test_empty\n"
         "    slow: pytest test_empty (1 ms)\n"
         "    advisory: pytest skipped has no reason: test_empty.\n"
