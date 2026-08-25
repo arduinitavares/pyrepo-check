@@ -233,9 +233,11 @@ lifecycle after unconfigure, and atomically publishes the terminal artifact
 from an import-time `atexit` handler. Any public hook activity after closure is
 sticky invalidation and attempts to atomically restore non-finalized state. If
 that restore fails after terminal publication, the plugin terminates the child
-with pytest's internal-error exit code. Finalized raw bytes may remain, but the
-parent rejects them because their recorded exit status differs from the primary
-process. The artifact contains the target pytest version, exit code, collection/session state, and per-node
+with a non-zero fallback distinct from the recorded exit: pytest internal error
+`3` normally, or interrupted `2` when the artifact already records `3`.
+Finalized raw bytes may remain, but the parent rejects them because their
+recorded exit status differs from the primary process. The artifact contains
+the target pytest version, exit code, collection/session state, and per-node
 setup/call/teardown reports. Missing, malformed, schema-invalid, or
 non-finalized artifacts are evidence errors; the artifact pytest version must
 equal the trusted preflight version. Version 1 supports pytest
@@ -1436,7 +1438,8 @@ the intended contract.
   post-unconfigure hook relay, conflicting scope observations, fatal exit, and
   terminal replacement failure all retain non-finalized evidence. Also prove a
   failed post-terminal invalidation can leave stale finalized raw bytes only
-  with a non-zero primary exit, producing incomplete/error reporting with
+  with a distinct non-zero primary exit, including when the artifact records
+  pytest internal error `3`, producing incomplete/error reporting with
   `evidence: null`.
 - Prove missing, malformed, non-finalized, and otherwise invalid plugin
   artifacts produce `evidence: null`, unique planner-known scope reasons, and

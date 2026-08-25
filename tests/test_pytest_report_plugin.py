@@ -242,15 +242,21 @@ def test_plugin_terminal_replace_failure_leaves_started_artifact(
     assert artifact["session"]["finishes"] == 0
 
 
-def test_plugin_failed_post_terminal_invalidation_forces_internal_error_exit(
+@pytest.mark.parametrize(
+    ("recorded_exit_code", "expected_forced_exit_code"),
+    ((0, 3), (1, 3), (2, 3), (3, 2), (4, 3), (5, 3)),
+)
+def test_plugin_failed_post_terminal_invalidation_forces_distinct_nonzero_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    recorded_exit_code: int,
+    expected_forced_exit_code: int,
 ) -> None:
     module = _load_plugin_module(tmp_path, monkeypatch)
     evidence = module._Evidence()
     evidence.start_session()
     evidence.publish("started")
-    evidence.record_finish(0, stopped_early=False)
+    evidence.record_finish(recorded_exit_code, stopped_early=False)
     evidence.close()
     evidence.finalize_at_exit()
     forced_exit_codes: list[int] = []
@@ -269,15 +275,18 @@ def test_plugin_failed_post_terminal_invalidation_forces_internal_error_exit(
     monkeypatch.setattr(module.os, "replace", fail_restore_replace)
     monkeypatch.setattr(module.os, "_exit", force_exit)
 
-    with pytest.raises(ForcedExit, match="^3$"):
+    with pytest.raises(ForcedExit, match=rf"^{expected_forced_exit_code}$"):
         evidence.observe_hook()
 
     artifact = json.loads(
         (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
     )
-    assert forced_exit_codes == [3]
+    assert forced_exit_codes == [expected_forced_exit_code]
+    assert 1 <= expected_forced_exit_code <= 255
+    assert expected_forced_exit_code != recorded_exit_code
     assert artifact["state"] == "finalized"
     assert artifact["session"]["finishes"] == 1
+    assert artifact["session"]["exit_code"] == recorded_exit_code
 
 
 def test_plugin_conflicting_scope_observations_stay_non_finalized(

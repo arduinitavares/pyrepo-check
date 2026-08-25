@@ -95,7 +95,12 @@ class _Evidence:
                     self.publish("started")
                 except OSError:
                     if terminal_was_published:
-                        os._exit(int(pytest.ExitCode.INTERNAL_ERROR))
+                        forced_exit_code = (
+                            int(pytest.ExitCode.INTERRUPTED)
+                            if self.exit_code == int(pytest.ExitCode.INTERNAL_ERROR)
+                            else int(pytest.ExitCode.INTERNAL_ERROR)
+                        )
+                        os._exit(forced_exit_code)
                     raise
             return False
         return not self._invalidated

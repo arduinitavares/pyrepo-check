@@ -233,8 +233,29 @@ def emit_duplicate_report(session):
     assert primary["error_message"] is None
 
 
+@pytest.mark.parametrize(
+    ("published_exit_code", "expected_forced_exit_code", "runtestloop_hook"),
+    (
+        pytest.param(0, 3, "", id="published-0"),
+        pytest.param(
+            3,
+            2,
+            """
+
+
+def pytest_runtestloop(session):
+    del session
+    raise RuntimeError("intentional consumer internal error")
+""",
+            id="published-3",
+        ),
+    ),
+)
 def test_structured_pytest_cli_rejects_stale_finalized_artifact_when_terminal_invalidation_cannot_publish(
     tmp_path: Path,
+    published_exit_code: int,
+    expected_forced_exit_code: int,
+    runtestloop_hook: str,
 ) -> None:
     consumer = tmp_path / "consumer"
     consumer.mkdir()
@@ -287,7 +308,8 @@ atexit.register(relay_after_evidence_finalizer)
 def pytest_configure(config):
     global _CONFIG
     _CONFIG = config
-""",
+"""
+        + runtestloop_hook,
         encoding="utf-8",
     )
     environment = os.environ | {"PYTEST_ADDOPTS": "-p early_terminal_relay"}
@@ -312,8 +334,10 @@ def pytest_configure(config):
     )
     assert stale_artifact["state"] == "finalized"
     assert stale_artifact["session"]["finishes"] == 1
-    assert stale_artifact["session"]["exit_code"] == 0
-    assert completed.returncode == 3
+    assert stale_artifact["session"]["exit_code"] == published_exit_code
+    assert 1 <= expected_forced_exit_code <= 255
+    assert expected_forced_exit_code != published_exit_code
+    assert completed.returncode == expected_forced_exit_code
     assert completed.stderr == b""
     assert payload["overall_status"] == "error"
     assert payload["complete"] is False
@@ -323,7 +347,7 @@ def pytest_configure(config):
         "scope": "partial",
         "scope_reasons": ["planned_selector", "incomplete_session"],
         "pytest_version": payload["pytest"]["pytest_version"],
-        "exit_code": 3,
+        "exit_code": expected_forced_exit_code,
         "evidence": None,
         "error": {
             "code": "exit_code_mismatch",
@@ -333,7 +357,7 @@ def pytest_configure(config):
     primary = payload["checks"][0]["processes"][1]
     assert primary["role"] == "primary"
     assert primary["outcome"] == "exited"
-    assert primary["exit_code"] == 3
+    assert primary["exit_code"] == expected_forced_exit_code
 
 
 def test_structured_pytest_cli_stops_after_unsupported_preflight(tmp_path: Path) -> None:
