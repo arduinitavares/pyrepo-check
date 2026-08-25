@@ -89,6 +89,9 @@ pyrepo-check pytest --shortcut unit --coverage
 # With native Coverage.py configuration, this is the target-free strict aggregate.
 pyrepo-check --coverage
 
+# In that configured repository, the normal target-free aggregate auto-enables coverage.
+pyrepo-check --all
+
 # A target-bearing --all request is focused coverage guidance, not a threshold gate.
 pyrepo-check --all --coverage tests/test_example.py
 
@@ -159,10 +162,13 @@ deselection, collection reduction, or an incomplete session). `counts` covers
 passed, failed, errors, skipped, xfailed, and xpassed outcomes;
 `special_outcomes` lists skipped/XFAIL/XPASS nodes; and `slowest` contains up
 to ten nodes in deterministic order. `pytest` is `null` only when pytest was
-not selected. `coverage` is `null` when coverage was not requested. For an
-implicit target-free aggregate with native Coverage.py configuration unavailable,
-it is also `null` and emits the typed `coverage_not_configured` advisory; an
-explicit `--coverage` request instead fails planning with
+not selected. `coverage` is `null` only when its planned scope is
+`not_requested` or `unavailable`. A focused run without `--coverage` is
+`not_requested`. An implicit target-free aggregate without native Coverage.py
+configuration is `unavailable` and emits the typed `coverage_not_configured`
+advisory. With valid native configuration, `pyrepo-check --all` auto-enables
+coverage and may enforce its threshold. An explicit `--coverage` request without
+that configuration instead fails planning with
 `coverage_configuration_required`. Files are ranked by `missing statements +
 missing branches`; there is no separate `missing_opportunities` JSON field.
 
