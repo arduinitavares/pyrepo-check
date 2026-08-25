@@ -1655,3 +1655,20 @@ def test_pytest_fixture_dependencies_are_development_only() -> None:
     assert pyproject["project"]["dependencies"] == []
     assert "pytest-xdist>=3.8,<4" in pyproject["dependency-groups"]["dev"]
     assert "pytest-rerunfailures>=16.6,<17" in pyproject["dependency-groups"]["dev"]
+
+
+def test_repository_coverage_dependency_is_development_only_and_locked() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lockfile = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["dependencies"] == []
+    assert "coverage[toml]>=7.15,<8" in pyproject["dependency-groups"]["dev"]
+    coverage_packages = [
+        package for package in lockfile["package"] if package["name"] == "coverage"
+    ]
+    assert len(coverage_packages) == 1
+    major, minor, *_ = (
+        int(piece) for piece in coverage_packages[0]["version"].split(".")
+    )
+    assert major == 7
+    assert minor >= 15
