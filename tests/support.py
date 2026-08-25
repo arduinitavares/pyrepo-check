@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess  # nosec B404
@@ -13,6 +13,7 @@ class RecordedCall:
     cwd: Path
     check: bool
     capture_output: bool
+    env: Mapping[str, str] | None = None
 
 
 class RecordingRunner:
@@ -41,12 +42,14 @@ class RecordingRunner:
         cwd: Path,
         check: bool,
         capture_output: bool = False,
+        env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         recorded = RecordedCall(
             command=command,
             cwd=cwd,
             check=check,
             capture_output=capture_output,
+            env=env,
         )
         self.calls.append(recorded)
         if self.on_call is not None:

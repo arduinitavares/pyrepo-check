@@ -64,6 +64,7 @@ def test_zero_return_codes_produce_exit_zero(tmp_path: Path) -> None:
     ) == (0, 0)
     assert all(
         len(check.processes) == 1
+        and check.pytest is None
         and isinstance(check.processes[0], ExecutedProcess)
         and check.processes[0].role == "primary"
         and check.processes[0].command == check.planned.command

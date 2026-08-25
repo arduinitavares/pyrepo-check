@@ -6,9 +6,12 @@ from pathlib import Path
 import shlex
 import subprocess  # nosec B404
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from pyrepo_check.planning import PlannedCheck, RunPlan
+
+if TYPE_CHECKING:
+    from pyrepo_check.pytest_execution import PytestExecutionObservation
 
 
 ProcessRunner = Callable[
@@ -33,6 +36,7 @@ class ExecutedProcess:
 class ExecutedCheck:
     planned: PlannedCheck
     processes: tuple[ExecutedProcess, ...]
+    pytest: PytestExecutionObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,18 @@ def execute_plan(
         is_json = plan.output_format == "json"
         if not is_json:
             print(f"\n==> {check.name}: {shlex.join(check.command)}", flush=True)
+        if check.pytest is not None:
+            from pyrepo_check.pytest_execution import execute_pytest
+
+            executed.append(
+                execute_pytest(
+                    check,
+                    output_format=plan.output_format,
+                    runner=runner,
+                    clock_ns=clock_ns,
+                )
+            )
+            continue
 
         returncode: int | None = None
         stdout: bytes | None = None
