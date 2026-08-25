@@ -214,10 +214,10 @@ the frozen lock resolves Coverage.py `7.15.4`. Its native configuration measures
 
 For this repository, `pyrepo-check --all` is the normal strict self-check, and
 `pyrepo-check --format json --all` is the agent-readable form. The verified
-target-free strict run passed all 1,310 tests and measured 13 files: 4,019
-covered and 484 missing statements, plus 1,516 covered and 372 missing
-branches. The combined fresh baseline is 5,535 / 6,391 =
-86.60616491941792%.
+target-free strict run passed all 1,314 tests and measured 13 files: 4,031
+covered and 484 missing statements, plus 1,522 covered and 372 missing
+branches. The combined fresh baseline is 5,553 / 6,409 =
+86.64378218130754%.
 
 `[tool.coverage.report]` sets `fail_under = 86.01` with `precision = 2`. This
 floor is below the fresh baseline and rejects totals that round to 86.00%. The

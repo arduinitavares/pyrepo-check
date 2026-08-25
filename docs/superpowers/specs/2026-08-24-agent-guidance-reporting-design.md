@@ -40,8 +40,8 @@ missing statements plus 1,505 covered and 371 missing branches, or 5,494 /
 
 A post-D terminal refinement keeps schema-v1 JSON and execution behavior
 unchanged while replacing unbounded raw gap lists with the compact focus table.
-Its fresh strict gate passed 1,310 of 1,310 tests with 5,535 of 6,391 combined
-coverage opportunities covered, or 86.60616491941792%; the `86.01` threshold
+Its fresh strict gate passed 1,314 of 1,314 tests with 5,553 of 6,409 combined
+coverage opportunities covered, or 86.64378218130754%; the `86.01` threshold
 passed.
 
 ## Problem
