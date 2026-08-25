@@ -752,6 +752,32 @@ def test_rejects_out_of_order_execution_observations(tmp_path: Path) -> None:
         )
 
 
+def test_rejects_non_primary_ordinary_process_observation(tmp_path: Path) -> None:
+    ruff = planned_check(tmp_path, "ruff")
+    observation = ExecutedCheck(
+        planned=ruff,
+        processes=(
+            ExecutedProcess(
+                role="pytest_preflight",
+                command=ruff.command,
+                cwd=ruff.cwd,
+                returncode=0,
+                duration_ms=1,
+                stdout=b"",
+                stderr=b"",
+                spawn_error=None,
+            ),
+        ),
+    )
+
+    with pytest.raises(ReportingError, match="ordinary check must contain exactly one primary process"):
+        build_run_report(
+            tmp_path,
+            run_plan((ruff,)),
+            ExecutionResult((observation,), 0),
+        )
+
+
 @pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
 @pytest.mark.parametrize(
     ("raw", "expected_text", "truncated", "omitted_bytes"),

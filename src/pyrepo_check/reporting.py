@@ -734,7 +734,7 @@ def _build_check_result(
             ),
         )
 
-    if len(observation.processes) != 1:
+    if len(observation.processes) != 1 or observation.processes[0].role != "primary":
         raise ReportingError("ordinary check must contain exactly one primary process")
     process, status, error = _build_process_result(
         observation.processes[0],
