@@ -580,19 +580,37 @@ integer `O_DIRECTORY`, `O_NOFOLLOW`, and `O_NONBLOCK` flags; fd-based
 `scandir`; descriptor-relative `open`, `stat`, `unlink`, and `rmdir`; and
 `stat(..., follow_symlinks=False)`. The platform must also have a proven
 post-`rmdir` unlink check: Linux zero-link semantics, or Darwin link-count plus
-`F_GETPATH` device/inode verification. Unsupported or unproven platforms fail
+an absolute `F_GETPATH` lexical target that is missing at the no-follow stat.
+Any live Darwin target, including one with a different device/inode, remains
+unproven and fails closed. Empty, malformed, or relative `F_GETPATH` values and
+other lookup errors also fail closed. Unsupported or unproven platforms fail
 closed before temporary-directory creation or process spawn; pyrepo-check has
 no path-based cleanup fallback.
 
 The run-directory record includes both the run directory's device/inode and
-its verified parent's device/inode, recorded before directory creation. Cleanup
-opens the parent first, opens the run basename relative to that descriptor, and
-uses two iterative streaming DFS passes. The first pass validates the complete
-tree without deletion. The second pass unlinks leaves and removes verified
-directories postorder. Each
-pass accepts exactly 4,096 non-root entries and depth 64 with root at depth 0;
-the whole cleanup shares a five-second monotonic deadline. Deadline checks run
-between system calls because one in-progress kernel call cannot be interrupted.
+its verified parent's device/inode. The parent identity is recorded before
+directory creation; the run identity is recorded afterward. Cleanup opens the
+parent first and opens the run basename relative to that descriptor. Creation
+also revalidates the live resolved parent's device/inode after `mkdtemp` and
+before plugin preparation or process spawn. A same-path parent replacement
+fails setup; safe cleanup may retain the new run path and reports that cleanup
+failure with the setup error.
+
+Cleanup uses two iterative streaming DFS passes. The first pass validates the
+complete tree without deletion and returns an immutable manifest. Every
+non-root entry is keyed by its parent directory's device/inode plus entry name;
+the value records the child's device/inode and exact directory, symlink,
+regular-file, or other type. The second pass is authorized only by that exact
+manifest. Before it opens a directory or unlinks a leaf, the manifest key must
+exist and the current no-follow identity and type must match. Unknown additions,
+substitutions, and validated entries missing during deletion fail closed as an
+unsafe tree. Additions after an iterator has passed remain untraversed and make
+descriptor-relative removal fail with a retained root.
+
+Each pass accepts exactly 4,096 non-root entries and depth 64 with root at depth
+0; the immutable manifest is therefore bounded to 4,096 entries. The whole
+cleanup shares a five-second monotonic deadline. Deadline checks run between
+system calls because one in-progress kernel call cannot be interrupted.
 Directories must retain their no-follow stat/open identity and root device;
 symlinks and non-directories are descriptor-relative leaves. Final root removal
 is `rmdir(run_basename, dir_fd=verified_parent_fd)`. Each directory descriptor

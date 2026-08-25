@@ -14,7 +14,7 @@ import stat
 import sys
 import tempfile
 import time
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import Literal, Never, Protocol, cast
 
 from pyrepo_check.execution import (
@@ -129,6 +129,8 @@ class _RunDirectory:
 
 
 CleanupFailureKind = Literal["budget_exceeded", "unsafe_tree", "io_failed"]
+CleanupEntryType = Literal["directory", "symlink", "regular", "other"]
+CleanupManifestKey = tuple[tuple[int, int], str]
 
 
 class _ScandirIterator(Iterator[os.DirEntry[str]], Protocol):
@@ -147,6 +149,17 @@ class _CleanupFailure(OSError):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+@dataclass(frozen=True)
+class _CleanupManifestEntry:
+    identity: tuple[int, int]
+    file_type: CleanupEntryType
+
+
+@dataclass(frozen=True)
+class _CleanupManifest:
+    entries: Mapping[CleanupManifestKey, _CleanupManifestEntry]
 
 
 @dataclass
@@ -386,12 +399,16 @@ def _create_run_directory(consumer_root: Path) -> _RunDirectory:
         identity: tuple[int, int] | None = None
         try:
             identity = _directory_identity(run_directory)
-            record = _RunDirectory(run_directory, identity, parent_identity)
             resolved_run_directory = run_directory.resolve(strict=True)
-            if resolved_run_directory.parent != base:
+            resolved_parent = resolved_run_directory.parent
+            if (
+                resolved_parent != base
+                or _directory_identity(resolved_parent) != parent_identity
+            ):
                 raise OSError("created run directory parent identity mismatch")
             if _is_within(resolved_run_directory, resolved_root):
                 raise OSError("refusing run directory inside consumer root")
+            record = _RunDirectory(run_directory, identity, parent_identity)
         except OSError as error:
             cleanup_error = _remove_empty_created_run_directory(
                 run_directory,
@@ -586,7 +603,7 @@ def _remove_run_directory(
             )
         parent_descriptor = _open_verified_parent(run_directory)
         parent_verified = True
-        _walk_cleanup_tree(
+        manifest = _walk_cleanup_tree(
             parent_descriptor,
             run_directory.path.name,
             run_directory.identity,
@@ -599,6 +616,7 @@ def _remove_run_directory(
             run_directory.identity,
             budget=_CleanupBudget(started_ns, clock_ns),
             delete=True,
+            manifest=manifest,
         )
         deletion_budget = _CleanupBudget(started_ns, clock_ns)
         _remove_verified_relative_directory(
@@ -649,7 +667,14 @@ def _walk_cleanup_tree(
     *,
     budget: _CleanupBudget,
     delete: bool,
-) -> None:
+    manifest: _CleanupManifest | None = None,
+) -> _CleanupManifest:
+    if delete and manifest is None:
+        raise _CleanupFailure("unsafe_tree", "cleanup deletion manifest is unavailable")
+    if not delete and manifest is not None:
+        raise _CleanupFailure("unsafe_tree", "cleanup validation received a deletion manifest")
+    manifest_entries: dict[CleanupManifestKey, _CleanupManifestEntry] = {}
+    remaining = set(manifest.entries) if manifest is not None else set()
     stack: list[_CleanupFrame] = []
     try:
         root_descriptor, root_status = _open_verified_relative_directory(
@@ -712,11 +737,43 @@ def _walk_cleanup_tree(
             child_depth = frame.depth + 1
             budget.observe_entry(depth=child_depth)
             budget.check_deadline()
-            child_status = os.stat(
-                entry.name,
-                dir_fd=frame.descriptor,
-                follow_symlinks=False,
+            key = (frame.identity, entry.name)
+            if delete and key not in remaining:
+                raise _CleanupFailure(
+                    "unsafe_tree",
+                    f"cleanup entry absent from validation manifest: {entry.name}",
+                )
+            try:
+                child_status = os.stat(
+                    entry.name,
+                    dir_fd=frame.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as error:
+                if delete:
+                    raise _CleanupFailure(
+                        "unsafe_tree",
+                        f"validated cleanup entry is missing: {entry.name}",
+                    ) from error
+                raise
+            observed_entry = _CleanupManifestEntry(
+                _status_identity(child_status),
+                _cleanup_entry_type(child_status.st_mode),
             )
+            if delete:
+                if manifest is None or manifest.entries[key] != observed_entry:
+                    raise _CleanupFailure(
+                        "unsafe_tree",
+                        f"cleanup entry identity or type mismatch: {entry.name}",
+                    )
+                remaining.remove(key)
+            else:
+                if key in manifest_entries:
+                    raise _CleanupFailure(
+                        "unsafe_tree",
+                        f"duplicate cleanup manifest entry: {entry.name}",
+                    )
+                manifest_entries[key] = observed_entry
             if stat.S_ISDIR(child_status.st_mode):
                 child_identity = _status_identity(child_status)
                 child_descriptor, verified_status = _open_verified_relative_directory(
@@ -746,6 +803,14 @@ def _walk_cleanup_tree(
             if delete:
                 budget.check_deadline()
                 os.unlink(entry.name, dir_fd=frame.descriptor)
+        if delete and remaining:
+            raise _CleanupFailure(
+                "unsafe_tree",
+                "validated cleanup entries are missing during deletion",
+            )
+        if manifest is not None:
+            return manifest
+        return _CleanupManifest(MappingProxyType(manifest_entries))
     finally:
         for frame in reversed(stack):
             try:
@@ -879,15 +944,18 @@ def _opened_directory_remains_linked(descriptor: int) -> bool:
         raw_path = fcntl_call(descriptor, get_path, b"\0" * 1024)
         if not isinstance(raw_path, bytes):
             return True
-        live_status = os.stat(os.fsdecode(raw_path.split(b"\0", 1)[0]), follow_symlinks=False)
+        path_bytes, separator, _remainder = raw_path.partition(b"\0")
+        if not separator or not path_bytes:
+            return True
+        live_path = os.fsdecode(path_bytes)
+        if not os.path.isabs(live_path):
+            return True
+        os.stat(live_path, follow_symlinks=False)
     except FileNotFoundError:
         return False
     except OSError:
         return True
-    return (
-        stat.S_ISDIR(live_status.st_mode)
-        and _status_identity(live_status) == _status_identity(file_status)
-    )
+    return True
 
 
 def _verified_retained_path(
@@ -991,6 +1059,16 @@ def _directory_identity(path: Path) -> tuple[int, int]:
 
 def _status_identity(file_status: os.stat_result) -> tuple[int, int]:
     return file_status.st_dev, file_status.st_ino
+
+
+def _cleanup_entry_type(mode: int) -> CleanupEntryType:
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISREG(mode):
+        return "regular"
+    return "other"
 
 
 def _verify_directory_identity(path: Path, identity: tuple[int, int]) -> None:
