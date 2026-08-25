@@ -1,6 +1,6 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Milestones A-B and C1-C3 implemented and verified; D designed and not implemented
+**Status:** Milestones A-D implemented and verified; acceptance criterion 12 implemented; criterion 13 remains outside scope
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
@@ -9,10 +9,10 @@
 
 As of 2026-08-25, the prior research, design specification, Agent Skill, README
 guidance, repository cleanup, and Milestones A-B implementation are merged and
-pushed on `main`. C1 Test Shortcuts, C2 structured pytest evidence, and C3
-coverage execution and guidance are implemented and verified. Repository
-coverage adoption remains Milestone D. Repository and installed Agent Skill
-synchronization is explicitly deferred until after Milestone D.
+pushed on `main`. C1 Test Shortcuts, C2 structured pytest evidence, C3 coverage
+execution and guidance, and D repository coverage adoption are implemented and
+verified. The next separate post-D action is repository and installed Agent Skill
+synchronization; it remains unchanged in this milestone.
 
 | Milestone | State | Evidence |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ synchronization is explicitly deferred until after Milestone D.
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
 | C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
 | C3 — coverage execution and guidance | Implemented and verified | Pytest and coverage preflight, one Coverage-instrumented pytest run, typed evidence/result/reporting, exact line/branch gaps, threshold eligibility, real-consumer public modes, artifact isolation, full suite, and strict gate. |
-| D | Designed; not implemented | Repository coverage adoption. |
+| D | Implemented and verified | Development dependency `coverage[toml]>=7.15,<8`, resolved Coverage.py `7.15.4`; native strict coverage gate and fresh baseline verified. |
 
 C3 verification covers supported-version and module checks before execution;
 typed coverage evidence in terminal and schema-v1 JSON reports; direct-target,
@@ -29,8 +29,13 @@ shortcut, explicit focused, and target-free aggregate public modes; threshold
 pass/fail and neutralized focused or incomplete runs; exact missing lines and
 branches; one-primary-run proof; and run-owned artifact isolation from consumer
 bytes and worktrees. The full pytest suite and `pyrepo-check --all` strict gate
-passed. C3 does not add this repository's Coverage.py dependency, native
-configuration, or threshold; those adoption decisions remain Milestone D.
+passed. D adds this repository's locked Coverage.py dependency, native
+configuration, and threshold: `branch = true`, `source = ["src/pyrepo_check"]`,
+`parallel = false`, `fail_under = 86.01`, and `precision = 2`. The resolved
+Coverage.py version is `7.15.4`. The target-free strict aggregate passed 1,309
+of 1,309 tests with complete coverage across 13 files: 3,989 covered and 483
+missing statements plus 1,505 covered and 371 missing branches, or 5,494 /
+6,348 = 86.54694391934467%. The `86.01` threshold was evaluated and passed.
 
 ## Problem
 
@@ -1504,15 +1509,18 @@ the intended contract.
 
 ### Milestone D tests: repository adoption
 
-- Add `coverage[toml]>=7.15,<8` to this repository's development group and
-  regenerate `uv.lock` before activating coverage configuration.
-- Add this repository's native line and branch coverage configuration.
-- Measure the current baseline after the implementation; do not reuse a
-  historical percentage as proof.
-- Set an optional no-regression threshold at or below the verified baseline,
-  not an arbitrary 100%.
-- Run focused planner/renderer tests during development and the strict
-  aggregate gate at every milestone boundary.
+- `coverage[toml]>=7.15,<8` is declared in this repository's development group
+  and locked as Coverage.py `7.15.4` before activating coverage configuration.
+- Native configuration measures `src/pyrepo_check` with line and branch
+  coverage in single-process mode: `branch = true` and `parallel = false`.
+- The fresh strict aggregate baseline is 5,494 / 6,348 = 86.54694391934467%
+  (3,989/483 statement and 1,505/371 branch covered/missing counts across 13
+  files), not a historical percentage.
+- The optional no-regression threshold is `fail_under = 86.01` with
+  `precision = 2`, below the verified baseline. The strict gate evaluates and
+  passes it after 1,309 of 1,309 tests pass.
+- Focused planner/renderer tests ran during development and the strict
+  aggregate gate passed at the milestone boundary.
 
 ## Delivery sequence
 
@@ -1537,7 +1545,7 @@ worktree files are never included.
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
 | C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
 | C3 — coverage execution and guidance | Implemented and verified | Coverage and pytest preflight, one instrumented primary run, validated evidence/reporting, exact gaps, threshold policy, public-mode/consumer isolation matrix, full suite, and strict gate. |
-| D — repository coverage adoption | Designed; not implemented | No locked Coverage.py dependency or native coverage policy exists. |
+| D — repository coverage adoption | Implemented and verified | `coverage[toml]>=7.15,<8` resolves to `7.15.4`; native `branch = true`, `source = ["src/pyrepo_check"]`, `parallel = false`, `fail_under = 86.01`, and `precision = 2` produced a complete, passing strict gate: 1,309/1,309 tests and 5,494/6,348 combined coverage across 13 files. |
 
 ## Acceptance criteria
 
@@ -1564,13 +1572,14 @@ The work is complete when all of the following are proven:
     artifacts cannot produce a false pass; hidden arbitrary retry protocols are
     explicitly outside version 1.
 11. Missing tools, configuration, or artifacts cannot produce a false pass.
-12. The repository declares and locks the supported Coverage.py range before
-    Ruff, annotation enforcement, `ty`, Bandit, pytest, and coverage pass its
-    strict aggregate gate.
-13. Dependency auditing, changed-code coverage, complexity, mutation, and
+12. **Implemented.** The repository declares and locks the supported Coverage.py
+    range before Ruff, annotation enforcement, `ty`, Bandit, pytest, and
+    coverage pass its strict aggregate gate.
+13. **Outside scope.** Dependency auditing, changed-code coverage, complexity, mutation, and
     flaky repetition remain outside this change.
 
-C3 completion deliberately excludes criterion 12: that dependency-locking and
-repository-coverage adoption requirement belongs to Milestone D. C3 is
-implemented and verified; Milestone D remains **Designed; not implemented**
-until that separate adoption work and evidence are complete.
+C3 completion deliberately excluded criterion 12; its dependency-locking and
+repository-coverage adoption requirement is now implemented and verified by
+Milestone D. Criterion 13 remains outside this change. Repository and installed
+Agent Skill synchronization remains the next separate post-D action and was
+not performed in this milestone.

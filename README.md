@@ -28,7 +28,9 @@ ln -s "$PWD/.agents/skills/pyrepo-check" \
 
 The skill teaches agents which focused checks to choose, how to run one pytest
 test, and when the strict `--all` gate is still required. The CLI `--help`
-output remains the source of truth for supported commands.
+output remains the source of truth for supported commands. Repository and
+installed Agent Skill synchronization is the next separate post-D action and
+remains unchanged in this milestone.
 
 ## Usage
 
@@ -98,7 +100,7 @@ pyrepo-check --all --coverage tests/test_example.py
 # JSON uses the same report and selection rules.
 pyrepo-check --format json pytest --coverage tests/test_example.py::test_positive
 
-# In a repository without native coverage configuration, this remains plain pytest.
+# The agent-readable form of this repository's normal strict self-check.
 pyrepo-check --format json --all
 ```
 
@@ -195,9 +197,26 @@ the public exit is `2` under the normal first-positive-exit rule.
 Pytest runs once under Coverage instrumentation; it is not rerun for the
 coverage report. Pyrepo-check-owned coverage, plugin, and report artifacts are
 run-owned and outside the consumer root, so a completed run leaves consumer
-bytes and its worktree unchanged. This repository deliberately has no native
-Coverage.py configuration or threshold yet: its target-free aggregate remains
-plain pytest with `coverage: null` and the `coverage_not_configured` advisory.
+bytes and its worktree unchanged.
+
+## Repository coverage baseline
+
+This repository declares `coverage[toml]>=7.15,<8` in its development group;
+the frozen lock resolves Coverage.py `7.15.4`. Its native configuration measures
+`src/pyrepo_check` with `branch = true` and `parallel = false`.
+
+For this repository, `pyrepo-check --all` is the normal strict self-check, and
+`pyrepo-check --format json --all` is the agent-readable form. The verified
+target-free strict run passed all 1,309 tests and measured 13 files: 3,989
+covered and 483 missing statements, plus 1,505 covered and 371 missing
+branches. The combined fresh baseline is 5,494 / 6,348 =
+86.54694391934467%.
+
+`[tool.coverage.report]` sets `fail_under = 86.01` with `precision = 2`. This
+floor is below the fresh baseline. It rejects raw combined totals below 86%
+despite native two-decimal rounding: 40 added misses pass at rounded 86.01%,
+while 41 fail at 85.99% with exit 2. The score is the gate; exact missing lines
+and arcs in the terminal and JSON reports remain the action payload.
 
 The CLI keeps the first positive tool exit code in planned execution order.
 Checks continue after ordinary failures. If execution has only spawn or
@@ -298,8 +317,9 @@ tests:
 pyrepo-check pytest tests/test_cli.py::test_invalid_shortcut_config_renders_typed_planning_error_without_spawning
 ```
 
-Repository and installed Agent Skills intentionally remain unsynchronized until
-after Milestone D; do not copy this C3 guidance into either skill location yet.
+Repository and installed Agent Skills remain unchanged in this milestone. Their
+synchronization is the next separate post-D action; do not copy this C3 guidance
+into either skill location here.
 
 ## Type Annotation Enforcement
 
