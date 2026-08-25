@@ -68,7 +68,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         help=f"Optional check names and target paths. Checks: {CHECK_HELP}.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_intermixed_args(argv)
 
 
 def main(

@@ -14,6 +14,10 @@ _SUPPORTED_PYTEST_PREFLIGHT = (
     b'{"schema_version":1,"python_version":[3,13,15],'
     b'"pytest_available":true,"pytest_version":[8,4,2]}'
 )
+_SUPPORTED_COVERAGE_PREFLIGHT = (
+    b'{"schema_version":1,"python_version":[3,13,15],'
+    b'"coverage_available":true,"coverage_version":"7.15.2"}'
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class RecordingRunner:
         exception: Exception | None = None,
         on_call: Callable[[RecordedCall], None] | None = None,
         publish_pytest_artifact: bool = False,
+        publish_coverage_artifact: bool = False,
     ) -> None:
         self.returncodes = returncodes
         self.stdout = stdout
@@ -44,6 +49,7 @@ class RecordingRunner:
         self.exception = exception
         self.on_call = on_call
         self.publish_pytest_artifact = publish_pytest_artifact
+        self.publish_coverage_artifact = publish_coverage_artifact
         self.calls: list[RecordedCall] = []
 
     def __call__(
@@ -79,6 +85,8 @@ class RecordingRunner:
         )
         if self.publish_pytest_artifact:
             _publish_pytest_artifact(command, env, returncode)
+        if self.publish_coverage_artifact:
+            _publish_coverage_artifact(command)
         return cast(
             subprocess.CompletedProcess[tuple[str, ...]],
             subprocess.CompletedProcess(
@@ -87,9 +95,7 @@ class RecordingRunner:
                 stdout=(
                     self.stdout[returncode_index]
                     if returncode_index < len(self.stdout)
-                    else _SUPPORTED_PYTEST_PREFLIGHT
-                    if "-c" in command
-                    else None
+                    else _default_stdout(command, self.publish_coverage_artifact)
                 ),
                 stderr=(
                     self.stderr[returncode_index]
@@ -100,15 +106,28 @@ class RecordingRunner:
         )
 
 
+def _default_stdout(
+    command: tuple[str, ...],
+    publish_coverage_artifact: bool,
+) -> bytes | None:
+    if "-c" not in command:
+        return None
+    if publish_coverage_artifact and any(
+        "coverage_available" in argument for argument in command
+    ):
+        return _SUPPORTED_COVERAGE_PREFLIGHT
+    return _SUPPORTED_PYTEST_PREFLIGHT
+
+
 def _publish_pytest_artifact(
     command: tuple[str, ...],
     environment: Mapping[str, str] | None,
     returncode: int,
 ) -> None:
-    if environment is None or "-m" not in command:
+    if environment is None:
         return
-    module_index = command.index("-m")
-    if command[module_index + 1] != "pytest":
+    module_index = _module_index(command, "pytest")
+    if module_index is None:
         return
     plugin_index = command.index("-p", module_index + 2)
     artifact_path = Path(environment["PYREPO_CHECK_PYTEST_JSON"])
@@ -186,3 +205,81 @@ def _publish_pytest_artifact(
         temporary_file.flush()
         os.fsync(temporary_file.fileno())
     os.replace(temporary_path, artifact_path)
+
+
+def _publish_coverage_artifact(command: tuple[str, ...]) -> None:
+    module_index = _module_index(command, "coverage")
+    if module_index is None:
+        return
+    coverage_subcommand = command[module_index + 2]
+    if coverage_subcommand == "run":
+        data_argument = next(
+            (argument for argument in command if argument.startswith("--data-file=")),
+            None,
+        )
+        if data_argument is not None:
+            Path(data_argument.removeprefix("--data-file=")).write_bytes(b"coverage-data")
+        return
+    if coverage_subcommand != "json":
+        return
+    output_index = command.index("-o")
+    output_path = Path(command[output_index + 1])
+    output_path.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "format": 3,
+                    "version": "7.15.2",
+                    "timestamp": "2026-08-25T12:00:00Z",
+                    "branch_coverage": True,
+                    "show_contexts": False,
+                },
+                "files": {
+                    "src/example.py": {
+                        "executed_lines": [1],
+                        "summary": {
+                            "covered_lines": 1,
+                            "num_statements": 1,
+                            "percent_covered": 100.0,
+                            "percent_covered_display": "100",
+                            "missing_lines": 0,
+                            "excluded_lines": 0,
+                            "num_branches": 0,
+                            "num_partial_branches": 0,
+                            "covered_branches": 0,
+                            "missing_branches": 0,
+                        },
+                        "missing_lines": [],
+                        "excluded_lines": [],
+                        "executed_branches": [],
+                        "missing_branches": [],
+                    }
+                },
+                "totals": {
+                    "covered_lines": 1,
+                    "num_statements": 1,
+                    "percent_covered": 100.0,
+                    "percent_covered_display": "100",
+                    "missing_lines": 0,
+                    "excluded_lines": 0,
+                    "num_branches": 0,
+                    "num_partial_branches": 0,
+                    "covered_branches": 0,
+                    "missing_branches": 0,
+                },
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def _module_index(command: tuple[str, ...], module: str) -> int | None:
+    return next(
+        (
+            index
+            for index, pair in enumerate(zip(command, command[1:]))
+            if pair == ("-m", module)
+        ),
+        None,
+    )

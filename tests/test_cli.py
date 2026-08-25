@@ -563,6 +563,140 @@ def test_coverage_flag_is_parsed_and_forwarded(
     assert captured_requests[0].coverage_requested is True
 
 
+@pytest.mark.parametrize(
+    "target",
+    ("tests/test_sample.py", "tests/test_sample.py::test_selected"),
+)
+def test_coverage_option_can_be_interspersed_with_a_direct_target(target: str) -> None:
+    args = parse_args(("pytest", "--coverage", target))
+
+    assert args.coverage is True
+    assert args.checks == ["pytest", target]
+
+
+@pytest.mark.parametrize(
+    "positionals",
+    (("ty",), ("tests/test_example.py",)),
+    ids=("non-pytest-check", "target-only"),
+)
+def test_coverage_without_pytest_is_a_zero_spawn_planning_error(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    positionals: tuple[str, ...],
+) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_example.py").write_text("", encoding="utf-8")
+    runner = RecordingRunner()
+
+    result = main(
+        ["--root", str(tmp_path), "--format", "json", *positionals, "--coverage"],
+        runner=runner,
+    )
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format="json",
+        code="invalid_arguments",
+        message="--coverage requires pytest to be selected.",
+        hint="Use: pyrepo-check pytest --coverage",
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+def test_cli_recording_runner_executes_coverage_processes_in_order(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "example.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_example.py").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        """[tool.coverage.run]
+branch = true
+source = ["src"]
+parallel = false
+
+[tool.coverage.report]
+fail_under = 100
+""",
+        encoding="utf-8",
+    )
+    runner = RecordingRunner(
+        publish_pytest_artifact=True,
+        publish_coverage_artifact=True,
+    )
+
+    result = main(
+        [
+            "--root",
+            str(tmp_path),
+            "--format",
+            "json",
+            "pytest",
+            "--coverage",
+            "tests/test_example.py",
+        ],
+        runner=runner,
+    )
+
+    payload = json.loads(capsysbinary.readouterr().out)
+    pytest_check = payload["checks"][0]
+    processes = pytest_check["processes"]
+    primary = processes[2]
+    coverage_json = processes[3]
+
+    assert result == 0, payload
+    assert payload["selection"] == {
+        "checks": ["pytest"],
+        "targets": ["tests/test_example.py"],
+        "test_shortcut": None,
+        "pytest_args": ["tests/test_example.py"],
+        "planned_test_scope": "partial",
+        "planned_coverage_scope": "partial",
+    }
+    assert payload["coverage"]["status"] == "guidance"
+    assert payload["coverage"]["threshold"]["skipped_reason"] == "partial_run"
+    assert [process["role"] for process in processes] == [
+        "pytest_preflight",
+        "coverage_preflight",
+        "primary",
+        "coverage_json",
+    ]
+    assert len(runner.calls) == 4
+    assert "pytest_available" in runner.calls[0].command[-1]
+    assert "coverage_available" in runner.calls[1].command[-1]
+    assert primary["argv"][:7] == [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "coverage",
+        "run",
+        f"--rcfile={tmp_path / 'pyproject.toml'}",
+    ]
+    assert primary["argv"][7].startswith("--data-file=")
+    assert primary["argv"][8:11] == ["-m", "pytest", "-p"]
+    assert primary["argv"][11].startswith("_pyrepo_check_pytest_")
+    assert primary["argv"][12:] == ["tests/test_example.py"]
+    assert coverage_json["argv"][:7] == [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "coverage",
+        "json",
+        f"--rcfile={tmp_path / 'pyproject.toml'}",
+    ]
+    assert coverage_json["argv"][7].startswith("--data-file=")
+    assert coverage_json["argv"][8] == "-o"
+    assert coverage_json["argv"][9].endswith("/coverage.json")
+    assert coverage_json["argv"][10:] == ["--keep-combined", "--fail-under=0"]
+
+
 def test_coverage_flag_appears_in_help(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as raised:
         parse_args(("--help",))
