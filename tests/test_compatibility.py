@@ -1694,3 +1694,12 @@ def test_repository_native_coverage_measurement_policy_is_explicit() -> None:
         "source": ["src/pyrepo_check"],
         "parallel": False,
     }
+
+
+def test_repository_coverage_threshold_is_explicit() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["tool"]["coverage"]["report"] == {
+        "fail_under": 86.01,
+        "precision": 2,
+    }

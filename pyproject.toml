@@ -40,6 +40,10 @@ branch = true
 source = ["src/pyrepo_check"]
 parallel = false
 
+[tool.coverage.report]
+fail_under = 86.01
+precision = 2
+
 [tool.bandit]
 exclude_dirs = [".venv", ".pytest_cache", ".ruff_cache"]
 
