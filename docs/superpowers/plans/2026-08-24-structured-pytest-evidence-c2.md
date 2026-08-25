@@ -56,7 +56,7 @@
 - Consumes: absolute `PYREPO_CHECK_PYTEST_JSON` and `PYREPO_CHECK_PYTEST_WRITER_DIR` paths plus its own `__name__`.
 - Produces: one marker created with exclusive-create semantics at `pytest-writer-<writer_id>.json`; its JSON is `{schema_version: 1, writer_id: string, pid: integer}`.
 - Produces: an atomically replaced artifact with exact top-level members `schema_version`, `state`, `writer_id`, `pytest_version`, `session`, `effective_args`, `semantic_options`, `collection`, `reports`, and `flags`.
-- Produces: `state` is `started` until final publication and `finalized` after `pytest_sessionfinish`. `session` contains integer `starts`, `finishes`, `exit_code`, plus booleans `collection_completed` and `stopped_early`.
+- Produces: `state` is `started` until terminal publication and `finalized` only from the import-time exit handler after `pytest_sessionfinish` and `pytest_unconfigure` complete. `session` contains integer `starts`, `finishes`, `exit_code`, plus booleans `collection_completed` and `stopped_early`.
 - Produces: `collection` contains string arrays `initial_nodeids`, `final_nodeids`, `deselected_nodeids`, `uncovered_removed_nodeids` plus arrays of `{nodeid, message}` for `errors` and `skips`.
 - Produces: `semantic_options` contains `collection_paths`, `keyword`, `markexpr`, `deselect`, `ignore`, `ignore_glob`, `lf`, `pyargs`, `collectonly`, `setuponly`, and `setupplan`, using only strings, booleans, or string arrays.
 - Produces: each report is `{nodeid, when, outcome, duration, wasxfail_present, wasxfail_valid, wasxfail, longrepr}`; duration is a finite non-negative JSON number and nullable text is JSON null.
@@ -92,7 +92,9 @@ Expected: FAIL because the standalone plugin does not exist.
 
 - [ ] **Step 3: Implement exclusive writer registration and atomic lifecycle publication**
 
-Use only public pytest hooks and stdlib. Create the marker with mode `0o600` and `open(..., "x")`. `_publish(state)` writes compact JSON to a unique sibling file, flushes, calls `os.fsync`, sets owner-only mode, and `os.replace`s it over the exact artifact path. Publish `started` during `pytest_sessionstart` and `finalized` during `pytest_sessionfinish`.
+Use only public pytest hooks and stdlib. Create the marker with mode `0o600` and `open(..., "x")`. `_publish(state)` writes compact JSON to a unique sibling file, flushes, calls `os.fsync`, sets owner-only mode, and `os.replace`s it over the exact artifact path. Publish `started` during `pytest_sessionstart`; record the candidate finish during `pytest_sessionfinish`, close the hook lifecycle after `pytest_unconfigure`, and publish `finalized` from an import-time `atexit` handler only when one start, one finish, closure, and representable scope evidence are present. Any post-close hook activity atomically restores non-finalized state.
+
+Document the boundary: fatal interpreter errors, unhandled terminating signals, and `os._exit()` do not run `atexit` and must leave missing or started evidence. Hidden plugin state with no argument, option, collection, deselection, or report signal and concurrent background relay during shutdown remain outside the version-1 cooperative-plugin contract.
 
 - [ ] **Step 4: Run the lifecycle test and record GREEN**
 
@@ -102,7 +104,7 @@ Expected: PASS with one marker and one finalized artifact.
 
 - [ ] **Step 5: Write failing effective-argument, semantic-option, collection-wrapper, and collection-issue tests**
 
-Add real projects proving configured `addopts`, `PYTEST_ADDOPTS`, invocation args, and inner-hook mutations survive; only the owned `-p MODULE` pair is removed; semantic options are snapped; reported deselection is distinguished from silent removal; collection errors/skips remain separate; and normal collection completes.
+Add real projects proving configured `addopts`, `PYTEST_ADDOPTS`, invocation args, and inner-hook mutations survive; only the owned `-p MODULE` pair is removed; argument and semantic-option observations accumulate conservatively across lifecycle hooks; reported deselection is distinguished from silent removal; collection errors/skips remain separate; and normal collection completes.
 
 ```python
 assert artifact["collection"]["deselected_nodeids"] == ["test_sample.py::test_b"]
@@ -118,7 +120,7 @@ Expected: FAIL because Task 1 does not yet collect these signals.
 
 - [ ] **Step 7: Implement documented argument, semantic, collection, deselection, and report hooks**
 
-Use a pytest-8 new-style outer wrapper around `pytest_load_initial_conftests`; after `yield`, copy `args` and remove only the exact owned pair. Use an outer collection wrapper, `pytest_deselected`, `pytest_collectreport`, `pytest_collection_finish`, and `pytest_runtest_logreport`. Do not import hook or report classes from `_pytest`.
+Use a pytest-8 new-style outer wrapper around `pytest_load_initial_conftests`; retain the live `args`, observe it before and after `yield`, and remove only the exact owned pair. Refresh retained arguments and config options through session start, collection modification/finish, session finish, unconfigure, and interpreter exit. Additions, true booleans, and non-empty expressions remain sticky; incomparable argument order or conflicting non-empty expressions leave the artifact non-finalized. Use an outer collection wrapper, `pytest_deselected`, `pytest_collectreport`, `pytest_collection_finish`, and `pytest_runtest_logreport`. Do not import hook or report classes from `_pytest`.
 
 - [ ] **Step 8: Run plugin tests, quality checks, and commit**
 
@@ -174,7 +176,7 @@ Capture `wasxfail` presence/type without serializing arbitrary objects, and stor
 
 - [ ] **Step 4: Write failing real and synthetic xdist/retry tests**
 
-Required real tests: `-n 0` finalizes normally; `-n 1` publishes `unsupported_parallelism` and leaves a worker-only sentinel absent; `--reruns 1` publishes `unsupported_retries`. Keep synthetic plugins for repeated setup/teardown and arbitrary `rerun`. No test in this block may skip.
+Required real tests: `-n 0` finalizes normally; `-n 1` records a forced `unsupported_parallelism` finish before exit-time publication and leaves a worker-only sentinel absent; `--reruns 1` publishes `unsupported_retries`. Keep synthetic plugins for repeated setup/teardown and arbitrary `rerun`. No test in this block may skip.
 
 Run: `uv run --frozen python -m pytest tests/test_pytest_report_plugin.py -k 'xdist or rerun or repeated_phase' -vv`
 
@@ -182,7 +184,7 @@ Expected: FAIL before fail-closed flags/hooks.
 
 - [ ] **Step 5: Implement fail-closed xdist, worker, and retry detection**
 
-Use `@pytest.hookimpl(optionalhook=True)` for `pytest_xdist_setupnodes(config, specs)`. With non-empty specs, publish before a controlled pytest exit; installed-but-inactive xdist and `-n 0` remain normal. Flag worker metadata, repeated core phases, and non-core outcomes.
+Use `@pytest.hookimpl(optionalhook=True)` for `pytest_xdist_setupnodes(config, specs)`. With non-empty specs, record the forced finish before a controlled pytest exit; installed-but-inactive xdist and `-n 0` remain normal. The exit handler publishes the terminal artifact after unconfigure. Flag worker metadata, repeated core phases, and non-core outcomes.
 
 - [ ] **Step 6: Write the failing stable-pytest-minor compatibility matrix**
 

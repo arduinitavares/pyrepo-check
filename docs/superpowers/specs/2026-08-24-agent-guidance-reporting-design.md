@@ -227,7 +227,11 @@ This boundary follows [Python's `-m` path semantics](https://docs.python.org/3/u
 and [Coverage.py's `run -m` behavior](https://coverage.readthedocs.io/en/7.15.2/commands/cmd_run.html).
 
 The plugin uses pytest's supported collection, deselection, runtest-report,
-and session-finish hooks. It atomically writes a versioned artifact containing
+session-finish, and unconfigure hooks. It publishes `started` at session start,
+records but does not publish terminal state at session finish, closes its hook
+lifecycle after unconfigure, and atomically publishes the terminal artifact
+from an import-time `atexit` handler. Any public hook activity after closure is
+sticky invalidation and atomically restores non-finalized state. The artifact contains
 the target pytest version, exit code, collection/session state, and per-node
 setup/call/teardown reports. Missing, malformed, schema-invalid, or
 non-finalized artifacts are evidence errors; the artifact pytest version must
@@ -252,7 +256,8 @@ teardown time.
 Version 1 supports one pytest process only. It explicitly detects active
 pytest-xdist with a `pytest.hookimpl(optionalhook=True)`
 `pytest_xdist_setupnodes(config, specs)` hook:
-non-empty worker specs finalize `unsupported_parallelism` before workers start,
+non-empty worker specs record a forced `unsupported_parallelism` finish before workers start,
+then terminal publication occurs at normal interpreter exit,
 while `-n 0` and merely having xdist installed remain allowed. Other
 third-party multi-worker runners are outside the supported contract. Observable
 worker metadata, multiple artifact-writer identities, duplicated session
@@ -275,19 +280,34 @@ report and exposes only a final attempt is outside the version-1 contract; the
 tool does not claim to detect hidden attempts for arbitrary plugins. Attempt-
 aware retry support requires a later schema that preserves every attempt.
 
-The plugin records pytest's final effective arguments with an outer,
+The plugin retains pytest's live effective-argument list with an outer,
 `tryfirst` hook wrapper around
-`pytest_load_initial_conftests(early_config, parser, args)`. It copies `args`
-after every inner implementation and post-yield mutation has completed, then
-removes only the exact tool-owned `-p <unique_plugin>` pair. The list therefore
-includes configured `addopts`, `PYTEST_ADDOPTS`, invocation arguments, and
-public hook mutations in pytest's
+`pytest_load_initial_conftests(early_config, parser, args)`. It observes the
+list before and after that hook and refreshes it through session start,
+collection modification/finish, session finish, unconfigure, and interpreter
+exit, removing only the exact tool-owned `-p <unique_plugin>` pair. A later
+supersequence replaces an earlier observation; a later subsequence cannot
+erase earlier arguments; incomparable token order leaves the artifact
+non-finalized. The retained list therefore conservatively includes configured
+`addopts`, `PYTEST_ADDOPTS`, invocation arguments, and observable public hook mutations in pytest's
 [documented option composition](https://docs.pytest.org/en/8.4.x/example/simple.html#how-to-change-command-line-options-defaults).
-Before collection, it also snapshots the final semantic values of pytest's
+At the same lifecycle points it accumulates a conservative envelope of pytest's
 core selector/narrowing options so a plugin that mutates `config.option`
 without changing `args` cannot hide selection: collection paths plus `keyword`,
 `markexpr`, `deselect`, `ignore`, `ignore_glob`, `lf`, `pyargs`, `collectonly`,
-`setuponly`, and `setupplan`.
+`setuponly`, and `setupplan`. String-list additions preserve first-observed
+order, booleans remain true once observed, and non-empty `keyword`/`markexpr`
+values remain sticky. Conflicting non-empty expressions leave the artifact
+non-finalized rather than inventing semantics.
+
+The exit handler runs only during normal interpreter shutdown. A fatal Python
+error, unhandled terminating signal, or `os._exit()` therefore leaves the
+earlier artifact missing or `started`, which is fail-closed. This protocol does
+not claim detection of a consumer plugin that filters through hidden internal
+state and erases every argument, option, item-list, deselection, and report
+signal, nor of concurrent background hook relay during interpreter teardown.
+Those behaviors are outside the version-1 one-process cooperative-plugin
+contract; observed post-close relay invalidates evidence.
 For a planned complete suite, these core options are scope-neutral in version
 1: `-r<chars>`, repeated `-q`/`--quiet`, repeated `-v`/`--verbose`,
 `--tb=<style>`, `-l`/`--showlocals`/`--no-showlocals`, `--color=<value>`,
@@ -1406,6 +1426,12 @@ the intended contract.
   are `unsupported_retries`; prove plugin/subprocess exit-code mismatches also
   fail evidence closed without a false pass. Document a custom protocol that
   hides all intermediate attempts as unsupported and not claimed detectable.
+- Across pytest `8.0.2` through `8.4.2`, prove an equal-priority outer
+  session-finish wrapper cannot hide a late duplicate report, an ordinary
+  collection hook cannot hide a semantic-option mutation, and an equal-priority
+  outer collection wrapper cannot hide an appended external argument. Prove
+  post-unconfigure hook relay, conflicting scope observations, fatal exit, and
+  terminal replacement failure all retain non-finalized evidence.
 - Prove missing, malformed, non-finalized, and otherwise invalid plugin
   artifacts produce `evidence: null`, unique planner-known scope reasons, and
   no fabricated counts or empty findings.

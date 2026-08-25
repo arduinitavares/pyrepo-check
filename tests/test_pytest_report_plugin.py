@@ -189,14 +189,79 @@ def test_plugin_finalization_is_idempotent_after_an_early_abort(
 ) -> None:
     module = _load_plugin_module(tmp_path, monkeypatch)
     evidence = module._Evidence()
-    evidence.starts = 1
+    evidence.start_session()
 
-    evidence.finalize(4, stopped_early=True)
-    evidence.finalize(4, stopped_early=True)
+    evidence.record_finish(4, stopped_early=True, forced=True)
+    evidence.close()
+    evidence.finalize_at_exit()
+    evidence.finalize_at_exit()
 
     assert evidence.finishes == 1
     assert evidence.exit_code == 4
     assert evidence.stopped_early is True
+
+
+def test_plugin_exit_handler_is_noop_without_a_started_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+
+    module._finalize_at_exit()
+
+    artifact_path = tmp_path / "direct-plugin-artifacts" / "artifact.json"
+    assert not artifact_path.exists()
+
+
+def test_plugin_terminal_replace_failure_leaves_started_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+    evidence = module._Evidence()
+    evidence.start_session()
+    evidence.publish("started")
+    evidence.record_finish(0, stopped_early=False)
+    evidence.close()
+    original_replace = module.os.replace
+
+    def fail_terminal_replace(source: Path, destination: Path) -> None:
+        del source, destination
+        raise OSError("terminal replace failed")
+
+    monkeypatch.setattr(module.os, "replace", fail_terminal_replace)
+
+    with pytest.raises(OSError, match="terminal replace failed"):
+        evidence.finalize_at_exit()
+    monkeypatch.setattr(module.os, "replace", original_replace)
+    artifact = json.loads(
+        (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
+    )
+
+    assert artifact["state"] == "started"
+    assert artifact["session"]["finishes"] == 0
+
+
+def test_plugin_conflicting_scope_observations_stay_non_finalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+    evidence = module._Evidence()
+    evidence.start_session()
+    evidence.remember_args(["--first"])
+    evidence.remember_args(["--second"])
+    evidence.publish("started")
+    evidence.record_finish(0, stopped_early=False)
+    evidence.close()
+
+    evidence.finalize_at_exit()
+    artifact = json.loads(
+        (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
+    )
+
+    assert artifact["state"] == "started"
+    assert artifact["session"]["finishes"] == 0
 
 
 def test_plugin_finalized_exit_zero_requires_teardown_for_terminal_coverage(
@@ -207,7 +272,7 @@ def test_plugin_finalized_exit_zero_requires_teardown_for_terminal_coverage(
     evidence = module._Evidence()
     setattr(module, "_EVIDENCE", evidence)
     nodeid = "test_sample.py::test_case"
-    evidence.starts = 1
+    evidence.start_session()
     evidence.collection_completed = True
     evidence.initial_nodeids = [nodeid]
     evidence.final_nodeids = [nodeid]
@@ -225,7 +290,27 @@ def test_plugin_finalized_exit_zero_requires_teardown_for_terminal_coverage(
     module.pytest_runtest_logreport(Report("setup"))
     module.pytest_runtest_logreport(Report("call"))
 
+    class Option:
+        keyword = ""
+        markexpr = ""
+        deselect: list[str] = []
+        ignore: list[str] = []
+        ignore_glob: list[str] = []
+        lf = False
+        pyargs = False
+        collectonly = False
+        setuponly = False
+        setupplan = False
+
+    class Config:
+        option = Option()
+
+        @staticmethod
+        def getoption(_name: str, *, default: object) -> object:
+            return default
+
     class Session:
+        config = Config()
         shouldstop = False
         shouldfail = False
 
@@ -233,6 +318,11 @@ def test_plugin_finalized_exit_zero_requires_teardown_for_terminal_coverage(
     next(wrapper)
     with pytest.raises(StopIteration):
         next(wrapper)
+    unconfigure = module.pytest_unconfigure(Session.config)
+    next(unconfigure)
+    with pytest.raises(StopIteration):
+        next(unconfigure)
+    evidence.finalize_at_exit()
     artifact = json.loads(
         (tmp_path / "direct-plugin-artifacts" / "artifact.json").read_text()
     )
@@ -273,6 +363,68 @@ def test_plugin_finalizes_one_atomic_session_for_a_passing_test(tmp_path: Path) 
         "call",
         "teardown",
     ]
+
+
+def test_plugin_invalidates_a_consumer_atexit_hook_relay(tmp_path: Path) -> None:
+    run = run_plugin_project(
+        tmp_path,
+        "def test_ok():\n    assert True\n",
+        invocation_args=("-p", "late_relay"),
+        plugin_sources={
+            "late_relay": """
+import atexit
+from _pytest.reports import TestReport
+
+
+_CONFIG = None
+
+
+def relay_after_unconfigure():
+    if _CONFIG is None:
+        return
+    _CONFIG.hook.pytest_runtest_logreport(
+        report=TestReport(
+            nodeid="test_sample.py::test_ok",
+            location=("test_sample.py", 0, "test_ok"),
+            keywords={},
+            outcome="passed",
+            longrepr=None,
+            when="call",
+            sections=(),
+            duration=0.0,
+            start=0.0,
+            stop=0.0,
+            user_properties=[],
+        )
+    )
+
+
+atexit.register(relay_after_unconfigure)
+
+
+def pytest_configure(config):
+    global _CONFIG
+    _CONFIG = config
+""",
+        },
+    )
+
+    session = cast(dict[str, object], run.artifact["session"])
+    assert run.completed.returncode == 0
+    assert run.artifact["state"] == "started"
+    assert session["finishes"] == 0
+
+
+def test_plugin_fatal_exit_keeps_started_artifact(tmp_path: Path) -> None:
+    run = run_plugin_project(
+        tmp_path,
+        "import os\n\ndef test_abort():\n    os._exit(7)\n",  # nosec B404
+    )
+
+    session = cast(dict[str, object], run.artifact["session"])
+    assert run.completed.returncode == 7
+    assert run.artifact["state"] == "started"
+    assert session["finishes"] == 0
 
 
 def test_plugin_records_effective_args_after_all_public_sources(tmp_path: Path) -> None:

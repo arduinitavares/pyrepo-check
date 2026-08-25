@@ -38,6 +38,7 @@ def run_isolated_pytest_project(
     pytest_version: str,
     *,
     conftest_source: str | None = None,
+    plugin_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
     """Run the raw-artifact plugin in one cached isolated pytest environment."""
     project = tmp_path / "project"
@@ -84,6 +85,12 @@ def test_deselected():
         Path(__file__).parents[1] / "src/pyrepo_check/_pytest_report_plugin.py",
         module_dir / f"{module_name}.py",
     )
+    consumer_plugin_name = "consumer_plugin"
+    if plugin_source is not None:
+        (module_dir / f"{consumer_plugin_name}.py").write_text(
+            plugin_source,
+            encoding="utf-8",
+        )
     environment = os.environ | {
         "PYREPO_CHECK_PYTEST_JSON": str(artifact_path),
         "PYREPO_CHECK_PYTEST_WRITER_DIR": str(writer_dir),
@@ -105,6 +112,7 @@ def test_deselected():
             "pytest",
             "-p",
             module_name,
+            *(("-p", consumer_plugin_name) if plugin_source is not None else ()),
             "--deselect",
             "test_sample.py::test_deselected",
         ),
@@ -120,6 +128,103 @@ def test_deselected():
         f"stderr:\n{completed.stderr}"
     )
     return completed, json.loads(artifact_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("pytest_version", PYTEST_8_VERSIONS)
+def test_equal_priority_outer_sessionfinish_report_is_not_hidden(
+    tmp_path: Path,
+    pytest_version: str,
+) -> None:
+    """Catch an outer wrapper emitting a report after an inner final publication."""
+    _completed, artifact = run_isolated_pytest_project(
+        tmp_path,
+        pytest_version,
+        conftest_source="""
+import pytest
+from _pytest.reports import TestReport
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    yield
+    session.config.hook.pytest_runtest_logreport(
+        report=TestReport(
+            nodeid="test_sample.py::test_pass",
+            location=("test_sample.py", 0, "test_pass"),
+            keywords={},
+            outcome="passed",
+            longrepr=None,
+            when="call",
+            sections=(),
+            duration=0.0,
+            start=0.0,
+            stop=0.0,
+            user_properties=[],
+        )
+    )
+""",
+    )
+
+    flags = cast(dict[str, object], artifact["flags"])
+    assert flags["unsupported_retries"] is True
+
+
+@pytest.mark.parametrize("pytest_version", PYTEST_8_VERSIONS)
+def test_ordinary_collection_semantic_mutation_is_not_hidden(
+    tmp_path: Path,
+    pytest_version: str,
+) -> None:
+    """Catch an ordinary collection hook mutating options after the first snapshot."""
+    _completed, artifact = run_isolated_pytest_project(
+        tmp_path,
+        pytest_version,
+        conftest_source="""
+def pytest_collection_modifyitems(config, items):
+    del items
+    config.option.keyword = "test"
+""",
+    )
+
+    semantic_options = cast(dict[str, object], artifact["semantic_options"])
+    assert semantic_options["keyword"] == "test"
+
+
+@pytest.mark.parametrize("pytest_version", PYTEST_8_VERSIONS)
+def test_equal_priority_outer_collection_argument_mutation_is_not_hidden(
+    tmp_path: Path,
+    pytest_version: str,
+) -> None:
+    """Catch a later outer wrapper appending an external scope argument."""
+    _completed, artifact = run_isolated_pytest_project(
+        tmp_path,
+        pytest_version,
+        plugin_source="""
+import pytest
+
+
+_ARGS = None
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_load_initial_conftests(early_config, parser, args):
+    del early_config, parser
+    global _ARGS
+    _ARGS = args
+    yield
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_collection_modifyitems(items):
+    del items
+    yield
+    assert _ARGS is not None
+    _ARGS.append("--external-filter")
+""",
+    )
+
+    effective_args = cast(list[str], artifact["effective_args"])
+    assert "--external-filter" in effective_args
 
 
 @pytest.mark.parametrize("pytest_version", PYTEST_8_VERSIONS)

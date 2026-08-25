@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 from collections.abc import Generator
 import json
 import math
 import os
 from pathlib import Path
+from typing import cast
 import uuid
 
 import pytest
@@ -40,7 +42,16 @@ class _Evidence:
         self._final_nodeid_set: set[str] = set()
         self._observed_phase_keys: set[tuple[str, str | None]] = set()
         self._terminal_nodeids: set[str] = set()
-        self._finalized = False
+        self._args: list[str] | None = None
+        self._config: pytest.Config | None = None
+        self._args_observed = False
+        self._semantic_options_observed = False
+        self._session_started = False
+        self._finish_seen = False
+        self._forced_finish = False
+        self._closed = False
+        self._terminal_published = False
+        self._invalidated = False
 
     @staticmethod
     def empty_semantic_options() -> dict[str, object]:
@@ -58,9 +69,10 @@ class _Evidence:
             "setupplan": False,
         }
 
-    def snapshot_semantic_options(self, config: pytest.Config) -> None:
+    @staticmethod
+    def _semantic_options(config: pytest.Config) -> dict[str, object]:
         option = config.option
-        self.semantic_options = {
+        return {
             "collection_paths": list(config.getoption("file_or_dir", default=[])),
             "keyword": option.keyword,
             "markexpr": option.markexpr,
@@ -73,6 +85,58 @@ class _Evidence:
             "setuponly": option.setuponly,
             "setupplan": option.setupplan,
         }
+
+    def observe_hook(self) -> bool:
+        if self._closed or self._terminal_published:
+            self._invalidated = True
+            if self._session_started:
+                self.publish("started")
+            return False
+        return not self._invalidated
+
+    def remember_args(self, args: list[str]) -> None:
+        self._args = args
+        self._merge_args(_remove_owned_plugin_pair(list(args)))
+
+    def remember_config(self, config: pytest.Config) -> None:
+        self._config = config
+        self._merge_semantic_options(self._semantic_options(config))
+
+    def refresh_scope(self) -> None:
+        if self._args is not None:
+            self._merge_args(_remove_owned_plugin_pair(list(self._args)))
+        if self._config is not None:
+            self._merge_semantic_options(self._semantic_options(self._config))
+
+    def _merge_args(self, observed: list[str]) -> None:
+        if not self._args_observed:
+            self.effective_args = observed
+            self._args_observed = True
+        elif _is_subsequence(self.effective_args, observed):
+            self.effective_args = observed
+        elif not _is_subsequence(observed, self.effective_args):
+            self._invalidated = True
+
+    def _merge_semantic_options(self, observed: dict[str, object]) -> None:
+        if not self._semantic_options_observed:
+            self.semantic_options = observed
+            self._semantic_options_observed = True
+            return
+        for name in ("collection_paths", "deselect", "ignore", "ignore_glob"):
+            retained = list(cast(list[str], self.semantic_options[name]))
+            for value in cast(list[str], observed[name]):
+                if value not in retained:
+                    retained.append(value)
+            self.semantic_options[name] = retained
+        for name in ("lf", "pyargs", "collectonly", "setuponly", "setupplan"):
+            self.semantic_options[name] = bool(self.semantic_options[name] or observed[name])
+        for name in ("keyword", "markexpr"):
+            retained = self.semantic_options[name]
+            current = observed[name]
+            if retained and current and retained != current:
+                self._invalidated = True
+            elif current:
+                self.semantic_options[name] = current
 
     def publish(self, state: str) -> None:
         document = {
@@ -114,17 +178,51 @@ class _Evidence:
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, _ARTIFACT_PATH)
 
-    def finalize(self, exit_code: int, *, stopped_early: bool) -> None:
-        if self._finalized:
+    def start_session(self) -> None:
+        self._session_started = True
+        self.starts += 1
+
+    def record_finish(
+        self,
+        exit_code: int,
+        *,
+        stopped_early: bool,
+        forced: bool = False,
+    ) -> None:
+        if self._finish_seen:
+            if self._forced_finish and exit_code == self.exit_code:
+                self.stopped_early = self.stopped_early or stopped_early
+                return
+            self._invalidated = True
             return
-        self.finishes += 1
+        self._finish_seen = True
+        self._forced_finish = forced
         self.exit_code = exit_code
         self.stopped_early = stopped_early
+
+    def close(self) -> None:
+        self._closed = True
+
+    def finalize_at_exit(self) -> None:
+        if not self._session_started or self._terminal_published:
+            return
+        self.refresh_scope()
+        if self._invalidated or not self._finish_seen or not self._closed:
+            self.publish("started")
+            return
+        self.finishes = 1
         self.publish("finalized")
-        self._finalized = True
+        self._terminal_published = True
 
 
 _EVIDENCE = _Evidence()
+
+
+def _finalize_at_exit() -> None:
+    _EVIDENCE.finalize_at_exit()
+
+
+atexit.register(_finalize_at_exit)
 
 
 def _register_writer() -> None:
@@ -155,19 +253,33 @@ def _remove_owned_plugin_pair(args: list[str]) -> list[str]:
     return effective_args
 
 
+def _is_subsequence(candidate: list[str], sequence: list[str]) -> bool:
+    candidate_index = 0
+    for value in sequence:
+        if candidate_index < len(candidate) and value == candidate[candidate_index]:
+            candidate_index += 1
+    return candidate_index == len(candidate)
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_load_initial_conftests(
     early_config: pytest.Config,
     parser: pytest.Parser,
     args: list[str],
 ) -> Generator[None, object, None]:
+    if _EVIDENCE.observe_hook():
+        _EVIDENCE.remember_args(args)
     yield
-    _EVIDENCE.effective_args = _remove_owned_plugin_pair(list(args))
+    if _EVIDENCE.observe_hook():
+        _EVIDENCE.remember_args(args)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
+    if not _EVIDENCE.observe_hook():
+        return
     _register_writer()
-    _EVIDENCE.starts += 1
+    _EVIDENCE.remember_config(session.config)
+    _EVIDENCE.start_session()
     _EVIDENCE.publish("started")
 
 
@@ -177,10 +289,15 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> Generator[None, object, None]:
-    _EVIDENCE.snapshot_semantic_options(config)
+    active = _EVIDENCE.observe_hook()
+    if not active:
+        yield
+        return
+    _EVIDENCE.remember_config(config)
     _EVIDENCE.initial_nodeids = [item.nodeid for item in items]
     _EVIDENCE._deselected_during_collection_set = set()
     yield
+    _EVIDENCE.refresh_scope()
     _EVIDENCE.final_nodeids = [item.nodeid for item in items]
     _EVIDENCE._final_nodeid_set = set(_EVIDENCE.final_nodeids)
     deselected_nodeids = _EVIDENCE._deselected_during_collection_set or set()
@@ -193,6 +310,8 @@ def pytest_collection_modifyitems(
 
 
 def pytest_deselected(items: list[pytest.Item]) -> None:
+    if not _EVIDENCE.observe_hook():
+        return
     nodeids = [item.nodeid for item in items]
     _EVIDENCE.deselected_nodeids.extend(nodeids)
     if _EVIDENCE._deselected_during_collection_set is not None:
@@ -200,6 +319,8 @@ def pytest_deselected(items: list[pytest.Item]) -> None:
 
 
 def pytest_collectreport(report: pytest.CollectReport) -> None:
+    if not _EVIDENCE.observe_hook():
+        return
     if report.failed:
         _EVIDENCE.collection_errors.append(
             {"nodeid": report.nodeid, "message": str(report.longrepr)}
@@ -210,11 +331,20 @@ def pytest_collectreport(report: pytest.CollectReport) -> None:
         )
 
 
-def pytest_collection_finish(session: pytest.Session) -> None:
-    _EVIDENCE.collection_completed = True
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_collection_finish(session: pytest.Session) -> Generator[None, object, None]:
+    active = _EVIDENCE.observe_hook()
+    if active:
+        _EVIDENCE.remember_config(session.config)
+    yield
+    if active:
+        _EVIDENCE.refresh_scope()
+        _EVIDENCE.collection_completed = True
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if not _EVIDENCE.observe_hook():
+        return
     duration = report.duration if math.isfinite(report.duration) and report.duration >= 0 else 0.0
     wasxfail = getattr(report, "wasxfail", None)
     phase_key = (report.nodeid, report.when)
@@ -244,7 +374,13 @@ def pytest_sessionfinish(
     session: pytest.Session,
     exitstatus: int,
 ) -> Generator[None, object, None]:
+    active = _EVIDENCE.observe_hook()
+    if active:
+        _EVIDENCE.remember_config(session.config)
     yield
+    if not active:
+        return
+    _EVIDENCE.refresh_scope()
     stopped_early = bool(
         session.shouldstop
         or session.shouldfail
@@ -253,16 +389,31 @@ def pytest_sessionfinish(
             and not _EVIDENCE._final_nodeid_set.issubset(_EVIDENCE._terminal_nodeids)
         )
     )
-    _EVIDENCE.finalize(exitstatus, stopped_early=stopped_early)
+    _EVIDENCE.record_finish(exitstatus, stopped_early=stopped_early)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_unconfigure(config: pytest.Config) -> Generator[None, object, None]:
+    active = _EVIDENCE.observe_hook()
+    if active:
+        _EVIDENCE.remember_config(config)
+    yield
+    if active:
+        _EVIDENCE.refresh_scope()
+        _EVIDENCE.close()
 
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_xdist_setupnodes(config: pytest.Config, specs: list[object]) -> None:
-    if specs:
+    if specs and _EVIDENCE.observe_hook():
+        _EVIDENCE.remember_config(config)
         _EVIDENCE.unsupported_parallelism = True
-        _EVIDENCE.finalize(4, stopped_early=True)
+        _EVIDENCE.record_finish(4, stopped_early=True, forced=True)
         pytest.exit(returncode=4)
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    if not _EVIDENCE.observe_hook():
+        return
+    _EVIDENCE.remember_config(config)
     _EVIDENCE.worker_metadata = hasattr(config, "workerinput")
