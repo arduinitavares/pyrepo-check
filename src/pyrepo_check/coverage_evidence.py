@@ -364,7 +364,10 @@ def is_supported_coverage_version(value: object) -> bool:
     match = _STABLE_COVERAGE_VERSION.fullmatch(value)
     if match is None:
         return False
-    major, minor, patch = (int(piece or "0") for piece in match.groups())
+    try:
+        major, minor, patch = (int(piece or "0") for piece in match.groups())
+    except ValueError:
+        return False
     return (7, 15, 0) <= (major, minor, patch) < (8, 0, 0)
 
 

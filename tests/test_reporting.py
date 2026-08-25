@@ -1216,6 +1216,116 @@ def test_report_validation_rejects_combined_coverage_error_stage_defects(
             validate_report_v1(invalid)
 
 
+def test_report_validation_correlates_pre_json_parallelism_with_pytest_evidence(
+    tmp_path: Path,
+) -> None:
+    report = build_coverage_error_stage_report(tmp_path, "unsupported-parallelism")
+
+    assert report.pytest is not None
+    assert report.pytest.error is not None
+    assert report.pytest.error.code == "unsupported_parallelism"
+    assert report.coverage is not None
+    assert report.coverage.error is not None
+    assert report.coverage.error.code == "unsupported_parallelism"
+    validate_report_v1(report)
+
+    pytest_without_parallelism = replace(
+        report,
+        pytest=replace(
+            report.pytest,
+            error=PytestError("unsupported_retries", "pytest artifact reports retries"),
+        ),
+    )
+    coverage_without_parallelism = replace(
+        report,
+        coverage=replace(
+            report.coverage,
+            error=CoverageError("data_missing", "coverage data missing"),
+        ),
+    )
+
+    for invalid in (pytest_without_parallelism, coverage_without_parallelism):
+        with pytest.raises(ReportingError, match=r"^invalid report:"):
+            validate_report_v1(invalid)
+
+
+def test_report_validation_rejects_preprimary_parallel_data_without_primary(
+    tmp_path: Path,
+) -> None:
+    report = build_coverage_error_stage_report(tmp_path, "data-missing-without-primary")
+
+    assert report.coverage is not None
+    assert report.coverage.error == CoverageError("data_missing", "data_missing diagnostic")
+    validate_report_v1(report)
+
+    unexpected_parallel_data = replace(
+        report,
+        coverage=replace(
+            report.coverage,
+            error=CoverageError("unexpected_parallel_data", "parallel data was found"),
+        ),
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(unexpected_parallel_data)
+
+
+def test_report_validation_requires_typed_coverage_preflight_success(
+    tmp_path: Path,
+) -> None:
+    for case in (
+        "typed-unsupported-python",
+        "typed-module-unavailable",
+        "typed-stable-unsupported-version",
+    ):
+        report = build_coverage_error_stage_report(tmp_path / case, case)
+        check = report.checks[0]
+        failed_preflight = replace(check.processes[1], exit_code=1)
+        invalid = replace(
+            report,
+            checks=(replace(check, processes=(check.processes[0], failed_preflight)),),
+        )
+
+        with pytest.raises(ReportingError, match=r"^invalid report:"):
+            validate_report_v1(invalid)
+
+    preflight_invalid = build_coverage_error_stage_report(
+        tmp_path / "preflight-invalid", "typed-preflight-invalid"
+    )
+    check = preflight_invalid.checks[0]
+    positive_exit = replace(check.processes[1], exit_code=1)
+    validate_report_v1(
+        replace(
+            preflight_invalid,
+            checks=(replace(check, processes=(check.processes[0], positive_exit)),),
+        )
+    )
+
+
+def test_report_validation_rejects_eligible_exit_two_generation_failure(
+    tmp_path: Path,
+) -> None:
+    generation_failed = build_coverage_error_stage_report(
+        tmp_path / "strict", "generation-failed"
+    )
+    check = generation_failed.checks[0]
+    eligible_exit_two = replace(check.processes[-1], exit_code=2)
+    strict_invalid = replace(
+        generation_failed,
+        checks=(
+            replace(
+                check,
+                processes=(*check.processes[:-1], eligible_exit_two),
+            ),
+        ),
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(strict_invalid)
+
+    validate_report_v1(replace(strict_invalid, mode="focused"))
+
+
 def test_terminal_renders_post_primary_coverage_json_diagnostics_once(tmp_path: Path) -> None:
     report = build_coverage_report(
         tmp_path,

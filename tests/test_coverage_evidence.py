@@ -24,6 +24,7 @@ from pyrepo_check.coverage_evidence import (
     FileStatementCoverage,
     build_coverage_result,
     coverage_gate_policy,
+    is_supported_coverage_version,
     validate_coverage_result,
     validate_coverage_json,
 )
@@ -1124,6 +1125,29 @@ def test_coverage_result_retains_only_stable_out_of_range_unsupported_version(
 
     with pytest.raises(ValueError):
         validate_coverage_result(replace(result, coverage_version="7.15.2"))
+
+
+def test_coverage_result_retains_a_giant_stable_unsupported_version(tmp_path: Path) -> None:
+    root = _coverage_project(tmp_path)
+    version = f"{'9' * 10_000}.0.0"
+
+    assert is_supported_coverage_version(version) is False
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(
+            preflight="unsupported_version",
+            artifact="not_attempted",
+            version=version,
+            diagnostic="unsupported coverage version",
+        ),
+    )
+
+    assert result is not None
+    assert result.error == CoverageError("unsupported_version", "unsupported coverage version")
+    assert result.coverage_version == version
+    validate_coverage_result(result)
 
 
 @pytest.mark.parametrize("version", ("7.14.9", "8.0.0", "0.0"))

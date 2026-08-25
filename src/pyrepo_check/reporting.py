@@ -999,8 +999,14 @@ def _validate_coverage_error_processes(
     if roles == _COVERAGE_PREFLIGHT_ROLES:
         coverage_preflight = pytest_check.processes[-1]
         if error.code in _COVERAGE_PREPRIMARY_ERROR_CODES:
-            if coverage_preflight.outcome != "exited":
-                _invalid("typed coverage preflight error requires an exited preflight")
+            if (
+                coverage_preflight.outcome != "exited"
+                or (
+                    error.code != "preflight_invalid"
+                    and coverage_preflight.exit_code != 0
+                )
+            ):
+                _invalid("typed coverage preflight error contradicts preflight exit")
             return
         if error.code in {"spawn_failed", "terminated_by_signal"}:
             expected_outcome: ProcessOutcome = (
@@ -1012,7 +1018,7 @@ def _validate_coverage_error_processes(
             ):
                 _invalid("coverage preflight process contradicts coverage error")
             return
-        if error.code in _COVERAGE_PREJSON_ARTIFACT_ERROR_CODES:
+        if error.code == "data_missing":
             _validate_supported_prejson_coverage_error(coverage, coverage_preflight)
             return
         _invalid("coverage error requires a later attempted process")
@@ -1020,10 +1026,20 @@ def _validate_coverage_error_processes(
 
     if roles == _COVERAGE_PRIMARY_ROLES:
         coverage_preflight = pytest_check.processes[1]
+        if error.code == "unsupported_parallelism":
+            _validate_supported_prejson_coverage_error(coverage, coverage_preflight)
+            if (
+                pytest_result.error is None
+                or pytest_result.error.code != "unsupported_parallelism"
+            ):
+                _invalid("coverage parallelism error requires matching pytest evidence")
+            return
         if (
-            error.code in _COVERAGE_PREJSON_ARTIFACT_ERROR_CODES
-            or error.code == "unsupported_parallelism"
+            pytest_result.error is not None
+            and pytest_result.error.code == "unsupported_parallelism"
         ):
+            _invalid("pytest parallelism evidence requires matching coverage error")
+        if error.code in _COVERAGE_PREJSON_ARTIFACT_ERROR_CODES:
             _validate_supported_prejson_coverage_error(coverage, coverage_preflight)
             return
         _invalid("coverage error contradicts primary and JSON process evidence")
@@ -1053,6 +1069,13 @@ def _validate_coverage_error_processes(
             or coverage_json.exit_code <= 0
         ):
             _invalid("coverage generation failure requires a positive JSON exit")
+        if coverage_json.exit_code == 2 and _coverage_threshold_exit_two_is_eligible(
+            mode,
+            selection,
+            pytest_result,
+            coverage,
+        ):
+            _invalid("eligible coverage threshold exit cannot be a generation failure")
         return
     if error.code in {"artifact_missing", "artifact_invalid"}:
         if coverage_json.outcome != "exited":
