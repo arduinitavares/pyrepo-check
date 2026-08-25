@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import math
 from types import MappingProxyType
 from typing import Literal, cast
 
 from pyrepo_check.execution import ExecutedCheck, ExecutedProcess
+from pyrepo_check.planning import RunPlan
 
 
 PytestErrorCode = Literal[
@@ -33,6 +35,79 @@ PytestErrorCode = Literal[
     "unknown_exit_code",
 ]
 ExpectedFailureKind = Literal["none", "xfail", "xpass_non_strict", "xpass_strict"]
+PytestStatus = Literal["passed", "failed", "error"]
+TestScope = Literal["partial", "complete"]
+TestScopeReason = Literal[
+    "planned_selector",
+    "effective_narrowing_option",
+    "unclassified_external_option",
+    "deselected_tests",
+    "collection_reduced",
+    "incomplete_session",
+]
+SpecialOutcome = Literal["skipped", "xfailed", "xpassed"]
+
+
+@dataclass(frozen=True)
+class PytestCounts:
+    passed: int
+    failed: int
+    errors: int
+    skipped: int
+    xfailed: int
+    xpassed: int
+
+
+@dataclass(frozen=True)
+class CollectionIssue:
+    nodeid: str
+    message: str
+
+
+@dataclass(frozen=True)
+class SlowTest:
+    nodeid: str
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class SpecialTestOutcome:
+    nodeid: str
+    outcome: SpecialOutcome
+    reason: str | None
+    strict: bool | None
+    affects_exit: bool
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class PytestEvidence:
+    effective_args: tuple[str, ...]
+    collected: int
+    deselected: int
+    counts: PytestCounts
+    collection_errors: tuple[CollectionIssue, ...]
+    collection_skips: tuple[CollectionIssue, ...]
+    slowest: tuple[SlowTest, ...]
+    special_outcomes: tuple[SpecialTestOutcome, ...]
+
+
+@dataclass(frozen=True)
+class PytestError:
+    code: PytestErrorCode
+    message: str
+
+
+@dataclass(frozen=True)
+class PytestResult:
+    status: PytestStatus
+    complete: bool
+    scope: TestScope
+    scope_reasons: tuple[TestScopeReason, ...]
+    pytest_version: str | None
+    exit_code: int | None
+    evidence: PytestEvidence | None
+    error: PytestError | None
 
 
 @dataclass(frozen=True)
@@ -160,6 +235,360 @@ def validate_pytest_execution(
             primary.returncode,
         )
     return validated
+
+
+def build_pytest_result(plan: RunPlan, check: ExecutedCheck) -> PytestResult:
+    """Consolidate trusted pytest observations into the public schema-v1 result."""
+    validated = validate_pytest_execution(check)
+    if isinstance(validated, PytestValidationFailure):
+        return _result_from_validation_failure(plan, validated)
+
+    evidence, terminal_nodeids = _build_evidence(validated)
+    collection_errors = evidence.collection_errors
+    final_nodeids = cast(tuple[str, ...], validated.collection["final_nodeids"])
+    collection_completed = cast(bool, validated.session["collection_completed"])
+    stopped_early = cast(bool, validated.session["stopped_early"])
+    complete = (
+        collection_completed
+        and not collection_errors
+        and not stopped_early
+        and set(final_nodeids).issubset(terminal_nodeids)
+        and _count_total(evidence.counts) == evidence.collected
+        and validated.exit_code in {0, 1, 5}
+    )
+    status, error = _exit_result(validated.exit_code, complete, stopped_early)
+    reasons = _scope_reasons(plan, validated, evidence, complete)
+    return PytestResult(
+        status=status,
+        complete=complete,
+        scope="complete" if not reasons else "partial",
+        scope_reasons=reasons,
+        pytest_version=validated.pytest_version,
+        exit_code=validated.exit_code,
+        evidence=evidence,
+        error=error,
+    )
+
+
+def _result_from_validation_failure(
+    plan: RunPlan, failure: PytestValidationFailure
+) -> PytestResult:
+    reasons: list[TestScopeReason] = []
+    if plan.planned_test_scope == "partial":
+        reasons.append("planned_selector")
+    reasons.append("incomplete_session")
+    return PytestResult(
+        status="error",
+        complete=False,
+        scope="partial",
+        scope_reasons=tuple(reasons),
+        pytest_version=failure.pytest_version,
+        exit_code=failure.exit_code,
+        evidence=None,
+        error=PytestError(failure.code, failure.message),
+    )
+
+
+def _build_evidence(
+    validated: ValidatedPytestSession,
+) -> tuple[PytestEvidence, set[str]]:
+    final_nodeids = cast(tuple[str, ...], validated.collection["final_nodeids"])
+    phases_by_nodeid: dict[str, list[ValidatedPhaseReport]] = {}
+    for report in validated.reports:
+        if report.nodeid in final_nodeids:
+            phases_by_nodeid.setdefault(report.nodeid, []).append(report)
+
+    counts = PytestCounts(0, 0, 0, 0, 0, 0)
+    slowest: list[SlowTest] = []
+    special: list[SpecialTestOutcome] = []
+    terminal_nodeids: set[str] = set()
+    for nodeid in final_nodeids:
+        reports = phases_by_nodeid.get(nodeid, [])
+        outcome = _consolidate_node(reports)
+        if outcome is None:
+            continue
+        terminal_nodeids.add(nodeid)
+        counts = _increment_count(counts, outcome[0])
+        duration_ms = _round_phase_durations(reports)
+        slowest.append(SlowTest(nodeid, duration_ms))
+        if outcome[0] in {"skipped", "xfailed", "xpassed"}:
+            special.append(
+                SpecialTestOutcome(
+                    nodeid=nodeid,
+                    outcome=cast(SpecialOutcome, outcome[0]),
+                    reason=outcome[1],
+                    strict=outcome[2],
+                    affects_exit=outcome[3],
+                    duration_ms=duration_ms,
+                )
+            )
+
+    collection_errors = _collection_issues(validated.collection["errors"])
+    collection_skips = _collection_issues(validated.collection["skips"])
+    return (
+        PytestEvidence(
+            effective_args=validated.effective_args,
+            collected=len(final_nodeids),
+            deselected=len(cast(tuple[str, ...], validated.collection["deselected_nodeids"])),
+            counts=counts,
+            collection_errors=collection_errors,
+            collection_skips=collection_skips,
+            slowest=tuple(sorted(slowest, key=lambda item: (-item.duration_ms, item.nodeid))[:10]),
+            special_outcomes=tuple(sorted(special, key=lambda item: item.nodeid)),
+        ),
+        terminal_nodeids,
+    )
+
+
+def _consolidate_node(
+    reports: list[ValidatedPhaseReport],
+) -> tuple[Literal["passed", "failed", "errors", "skipped", "xfailed", "xpassed"], str | None, bool | None, bool] | None:
+    if not reports:
+        return None
+    setup_or_teardown = [report for report in reports if report.when in {"setup", "teardown"}]
+    if any(report.outcome == "failed" for report in setup_or_teardown):
+        return ("errors", None, None, False)
+    strict_xpass = next(
+        (report for report in reports if report.expected_failure.kind == "xpass_strict"),
+        None,
+    )
+    if strict_xpass is not None:
+        return ("xpassed", strict_xpass.expected_failure.reason, True, True)
+    if any(report.when == "call" and report.outcome == "failed" for report in reports):
+        return ("failed", None, None, False)
+    xfail = next(
+        (report for report in reports if report.expected_failure.kind == "xfail"),
+        None,
+    )
+    if xfail is not None:
+        return ("xfailed", xfail.expected_failure.reason, None, False)
+    non_strict_xpass = next(
+        (report for report in reports if report.expected_failure.kind == "xpass_non_strict"),
+        None,
+    )
+    if non_strict_xpass is not None:
+        return ("xpassed", non_strict_xpass.expected_failure.reason, False, False)
+    skipped = next((report for report in reports if report.outcome == "skipped"), None)
+    if skipped is not None:
+        return ("skipped", None, None, False)
+    if not _has_terminal_phase(reports):
+        return None
+    return ("passed", None, None, False)
+
+
+def _has_terminal_phase(reports: list[ValidatedPhaseReport]) -> bool:
+    return any(
+        report.when == "call"
+        or (report.when == "setup" and report.outcome != "passed")
+        or (report.when == "teardown" and report.outcome != "passed")
+        for report in reports
+    )
+
+
+def _increment_count(
+    counts: PytestCounts,
+    outcome: Literal["passed", "failed", "errors", "skipped", "xfailed", "xpassed"],
+) -> PytestCounts:
+    values = {
+        "passed": counts.passed,
+        "failed": counts.failed,
+        "errors": counts.errors,
+        "skipped": counts.skipped,
+        "xfailed": counts.xfailed,
+        "xpassed": counts.xpassed,
+    }
+    values[outcome] += 1
+    return PytestCounts(**values)
+
+
+def _collection_issues(value: object) -> tuple[CollectionIssue, ...]:
+    issues = cast(tuple[Mapping[str, str], ...], value)
+    return tuple(
+        sorted(
+            (CollectionIssue(issue["nodeid"], issue["message"]) for issue in issues),
+            key=lambda issue: (issue.nodeid, issue.message),
+        )
+    )
+
+
+def _round_phase_durations(reports: list[ValidatedPhaseReport]) -> int:
+    duration = sum((Decimal(str(report.duration)) for report in reports), Decimal())
+    return int((duration * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _count_total(counts: PytestCounts) -> int:
+    return (
+        counts.passed
+        + counts.failed
+        + counts.errors
+        + counts.skipped
+        + counts.xfailed
+        + counts.xpassed
+    )
+
+
+def _exit_result(
+    exit_code: int,
+    complete: bool,
+    stopped_early: bool,
+) -> tuple[PytestStatus, PytestError | None]:
+    if exit_code == 0:
+        return ("passed", None)
+    if exit_code == 1:
+        if not complete and stopped_early:
+            return (
+                "failed",
+                PytestError("session_incomplete", "pytest session stopped before all selected tests completed"),
+            )
+        return ("failed", None)
+    error_by_exit: dict[int, tuple[PytestErrorCode, str]] = {
+        2: ("interrupted", "pytest execution was interrupted"),
+        3: ("internal_error", "pytest encountered an internal error"),
+        4: ("usage_error", "pytest reported a usage error"),
+    }
+    if exit_code in error_by_exit:
+        code, message = error_by_exit[exit_code]
+        return ("error", PytestError(code, message))
+    if exit_code == 5:
+        return ("failed", None)
+    return ("error", PytestError("unknown_exit_code", f"pytest exited with unknown code {exit_code}"))
+
+
+def _scope_reasons(
+    plan: RunPlan,
+    validated: ValidatedPytestSession,
+    evidence: PytestEvidence,
+    complete: bool,
+) -> tuple[TestScopeReason, ...]:
+    reasons: list[TestScopeReason] = []
+    if plan.planned_test_scope == "partial":
+        reasons.append("planned_selector")
+    if _has_known_narrowing(validated):
+        reasons.append("effective_narrowing_option")
+    if _has_unclassified_option(validated.effective_args):
+        reasons.append("unclassified_external_option")
+    if evidence.deselected > 0:
+        reasons.append("deselected_tests")
+    if cast(tuple[str, ...], validated.collection["uncovered_removed_nodeids"]):
+        reasons.append("collection_reduced")
+    if not complete:
+        reasons.append("incomplete_session")
+    return tuple(reasons)
+
+
+def _has_known_narrowing(validated: ValidatedPytestSession) -> bool:
+    options = validated.semantic_options
+    return bool(
+        cast(tuple[str, ...], options["collection_paths"])
+        or cast(str, options["keyword"])
+        or cast(str, options["markexpr"])
+        or cast(tuple[str, ...], options["deselect"])
+        or cast(tuple[str, ...], options["ignore"])
+        or cast(tuple[str, ...], options["ignore_glob"])
+        or cast(bool, options["lf"])
+        or cast(bool, options["pyargs"])
+        or cast(bool, options["collectonly"])
+        or cast(bool, options["setuponly"])
+        or cast(bool, options["setupplan"])
+        or _has_known_narrowing_argument(validated.effective_args)
+    )
+
+
+def _has_known_narrowing_argument(args: tuple[str, ...]) -> bool:
+    known = {
+        "-k",
+        "-m",
+        "--deselect",
+        "--ignore",
+        "--ignore-glob",
+        "--lf",
+        "--last-failed",
+        "--pyargs",
+        "--collect-only",
+        "--setup-only",
+        "--setup-plan",
+    }
+    neutral_with_operand = {
+        "-r",
+        "--tb",
+        "--color",
+        "--code-highlight",
+        "--capture",
+        "--durations",
+        "--durations-min",
+    }
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument == "--":
+            return index + 1 < len(args)
+        if argument in neutral_with_operand:
+            index += 2
+            continue
+        if argument in known or argument.startswith(
+            ("-k", "-m", "--deselect=", "--ignore=", "--ignore-glob=")
+        ):
+            return True
+        if not argument.startswith("-"):
+            return True
+        index += 1
+    return False
+
+
+def _has_unclassified_option(args: tuple[str, ...]) -> bool:
+    index = 0
+    neutral_with_operand = {
+        "-r",
+        "--tb",
+        "--color",
+        "--code-highlight",
+        "--capture",
+        "--durations",
+        "--durations-min",
+    }
+    known_narrowing_without_operand = {
+        "--lf",
+        "--last-failed",
+        "--pyargs",
+        "--collect-only",
+        "--setup-only",
+        "--setup-plan",
+    }
+    while index < len(args):
+        argument = args[index]
+        if argument == "--":
+            return index + 1 < len(args)
+        if argument in neutral_with_operand:
+            index += 2
+            continue
+        if argument in known_narrowing_without_operand:
+            index += 1
+            continue
+        if argument.startswith("-r") and argument != "-r":
+            index += 1
+            continue
+        if argument and set(argument) <= {"-", "q"} and argument.startswith("-"):
+            index += 1
+            continue
+        if argument and set(argument) <= {"-", "v"} and argument.startswith("-"):
+            index += 1
+            continue
+        if argument in {"--quiet", "--verbose", "-l", "--showlocals", "--no-showlocals", "-s", "--disable-warnings", "--strict-config", "--strict-markers"}:
+            index += 1
+            continue
+        if argument.startswith(("--tb=", "--color=", "--code-highlight=", "--capture=", "--durations=", "--durations-min=")):
+            index += 1
+            continue
+        if argument.startswith(("-k", "-m", "--deselect=", "--ignore=", "--ignore-glob=")):
+            index += 1
+            continue
+        if argument.startswith("-"):
+            if argument in {"-k", "-m", "--deselect", "--ignore", "--ignore-glob"}:
+                index += 2
+                continue
+            return True
+        index += 1
+    return False
 
 
 def _validate_artifact(

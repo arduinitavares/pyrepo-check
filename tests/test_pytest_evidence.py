@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 
 from pyrepo_check.execution import ExecutedCheck, ExecutedProcess
-from pyrepo_check.planning import PlannedCheck, PytestExecutionPlan
+from pyrepo_check.planning import PlannedCheck, PlannedTestScope, PytestExecutionPlan, RunPlan
 from pyrepo_check.pytest_execution import (
     ArtifactState,
     PreflightClassification,
@@ -18,8 +18,16 @@ from pyrepo_check.pytest_execution import (
     PytestPreflightRecord,
 )
 from pyrepo_check.pytest_evidence import (
+    CollectionIssue,
+    PytestCounts,
+    PytestError,
+    PytestEvidence,
     PytestValidationFailure,
+    PytestResult,
+    SlowTest,
+    SpecialTestOutcome,
     ValidatedPytestSession,
+    build_pytest_result,
     validate_pytest_execution,
 )
 
@@ -718,3 +726,307 @@ def test_expected_failure_normalization_positive_shapes(
     assert expected.reason == expected_reason
     assert expected.strict is strict
     assert expected.affects_exit is affects_exit
+
+
+def _plan(check: ExecutedCheck, *, scope: str = "complete") -> RunPlan:
+    pytest = check.planned.pytest
+    assert pytest is not None
+    return RunPlan(
+        mode="strict_aggregate",
+        targets=(),
+        checks=(check.planned,),
+        output_format="json",
+        pytest_args=pytest.pytest_args,
+        planned_test_scope=cast(PlannedTestScope, scope),
+    )
+
+
+def _with_exit(check: ExecutedCheck, exit_code: int, *, stopped_early: bool = False) -> ExecutedCheck:
+    document = _artifact_document(check)
+    session = cast(dict[str, object], document["session"])
+    session["exit_code"] = exit_code
+    session["stopped_early"] = stopped_early
+    primary = replace(check.processes[0], returncode=exit_code)
+    return replace(_with_document(check, document), processes=(primary,))
+
+
+def test_evidence_null_on_validation_failure_keeps_only_planner_and_incomplete_scope() -> None:
+    result = build_pytest_result(_plan(_check(), scope="partial"), _check_with_defects("artifact-missing"))
+
+    assert result == PytestResult(
+        status="error",
+        complete=False,
+        scope="partial",
+        scope_reasons=("planned_selector", "incomplete_session"),
+        pytest_version="8.4.2",
+        exit_code=0,
+        evidence=None,
+        error=PytestError("artifact_missing", "pytest artifact is missing"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stopped_early", "expected_status", "expected_complete", "expected_error"),
+    (
+        (0, False, "passed", True, None),
+        (1, False, "failed", True, None),
+        (1, True, "failed", False, "session_incomplete"),
+        (2, False, "error", False, "interrupted"),
+        (3, False, "error", False, "internal_error"),
+        (4, False, "error", False, "usage_error"),
+        (9, False, "error", False, "unknown_exit_code"),
+    ),
+)
+def test_exit_matrix_retains_valid_evidence_when_allowed(
+    exit_code: int,
+    stopped_early: bool,
+    expected_status: str,
+    expected_complete: bool,
+    expected_error: str | None,
+) -> None:
+    result = build_pytest_result(_plan(_check()), _with_exit(_check(), exit_code, stopped_early=stopped_early))
+
+    assert result.status == expected_status
+    assert result.complete is expected_complete
+    assert result.exit_code == exit_code
+    assert result.evidence is not None
+    assert (None if result.error is None else result.error.code) == expected_error
+
+
+def test_exit_matrix_treats_valid_zero_collected_as_complete_failure() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    collection = cast(dict[str, object], document["collection"])
+    collection["initial_nodeids"] = []
+    collection["final_nodeids"] = []
+    document["reports"] = []
+    check = _with_document(check, document)
+    result = build_pytest_result(_plan(check), _with_exit(check, 5))
+
+    assert result.status == "failed"
+    assert result.complete is True
+    assert result.evidence is not None
+    assert result.evidence.collected == 0
+    assert result.error is None
+
+
+@pytest.mark.parametrize(
+    ("defect", "expected_code"),
+    (("primary-spawn", "spawn_failed"), ("primary-signal", "terminated_by_signal")),
+)
+def test_exit_matrix_maps_spawn_and_signal_to_incomplete_evidence_null(
+    defect: str, expected_code: str
+) -> None:
+    check = _check_with_defects(defect)
+
+    result = build_pytest_result(_plan(check), check)
+
+    assert result.status == "error"
+    assert result.complete is False
+    assert result.exit_code is None
+    assert result.evidence is None
+    assert result.error is not None
+    assert result.error.code == expected_code
+
+
+def test_consolidation_orders_special_outcomes_slowest_and_collection_issues() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["collection"] = {
+        "initial_nodeids": ["z", "a", "b", "c", "d"],
+        "final_nodeids": ["z", "a", "b", "c", "d"],
+        "deselected_nodeids": [],
+        "uncovered_removed_nodeids": [],
+        "errors": [{"nodeid": "z", "message": "later"}, {"nodeid": "a", "message": "first"}],
+        "skips": [{"nodeid": "z", "message": "skip"}, {"nodeid": "a", "message": "other"}],
+    }
+    reports: list[dict[str, object]] = []
+    for nodeid, outcome, expected, duration in (
+        ("z", "passed", "none", 0.0045),
+        ("a", "failed", "none", 0.001),
+        ("b", "failed", "strict", 0.002),
+        ("c", "skipped", "xfail", 0.003),
+        ("d", "passed", "xpass", 0.004),
+    ):
+        reports.extend(_phases(nodeid, outcome, expected, duration))
+    reports[3]["outcome"] = "failed"
+    document["reports"] = reports
+    check = _with_document(check, document)
+
+    result = build_pytest_result(_plan(check), _with_exit(check, 1))
+
+    assert result.evidence == PytestEvidence(
+        effective_args=("tests",),
+        collected=5,
+        deselected=0,
+        counts=PytestCounts(passed=1, failed=0, errors=1, skipped=0, xfailed=1, xpassed=2),
+        collection_errors=(CollectionIssue("a", "first"), CollectionIssue("z", "later")),
+        collection_skips=(CollectionIssue("a", "other"), CollectionIssue("z", "skip")),
+        slowest=(
+            SlowTest("z", 14),
+            SlowTest("d", 12),
+            SlowTest("c", 9),
+            SlowTest("b", 6),
+            SlowTest("a", 3),
+        ),
+        special_outcomes=(
+            SpecialTestOutcome("b", "xpassed", None, True, True, 6),
+            SpecialTestOutcome("c", "xfailed", "xfail reason", None, False, 9),
+            SpecialTestOutcome("d", "xpassed", "xpass reason", False, False, 12),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "mutate", "expected_reasons"),
+    (
+        (("-ra",), None, ()),
+        (("-k", "fast"), None, ("effective_narrowing_option",)),
+        (("--tb", "short"), None, ()),
+        (("--mystery",), None, ("unclassified_external_option",)),
+        ((), "deselected", ("deselected_tests",)),
+        ((), "reduced", ("collection_reduced",)),
+    ),
+)
+def test_scope_classifies_known_neutral_narrowing_unknown_and_collection_reasons(
+    args: tuple[str, ...], mutate: str | None, expected_reasons: tuple[str, ...]
+) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["effective_args"] = list(args)
+    options = cast(dict[str, object], document["semantic_options"])
+    options["collection_paths"] = []
+    collection = cast(dict[str, object], document["collection"])
+    if mutate == "deselected":
+        collection["deselected_nodeids"] = ["gone"]
+    elif mutate == "reduced":
+        collection["uncovered_removed_nodeids"] = ["gone"]
+    result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
+
+    assert result.scope_reasons == expected_reasons
+    assert result.scope == ("complete" if not expected_reasons else "partial")
+
+
+def _phases(nodeid: str, call_outcome: str, expected: str, duration: float) -> list[dict[str, object]]:
+    phases = [
+        _phase(nodeid, "setup", "passed", duration, expected="none"),
+        _phase(nodeid, "call", call_outcome, duration, expected=expected),
+        _phase(nodeid, "teardown", "passed", duration, expected="none"),
+    ]
+    return phases
+
+
+def _phase(nodeid: str, when: str, outcome: str, duration: float, *, expected: str) -> dict[str, object]:
+    report: dict[str, object] = {
+        "nodeid": nodeid,
+        "when": when,
+        "outcome": outcome,
+        "duration": duration,
+        "wasxfail_present": False,
+        "wasxfail_valid": True,
+        "wasxfail": None,
+        "longrepr": None,
+    }
+    if expected == "xfail":
+        report.update(wasxfail_present=True, wasxfail="xfail reason")
+    elif expected == "xpass":
+        report.update(wasxfail_present=True, wasxfail="xpass reason")
+    elif expected == "strict":
+        report["longrepr"] = "[XPASS(strict)] "
+    return report
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        ("-r", "a"),
+        ("-q", "-q"),
+        ("-v", "-v"),
+        ("--tb=short",),
+        ("-l", "--no-showlocals"),
+        ("--color", "yes"),
+        ("--code-highlight=no",),
+        ("-s", "--disable-warnings"),
+        ("--strict-config", "--strict-markers"),
+        ("--durations", "5", "--durations-min=1.5"),
+    ),
+)
+def test_scope_accepts_every_frozen_neutral_option_form(args: tuple[str, ...]) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["effective_args"] = list(args)
+    options = cast(dict[str, object], document["semantic_options"])
+    options["collection_paths"] = []
+
+    result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
+
+    assert result.scope == "complete"
+    assert result.scope_reasons == ()
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        ("-k", "fast"),
+        ("-m", "slow"),
+        ("--deselect", "test_a.py::test_a"),
+        ("--ignore=test_a.py",),
+        ("--ignore-glob", "*_generated.py"),
+        ("--lf",),
+        ("--last-failed",),
+        ("--pyargs",),
+        ("--collect-only",),
+        ("--setup-only",),
+        ("--setup-plan",),
+        ("test_direct.py",),
+    ),
+)
+def test_scope_marks_every_known_narrowing_argument(args: tuple[str, ...]) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["effective_args"] = list(args)
+    options = cast(dict[str, object], document["semantic_options"])
+    options["collection_paths"] = []
+
+    result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
+
+    assert result.scope_reasons == ("effective_narrowing_option",)
+
+
+def test_scope_uses_fixed_reason_order_for_semantic_mutation_and_incomplete_session() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["effective_args"] = ["--unknown"]
+    options = cast(dict[str, object], document["semantic_options"])
+    options["collection_paths"] = []
+    options["keyword"] = "injected"
+    collection = cast(dict[str, object], document["collection"])
+    collection["deselected_nodeids"] = ["gone"]
+    collection["uncovered_removed_nodeids"] = ["missing"]
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed, scope="partial"), _with_exit(changed, 1, stopped_early=True))
+
+    assert result.scope_reasons == (
+        "planned_selector",
+        "effective_narrowing_option",
+        "unclassified_external_option",
+        "deselected_tests",
+        "collection_reduced",
+        "incomplete_session",
+    )
+
+
+def test_teardown_failure_beats_a_normalized_xfail_without_reparsing_raw_metadata() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    reports = cast(list[dict[str, object]], document["reports"])
+    reports[1].update(outcome="skipped", wasxfail_present=True, wasxfail="expected")
+    reports[2]["outcome"] = "failed"
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), _with_exit(changed, 1))
+
+    assert result.evidence is not None
+    assert result.evidence.counts == PytestCounts(0, 0, 1, 0, 0, 0)
+    assert result.evidence.special_outcomes == ()
