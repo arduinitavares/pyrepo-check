@@ -27,6 +27,7 @@ from pyrepo_check.pytest_evidence import (
     SlowTest,
     SpecialTestOutcome,
     ValidatedPytestSession,
+    _round_phase_durations,
     build_pytest_result,
     validate_pytest_execution,
 )
@@ -1072,7 +1073,58 @@ def test_large_finite_phase_duration_rounds_without_rejecting_valid_evidence() -
     result = build_pytest_result(_plan(changed), changed)
 
     assert result.evidence is not None
-    assert result.evidence.slowest == (SlowTest("tests/test_ok.py::test_ok", 10**33),)
+    assert result.evidence.slowest == (SlowTest("tests/test_ok.py::test_ok", 10**33 + 200),)
+
+
+def test_phase_durations_sum_exactly_before_the_final_half_up_rounding() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    reports = cast(list[dict[str, object]], document["reports"])
+    reports[0]["duration"] = 1e30
+    reports[1]["duration"] = 0.0005
+    reports[2]["duration"] = 0
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.evidence is not None
+    assert result.evidence.slowest == (SlowTest("tests/test_ok.py::test_ok", 10**33 + 1),)
+
+
+@pytest.mark.parametrize(
+    ("durations", "expected_duration_ms"),
+    (
+        ((0.125, 0.225, 0.325), 675),
+        ((0.9995, 0.0005, 0), 1000),
+    ),
+    ids=("common-exponent", "carry"),
+)
+def test_phase_duration_rounding_preserves_exact_small_value_boundaries(
+    durations: tuple[float, float, float], expected_duration_ms: int
+) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    reports = cast(list[dict[str, object]], document["reports"])
+    for report, duration in zip(reports, durations, strict=True):
+        report["duration"] = duration
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.evidence is not None
+    assert result.evidence.slowest == (
+        SlowTest("tests/test_ok.py::test_ok", expected_duration_ms),
+    )
+
+
+def test_phase_duration_rounding_carries_many_submillisecond_phases() -> None:
+    check = _check()
+    validated = validate_pytest_execution(check)
+    assert isinstance(validated, ValidatedPytestSession)
+
+    reports = [replace(validated.reports[0], duration=0.0005) for _ in range(2001)]
+
+    assert _round_phase_durations(reports) == 1001
 
 
 @pytest.mark.parametrize(

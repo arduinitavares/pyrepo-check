@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from fractions import Fraction
 import json
 import math
 from types import MappingProxyType
@@ -413,8 +413,12 @@ def _collection_issues(value: object) -> tuple[CollectionIssue, ...]:
 
 
 def _round_phase_durations(reports: list[ValidatedPhaseReport]) -> int:
-    duration = sum((Decimal(str(report.duration)) for report in reports), Decimal())
-    return int((duration * 1000).to_integral_value(rounding=ROUND_HALF_UP))
+    milliseconds = sum(
+        (Fraction(str(report.duration)) * 1000 for report in reports),
+        Fraction(),
+    )
+    quotient, remainder = divmod(milliseconds.numerator, milliseconds.denominator)
+    return quotient + int(remainder * 2 >= milliseconds.denominator)
 
 
 def _count_total(counts: PytestCounts) -> int:
