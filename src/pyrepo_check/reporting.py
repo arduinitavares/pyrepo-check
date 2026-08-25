@@ -941,6 +941,18 @@ def _validate_coverage_report_context(
     )
     if coverage.gate_eligible is not policy.gate_eligible:
         _invalid("coverage gate eligibility contradicts report context")
+    pytest_parallelism = (
+        pytest_result.error is not None
+        and pytest_result.error.code == "unsupported_parallelism"
+    )
+    coverage_parallelism = (
+        coverage.status == "error"
+        and coverage.error is not None
+        and coverage.error.code == "unsupported_parallelism"
+        and tuple(process.role for process in pytest_check.processes) == _COVERAGE_PRIMARY_ROLES
+    )
+    if pytest_parallelism is not coverage_parallelism:
+        _invalid("pytest and coverage parallelism evidence must match exactly")
     if coverage.status == "error":
         if policy.skipped_reason != "evidence_error":
             _invalid("coverage error must be backed by incomplete evidence")

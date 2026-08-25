@@ -1249,6 +1249,44 @@ def test_report_validation_correlates_pre_json_parallelism_with_pytest_evidence(
             validate_report_v1(invalid)
 
 
+def test_report_validation_rejects_parallel_pytest_evidence_after_coverage_json(
+    tmp_path: Path,
+) -> None:
+    parallelism = build_coverage_error_stage_report(
+        tmp_path / "parallelism", "unsupported-parallelism"
+    )
+    generation_failed = build_coverage_error_stage_report(
+        tmp_path / "generation", "generation-failed"
+    )
+
+    assert parallelism.pytest is not None
+    assert parallelism.pytest.error == PytestError(
+        "unsupported_parallelism", "pytest artifact reports unsupported parallel execution"
+    )
+    assert parallelism.checks[0].error is not None
+    assert parallelism.checks[0].error.code == "pytest_evidence_error"
+    assert generation_failed.coverage is not None
+    assert generation_failed.coverage.error == CoverageError(
+        "generation_failed", "generation_failed diagnostic"
+    )
+    escaped = replace(
+        parallelism,
+        coverage=generation_failed.coverage,
+        checks=(
+            replace(
+                parallelism.checks[0],
+                processes=(
+                    *parallelism.checks[0].processes,
+                    generation_failed.checks[0].processes[-1],
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(escaped)
+
+
 def test_report_validation_rejects_preprimary_parallel_data_without_primary(
     tmp_path: Path,
 ) -> None:
