@@ -72,68 +72,85 @@ pytest diagnostics behind the first failing tool.
 ## Agent report output
 
 Terminal output is the default. It streams each tool's native diagnostics as
-the checks run, then adds one deterministic post-run summary. Focused and
-strict selection commands are unchanged:
+the checks run, then adds one deterministic post-run summary. These commands
+cover the public pytest and coverage forms:
 
 ```bash
 pyrepo-check ty
-pyrepo-check pytest tests/test_cli.py::test_name
-pyrepo-check --format json ty
+# An explicitly selected, target-free pytest coverage run is focused guidance.
+pyrepo-check pytest --coverage
+
+# A direct target remains a focused, partial coverage run.
+pyrepo-check pytest --coverage tests/test_example.py::test_name
+
+# A repository-owned shortcut is also a focused coverage run.
+pyrepo-check pytest --shortcut unit --coverage
+
+# With native Coverage.py configuration, this is the target-free strict aggregate.
+pyrepo-check --coverage
+
+# A target-bearing --all request is focused coverage guidance, not a threshold gate.
+pyrepo-check --all --coverage tests/test_example.py
+
+# JSON uses the same report and selection rules.
+pyrepo-check --format json pytest --coverage tests/test_example.py::test_positive
+
+# In a repository without native coverage configuration, this remains plain pytest.
 pyrepo-check --format json --all
 ```
 
 Use `--format json` when an agent needs a machine-readable result. Its stdout
 is exactly one versioned JSON document followed by a newline; native tool
-stdout and stderr are captured inside that document. With pytest selected,
-C2 adds a non-null `pytest` result with trusted session evidence. The valid
-JSON below is an abridged selection of fields from that full versioned document,
-not an exact complete stdout snapshot: required fields and additional list
-entries are omitted only for readability.
+stdout and stderr are captured inside that document. With pytest selected, the
+report has trusted pytest evidence and, when coverage is configured and
+requested, a non-null coverage result. The complete, schema-valid `coverage`
+member below was copied from an actual partial direct-target report; its integer
+counts and gaps are not illustrative placeholders.
 
 ```bash
-pyrepo-check --format json pytest
+pyrepo-check --format json pytest --coverage tests/test_example.py::test_positive
 ```
 
 ```json
 {
-  "overall_status": "passed",
-  "complete": true,
-  "pytest": {
-    "status": "passed",
-    "complete": true,
-    "scope": "complete",
-    "scope_reasons": [],
-    "exit_code": 0,
-    "evidence": {
-      "collected": 12,
-      "deselected": 0,
-      "counts": {
-        "passed": 10,
-        "failed": 0,
-        "errors": 0,
-        "skipped": 1,
-        "xfailed": 1,
-        "xpassed": 0
-      },
-      "special_outcomes": [
-        {
-          "nodeid": "tests/test_example.py::test_optional",
-          "outcome": "skipped",
-          "reason": "optional dependency unavailable",
-          "strict": null,
-          "affects_exit": false,
-          "duration_ms": 1
-        }
-      ],
-      "slowest": [
-        {
-          "nodeid": "tests/test_example.py::test_slow",
-          "duration_ms": 42
-        }
-      ]
+  "status": "guidance",
+  "scope": "partial",
+  "evidence_complete": true,
+  "coverage_version": "7.15.4",
+  "gate_eligible": false,
+  "threshold": {
+    "configured": true,
+    "value": 100,
+    "evaluated": false,
+    "passed": null,
+    "skipped_reason": "partial_run"
+  },
+  "totals": {
+    "statements": {
+      "covered": 3,
+      "missing": 1
+    },
+    "branches": {
+      "covered": 1,
+      "missing": 1
     }
   },
-  "coverage": null
+  "files": [
+    {
+      "path": "src/example.py",
+      "statements": {
+        "covered": 3,
+        "missing": 1,
+        "missing_lines": [4]
+      },
+      "branches": {
+        "covered": 1,
+        "missing": 1,
+        "missing_arcs": [[2, 4]]
+      }
+    }
+  ],
+  "error": null
 }
 ```
 
@@ -142,8 +159,39 @@ deselection, collection reduction, or an incomplete session). `counts` covers
 passed, failed, errors, skipped, xfailed, and xpassed outcomes;
 `special_outcomes` lists skipped/XFAIL/XPASS nodes; and `slowest` contains up
 to ten nodes in deterministic order. `pytest` is `null` only when pytest was
-not selected. Coverage remains `null`: C3 coverage execution is not yet
-implemented.
+not selected. `coverage` is `null` when coverage was not requested. For an
+implicit target-free aggregate with native Coverage.py configuration unavailable,
+it is also `null` and emits the typed `coverage_not_configured` advisory; an
+explicit `--coverage` request instead fails planning with
+`coverage_configuration_required`. Files are ranked by `missing statements +
+missing branches`; there is no separate `missing_opportunities` JSON field.
+
+Coverage guidance uses a project's native Coverage.py configuration, for
+example:
+
+```toml
+[tool.coverage.run]
+branch = true
+source = ["src"]
+parallel = false
+
+[tool.coverage.report]
+fail_under = 90
+```
+
+Focused, target-bearing, failed-test, and incomplete pytest runs neutralize
+`fail_under`: they retain valid coverage as guidance but do not evaluate the
+native threshold. Only an eligible target-free strict aggregate evaluates that
+threshold. When eligible Coverage JSON exits `2` with valid evidence, the
+report records a threshold failure rather than a coverage-artifact error, and
+the public exit is `2` under the normal first-positive-exit rule.
+
+Pytest runs once under Coverage instrumentation; it is not rerun for the
+coverage report. Pyrepo-check-owned coverage, plugin, and report artifacts are
+run-owned and outside the consumer root, so a completed run leaves consumer
+bytes and its worktree unchanged. This repository deliberately has no native
+Coverage.py configuration or threshold yet: its target-free aggregate remains
+plain pytest with `coverage: null` and the `coverage_not_configured` advisory.
 
 The CLI keeps the first positive tool exit code in planned execution order.
 Checks continue after ordinary failures. If execution has only spawn or
@@ -244,8 +292,8 @@ tests:
 pyrepo-check pytest tests/test_cli.py::test_invalid_shortcut_config_renders_typed_planning_error_without_spawning
 ```
 
-Skill synchronization is intentionally deferred until after Milestone D; do not
-copy this C1 guidance into repository or installed skill files yet.
+Repository and installed Agent Skills intentionally remain unsynchronized until
+after Milestone D; do not copy this C3 guidance into either skill location yet.
 
 ## Type Annotation Enforcement
 

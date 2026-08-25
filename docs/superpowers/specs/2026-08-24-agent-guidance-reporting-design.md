@@ -1,18 +1,18 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Milestones A-B and C1-C2 implemented and verified; C3 and D designed and not implemented
+**Status:** Milestones A-B and C1-C3 implemented and verified; D designed and not implemented
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
 
 ## Delivery status
 
-As of 2026-08-24, the prior research, design specification, Agent Skill, README
+As of 2026-08-25, the prior research, design specification, Agent Skill, README
 guidance, repository cleanup, and Milestones A-B implementation are merged and
-pushed on `main`. C1 Test Shortcuts and C2 structured pytest evidence are
-implemented and verified. C3 coverage execution and repository coverage
-adoption remain unimplemented. Agent Skill synchronization is explicitly
-deferred until after Milestone D.
+pushed on `main`. C1 Test Shortcuts, C2 structured pytest evidence, and C3
+coverage execution and guidance are implemented and verified. Repository
+coverage adoption remains Milestone D. Repository and installed Agent Skill
+synchronization is explicitly deferred until after Milestone D.
 
 | Milestone | State | Evidence |
 | --- | --- | --- |
@@ -20,8 +20,17 @@ deferred until after Milestone D.
 | B | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
 | C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
-| C3 — coverage execution and guidance | Designed; not implemented | No coverage preflight/execution/result exists. |
+| C3 — coverage execution and guidance | Implemented and verified | Pytest and coverage preflight, one Coverage-instrumented pytest run, typed evidence/result/reporting, exact line/branch gaps, threshold eligibility, real-consumer public modes, artifact isolation, full suite, and strict gate. |
 | D | Designed; not implemented | Repository coverage adoption. |
+
+C3 verification covers supported-version and module checks before execution;
+typed coverage evidence in terminal and schema-v1 JSON reports; direct-target,
+shortcut, explicit focused, and target-free aggregate public modes; threshold
+pass/fail and neutralized focused or incomplete runs; exact missing lines and
+branches; one-primary-run proof; and run-owned artifact isolation from consumer
+bytes and worktrees. The full pytest suite and `pyrepo-check --all` strict gate
+passed. C3 does not add this repository's Coverage.py dependency, native
+configuration, or threshold; those adoption decisions remain Milestone D.
 
 ## Problem
 
@@ -597,12 +606,12 @@ For each measured production file, report:
 - exact missing line numbers; and
 - exact missing branch arcs.
 
-`missing_opportunities` is exactly `missing_statements + missing_branches`.
-Files sort by that value descending, then normalized project-relative path
-ascending. Missing lines sort numerically. Missing arcs sort by source line,
-then destination line; negative arc values are retained because Coverage.py
-uses them for code-object entry or exit. Percentages are terminal headers only;
-JSON keeps exact integer counts.
+The ranking score is `missing_statements + missing_branches`; it is derived for
+ordering and is not a JSON field. Files sort by that score descending, then
+normalized project-relative path ascending. Missing lines sort numerically.
+Missing arcs sort by source line, then destination line; negative arc values are
+retained because Coverage.py uses them for code-object entry or exit.
+Percentages are terminal headers only; JSON keeps exact integer counts.
 
 Execution mode, coverage scope, and threshold eligibility are independent. A
 pytest-only Focused Run can execute the complete test suite and produce
@@ -1527,7 +1536,7 @@ worktree files are never included.
 | B — Agent Report and JSON | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
 | C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
-| C3 — coverage execution and guidance | Designed; not implemented | No coverage preflight/execution/result exists. |
+| C3 — coverage execution and guidance | Implemented and verified | Coverage and pytest preflight, one instrumented primary run, validated evidence/reporting, exact gaps, threshold policy, public-mode/consumer isolation matrix, full suite, and strict gate. |
 | D — repository coverage adoption | Designed; not implemented | No locked Coverage.py dependency or native coverage policy exists. |
 
 ## Acceptance criteria
@@ -1562,6 +1571,6 @@ The work is complete when all of the following are proven:
     flaky repetition remain outside this change.
 
 C3 completion deliberately excludes criterion 12: that dependency-locking and
-repository-coverage adoption requirement belongs to Milestone D. C3 therefore
-remains **Designed; not implemented** until its own implementation and evidence
-are complete.
+repository-coverage adoption requirement belongs to Milestone D. C3 is
+implemented and verified; Milestone D remains **Designed; not implemented**
+until that separate adoption work and evidence are complete.
