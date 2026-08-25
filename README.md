@@ -104,6 +104,13 @@ pyrepo-check --format json pytest --coverage tests/test_example.py::test_positiv
 pyrepo-check --format json --all
 ```
 
+Terminal coverage uses a compact Coverage.py-style table: at most the three
+highest-gap files plus one `TOTAL` row. The summary states whether the run is
+focused or strict, whether coverage is partial or complete, and whether the
+configured minimum was applied. Raw missing line numbers and branch arcs stay
+out of terminal output; use `--format json` when an agent needs every exact
+gap. Files with no gaps do not occupy a focus row.
+
 Use `--format json` when an agent needs a machine-readable result. Its stdout
 is exactly one versioned JSON document followed by a newline; native tool
 stdout and stderr are captured inside that document. With pytest selected, the
@@ -207,16 +214,15 @@ the frozen lock resolves Coverage.py `7.15.4`. Its native configuration measures
 
 For this repository, `pyrepo-check --all` is the normal strict self-check, and
 `pyrepo-check --format json --all` is the agent-readable form. The verified
-target-free strict run passed all 1,309 tests and measured 13 files: 3,989
-covered and 483 missing statements, plus 1,505 covered and 371 missing
-branches. The combined fresh baseline is 5,494 / 6,348 =
-86.54694391934467%.
+target-free strict run passed all 1,310 tests and measured 13 files: 4,019
+covered and 484 missing statements, plus 1,516 covered and 372 missing
+branches. The combined fresh baseline is 5,535 / 6,391 =
+86.60616491941792%.
 
 `[tool.coverage.report]` sets `fail_under = 86.01` with `precision = 2`. This
-floor is below the fresh baseline. It rejects raw combined totals below 86%
-despite native two-decimal rounding: 40 added misses pass at rounded 86.01%,
-while 41 fail at 85.99% with exit 2. The score is the gate; exact missing lines
-and arcs in the terminal and JSON reports remain the action payload.
+floor is below the fresh baseline and rejects totals that round to 86.00%. The
+compact terminal table identifies the highest-gap files; schema-v1 JSON retains
+every exact missing line and arc.
 
 The CLI keeps the first positive tool exit code in planned execution order.
 Checks continue after ordinary failures. If execution has only spawn or

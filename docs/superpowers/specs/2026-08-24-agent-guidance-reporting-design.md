@@ -20,22 +20,29 @@ synchronization; it remains unchanged in this milestone.
 | B | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
 | C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
-| C3 — coverage execution and guidance | Implemented and verified | Pytest and coverage preflight, one Coverage-instrumented pytest run, typed evidence/result/reporting, exact line/branch gaps, threshold eligibility, real-consumer public modes, artifact isolation, full suite, and strict gate. |
+| C3 — coverage execution and guidance | Implemented and verified | Pytest and coverage preflight, one Coverage-instrumented pytest run, compact terminal guidance, exact JSON line/branch gaps, threshold eligibility, real-consumer public modes, artifact isolation, full suite, and strict gate. |
 | D | Implemented and verified | Development dependency `coverage[toml]>=7.15,<8`, resolved Coverage.py `7.15.4`; native strict coverage gate and fresh baseline verified. |
 
 C3 verification covers supported-version and module checks before execution;
-typed coverage evidence in terminal and schema-v1 JSON reports; direct-target,
-shortcut, explicit focused, and target-free aggregate public modes; threshold
-pass/fail and neutralized focused or incomplete runs; exact missing lines and
-branches; one-primary-run proof; and run-owned artifact isolation from consumer
-bytes and worktrees. The full pytest suite and `pyrepo-check --all` strict gate
-passed. D adds this repository's locked Coverage.py dependency, native
-configuration, and threshold: `branch = true`, `source = ["src/pyrepo_check"]`,
-`parallel = false`, `fail_under = 86.01`, and `precision = 2`. The resolved
+compact Coverage.py-style terminal guidance and typed schema-v1 JSON reports;
+direct-target, shortcut, explicit focused, and target-free aggregate public
+modes; threshold pass/fail and neutralized focused or incomplete runs; exact
+missing lines and branches in JSON; one-primary-run proof; and run-owned
+artifact isolation from consumer bytes and worktrees. The full pytest suite
+and `pyrepo-check --all` strict gate passed. D adds this repository's locked
+Coverage.py dependency, native configuration, and threshold: `branch = true`,
+`source = ["src/pyrepo_check"]`, `parallel = false`, `fail_under = 86.01`, and
+`precision = 2`. The resolved
 Coverage.py version is `7.15.4`. The target-free strict aggregate passed 1,309
 of 1,309 tests with complete coverage across 13 files: 3,989 covered and 483
 missing statements plus 1,505 covered and 371 missing branches, or 5,494 /
 6,348 = 86.54694391934467%. The `86.01` threshold was evaluated and passed.
+
+A post-D terminal refinement keeps schema-v1 JSON and execution behavior
+unchanged while replacing unbounded raw gap lists with the compact focus table.
+Its fresh strict gate passed 1,310 of 1,310 tests with 5,535 of 6,391 combined
+coverage opportunities covered, or 86.60616491941792%; the `86.01` threshold
+passed.
 
 ## Problem
 
@@ -59,7 +66,8 @@ single score.
 3. Render one Agent Report as normal terminal output or versioned JSON.
 4. Preserve direct check, file, directory, and pytest-node focused runs.
 5. Add project-defined Test Shortcuts for repeatable pytest subsets.
-6. Add line and branch Coverage Guidance with exact missing lines and branches.
+6. Add compact terminal Coverage Guidance ranked by file, with every exact
+   missing line and branch retained in JSON.
 7. Report the slowest tests and skip, xfail, and xpass evidence.
 8. Preserve the existing strict Ruff, annotation, `ty`, Bandit, and pytest
    behavior while the architecture is extracted.
@@ -616,7 +624,10 @@ ordering and is not a JSON field. Files sort by that score descending, then
 normalized project-relative path ascending. Missing lines sort numerically.
 Missing arcs sort by source line, then destination line; negative arc values are
 retained because Coverage.py uses them for code-object entry or exit.
-Percentages are terminal headers only; JSON keeps exact integer counts.
+Terminal output projects at most the first three files with gaps plus a `TOTAL`
+row in a Coverage.py-style table. It never prints raw missing line numbers or
+branch arcs. Table percentages are calculated from exact integer counts; JSON
+keeps all files, counts, missing lines, and missing arcs.
 
 Execution mode, coverage scope, and threshold eligibility are independent. A
 pytest-only Focused Run can execute the complete test suite and produce
@@ -1294,8 +1305,8 @@ evidence is complete, and otherwise becomes `partial`. Planned
 Coverage contract, regardless of whether a threshold is configured.
 
 For `passed`, `failed`, or `guidance`, totals are non-null and `error` is null.
-For `error`, totals are null, files are empty, and `error` is non-null. Coverage
-percentages are calculated only for terminal display from exact integer counts.
+For `error`, totals are null, files are empty, and `error` is non-null. Compact
+terminal table percentages are calculated from exact integer counts.
 
 ### Paths, durations, captured output, and ordering
 
@@ -1348,8 +1359,10 @@ Array order is normative:
   ascending;
 - slow tests use duration descending then node ID ascending;
 - special outcomes use node ID ascending;
-- coverage files use missing opportunities descending then path ascending;
-- missing lines and branch arcs use numeric ascending order; and
+- coverage files use missing opportunities descending then path ascending; the
+  terminal projects at most the first three files with gaps while JSON retains
+  all files;
+- JSON missing lines and branch arcs use numeric ascending order; and
 - advisories use code then message ascending.
 
 String ties use Unicode code-point order. JSON member order is not semantic,
@@ -1544,7 +1557,7 @@ worktree files are never included.
 | B — Agent Report and JSON | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
 | C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
-| C3 — coverage execution and guidance | Implemented and verified | Coverage and pytest preflight, one instrumented primary run, validated evidence/reporting, exact gaps, threshold policy, public-mode/consumer isolation matrix, full suite, and strict gate. |
+| C3 — coverage execution and guidance | Implemented and verified | Coverage and pytest preflight, one instrumented primary run, validated evidence/reporting, compact terminal focus table, exact JSON gaps, threshold policy, public-mode/consumer isolation matrix, full suite, and strict gate. |
 | D — repository coverage adoption | Implemented and verified | `coverage[toml]>=7.15,<8` resolves to `7.15.4`; native `branch = true`, `source = ["src/pyrepo_check"]`, `parallel = false`, `fail_under = 86.01`, and `precision = 2` produced a complete, passing strict gate: 1,309/1,309 tests and 5,494/6,348 combined coverage across 13 files. |
 
 ## Acceptance criteria
@@ -1561,8 +1574,9 @@ The work is complete when all of the following are proven:
    version-1 discriminated contract.
 6. All selected checks continue after an ordinary failure and are represented
    in the report.
-7. Coverage reports exact line and branch gaps, distinguishes partial from
-   complete evidence, and gates only a configured strict aggregate run.
+7. Coverage terminal output remains bounded and identifies the highest-gap
+   files; JSON reports every exact line and branch gap; both distinguish partial
+   from complete evidence, and only a configured strict aggregate run gates.
 8. Coverage runs pytest once and creates/modifies no pyrepo-check-owned
    coverage, plugin, or report artifact under the consumer root.
 9. Pytest exits `0` through `5`, early-stop completeness, slow nodes, skip,
