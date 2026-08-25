@@ -13,7 +13,9 @@ import pytest
 from pyrepo_check.execution import execute_plan
 from pyrepo_check.planning import OutputFormat, PlannedCheck, PytestExecutionPlan, RunPlan
 import pyrepo_check.pytest_execution as pytest_execution
-from pyrepo_check.pytest_execution import PYTEST_PLUGIN_MODULE, execute_pytest
+from pyrepo_check.pytest_execution import execute_pytest
+from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
+from tests.support import RecordingRunner
 
 
 def pytest_check(tmp_path: Path) -> PlannedCheck:
@@ -248,6 +250,13 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del check
         calls.append((command, cwd, capture_output, env))
+        if command[1:3] == ("-m", "pytest"):
+            assert env is not None
+            plugin_name = command[command.index("-p") + 1]
+            run_directory = Path(env["PYREPO_CHECK_PYTEST_JSON"]).parent
+            assert plugin_name.isidentifier()
+            assert plugin_name != "pyrepo_check_pytest_evidence_plugin"
+            assert (run_directory / f"{plugin_name}.py").is_file()
         stdout = preflight_document() if len(calls) == 1 else b"primary-output"
         return completed(command, 0, stdout=stdout, stderr=b"")
 
@@ -257,9 +266,10 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
         runner=runner,
     )
 
+    plugin_name = calls[1][0][calls[1][0].index("-p") + 1]
     assert [call[0] for call in calls] == [
         ("consumer-python", "-c", calls[0][0][-1]),
-        ("consumer-python", "-m", "pytest", "-p", PYTEST_PLUGIN_MODULE, "tests"),
+        ("consumer-python", "-m", "pytest", "-p", plugin_name, "tests"),
     ]
     assert [call[1] for call in calls] == [tmp_path, tmp_path]
     assert [call[2] for call in calls] == [True, primary_capture]
@@ -286,6 +296,75 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     assert result.checks[0].pytest.preflight.classification == "supported"
     expected_banner = "\n==> pytest: consumer-python -m pytest tests\n"
     assert capsys.readouterr().out == ("" if output_format == "json" else expected_banner)
+
+
+def test_plugin_module_name_is_fresh_for_each_pytest_execution(tmp_path: Path) -> None:
+    plugin_names: list[str] = []
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output, env
+        if command[1:3] == ("-m", "pytest"):
+            plugin_names.append(command[command.index("-p") + 1])
+            return completed(command, 0, stdout=b"", stderr=b"")
+        return completed(command, 0, stdout=preflight_document(), stderr=b"")
+
+    execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert len(plugin_names) == 2
+    assert plugin_names[0] != plugin_names[1]
+    assert all(name.isidentifier() for name in plugin_names)
+    assert "pyrepo_check_pytest_evidence_plugin" not in plugin_names
+
+
+def test_duplicate_simulated_primaries_fail_closed_with_multiple_writers(
+    tmp_path: Path,
+) -> None:
+    recording_runner = RecordingRunner(publish_pytest_artifact=True)
+
+    def duplicate_primary_runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        completed_process = recording_runner(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        if command[1:3] == ("-m", "pytest"):
+            recording_runner(
+                command,
+                cwd=cwd,
+                check=check,
+                capture_output=capture_output,
+                env=env,
+            )
+        return completed_process
+
+    observation = execute_pytest(
+        pytest_check(tmp_path),
+        output_format="json",
+        runner=duplicate_primary_runner,
+    )
+    validation = validate_pytest_execution(observation)
+
+    assert observation.pytest is not None
+    assert len(observation.pytest.artifact.writer_ids) == 2
+    assert isinstance(validation, PytestValidationFailure)
+    assert validation.code == "artifact_invalid"
 
 
 def test_preflight_runs_without_primary_when_consumer_is_unsupported(tmp_path: Path) -> None:
@@ -990,7 +1069,8 @@ def test_cleanup_preserves_inner_descriptor_relative_deletion_failure(
         dir_fd: int | None = None,
     ) -> None:
         nonlocal descriptor_relative_failure
-        if os.fsdecode(path) == f"{PYTEST_PLUGIN_MODULE}.py":
+        filename = os.fsdecode(path)
+        if filename.startswith("_pyrepo_check_pytest_") and filename.endswith(".py"):
             descriptor_relative_failure = dir_fd is not None
             raise PermissionError("plugin deletion denied")
         original_unlink(path, dir_fd=dir_fd)

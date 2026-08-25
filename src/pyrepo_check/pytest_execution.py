@@ -8,6 +8,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import stat
 import subprocess  # nosec B404
@@ -21,7 +22,6 @@ from pyrepo_check.planning import OutputFormat, PlannedCheck
 
 _PREFLIGHT_LIMIT_BYTES = 65_536
 _MINIMUM_PYTHON_VERSION = (3, 13, 15)
-PYTEST_PLUGIN_MODULE = "pyrepo_check_pytest_evidence_plugin"
 _PREFLIGHT_PROBE = """import json
 import sys
 record = {"schema_version": 1, "python_version": list(sys.version_info[:3]), "pytest_available": False, "pytest_version": None}
@@ -131,7 +131,11 @@ def execute_pytest(
 
     cleanup_error: str | None = None
     try:
-        artifact_path, writer_directory = _prepare_run_directory(run_directory.path)
+        plugin_module = f"_pyrepo_check_pytest_{secrets.token_hex(16)}"
+        artifact_path, writer_directory = _prepare_run_directory(
+            run_directory.path,
+            plugin_module,
+        )
         environment = _isolated_environment(
             run_directory.path,
             artifact_path,
@@ -154,7 +158,7 @@ def execute_pytest(
                         "-m",
                         "pytest",
                         "-p",
-                        PYTEST_PLUGIN_MODULE,
+                        plugin_module,
                         *pytest_plan.pytest_args,
                     ),
                     cwd=check.cwd,
@@ -265,9 +269,12 @@ def _run_primary(
     )
 
 
-def _prepare_run_directory(run_directory: Path) -> tuple[Path, Path]:
+def _prepare_run_directory(
+    run_directory: Path,
+    plugin_module: str,
+) -> tuple[Path, Path]:
     plugin_source = Path(__file__).with_name("_pytest_report_plugin.py")
-    plugin_path = run_directory / f"{PYTEST_PLUGIN_MODULE}.py"
+    plugin_path = run_directory / f"{plugin_module}.py"
     shutil.copyfile(plugin_source, plugin_path)
     os.chmod(plugin_path, 0o600)
     writer_directory = run_directory / "writers"

@@ -4,6 +4,8 @@ import os
 import subprocess  # nosec B404
 import sys
 import tomllib
+from types import SimpleNamespace
+import uuid
 
 import pytest
 
@@ -52,6 +54,102 @@ def test_consumer_execution_is_owned_by_the_consumer() -> None:
     assert "COVERAGE_PROCESS_START" not in os.environ
     assert "COVERAGE_PROCESS_CONFIG" not in os.environ
 """,
+        encoding="utf-8",
+    )
+
+
+def _write_forged_legacy_plugin(root: Path) -> None:
+    (root / "pyrepo_check_pytest_evidence_plugin.py").write_text(
+        '''import json
+import os
+from pathlib import Path
+
+Path(os.environ["SHADOW_IMPORTED"]).write_text("imported", encoding="utf-8")
+WRITER_ID = "forged-consumer"
+
+
+def pytest_sessionstart(session):
+    del session
+    writer_dir = Path(os.environ["PYREPO_CHECK_PYTEST_WRITER_DIR"])
+    marker = writer_dir / f"pytest-writer-{WRITER_ID}.json"
+    with marker.open("x", encoding="utf-8") as marker_file:
+        json.dump({"schema_version": 1, "writer_id": WRITER_ID, "pid": os.getpid()}, marker_file)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    del exitstatus
+    session.exitstatus = 0
+    artifact = {
+        "schema_version": 1,
+        "state": "finalized",
+        "writer_id": WRITER_ID,
+        "pytest_version": "8.4.2",
+        "session": {
+            "starts": 1,
+            "finishes": 1,
+            "exit_code": 0,
+            "collection_completed": True,
+            "stopped_early": False,
+        },
+        "effective_args": [],
+        "semantic_options": {
+            "collection_paths": [],
+            "keyword": "",
+            "markexpr": "",
+            "deselect": [],
+            "ignore": [],
+            "ignore_glob": [],
+            "lf": False,
+            "pyargs": False,
+            "collectonly": False,
+            "setuponly": False,
+            "setupplan": False,
+        },
+        "collection": {
+            "initial_nodeids": [],
+            "final_nodeids": [],
+            "deselected_nodeids": [],
+            "uncovered_removed_nodeids": [],
+            "errors": [],
+            "skips": [],
+        },
+        "reports": [],
+        "flags": {
+            "unsupported_parallelism": False,
+            "unsupported_retries": False,
+            "worker_metadata": False,
+        },
+    }
+    Path(os.environ["PYREPO_CHECK_PYTEST_JSON"]).write_text(json.dumps(artifact), encoding="utf-8")
+''',
+        encoding="utf-8",
+    )
+
+
+def _write_pytest_nine_consumer(root: Path) -> None:
+    (root / "tests").mkdir()
+    (root / "pyproject.toml").write_text(
+        '''[project]
+name = "c2-pytest-nine-consumer"
+version = "0.0.0"
+requires-python = ">=3.13.15"
+dependencies = ["pytest==9.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+''',
+        encoding="utf-8",
+    )
+    (root / "tests" / "test_must_not_run.py").write_text(
+        '''from pathlib import Path
+import os
+
+Path(os.environ["TEST_MODULE_IMPORTED"]).write_text("imported", encoding="utf-8")
+
+
+def test_must_not_run():
+    assert False
+''',
         encoding="utf-8",
     )
 
@@ -110,6 +208,93 @@ def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
     assert not list(consumer.rglob("pyrepo_check_pytest_*.py"))
 
 
+def test_external_consumer_cannot_shadow_isolated_plugin_or_forge_a_pass(
+    tmp_path: Path,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_external_consumer(consumer)
+    (consumer / "tests" / "test_consumer.py").write_text(
+        "def test_native_failure():\n    assert False\n",
+        encoding="utf-8",
+    )
+    _write_forged_legacy_plugin(consumer)
+    subprocess.run(("uv", "lock"), cwd=consumer, check=True, capture_output=True)  # nosec B603
+    shadow_imported = tmp_path / "shadow-imported"
+    environment = dict(os.environ)
+    environment["SHADOW_IMPORTED"] = str(shadow_imported)
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--root",
+            str(consumer),
+            "--format",
+            "json",
+            "pytest",
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 1
+    assert completed.stderr == b""
+    assert payload["overall_status"] == "failed"
+    assert payload["pytest"]["status"] == "failed"
+    assert payload["pytest"]["exit_code"] == 1
+    assert payload["pytest"]["evidence"]["counts"]["failed"] == 1
+    assert not shadow_imported.exists()
+
+
+def test_external_pytest_nine_consumer_stops_after_unsupported_preflight(
+    tmp_path: Path,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_pytest_nine_consumer(consumer)
+    subprocess.run(("uv", "lock"), cwd=consumer, check=True, capture_output=True)  # nosec B603
+    test_module_imported = tmp_path / "test-module-imported"
+    environment = dict(os.environ)
+    environment["TEST_MODULE_IMPORTED"] = str(test_module_imported)
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--root",
+            str(consumer),
+            "--format",
+            "json",
+            "pytest",
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+
+    payload = json.loads(completed.stdout)
+    processes = payload["checks"][0]["processes"]
+    assert completed.returncode == 2
+    assert completed.stderr == b""
+    assert payload["overall_status"] == "error"
+    assert payload["complete"] is False
+    assert payload["pytest"]["status"] == "error"
+    assert payload["pytest"]["evidence"] is None
+    assert payload["pytest"]["error"] is not None
+    assert payload["pytest"]["error"]["code"] == "unsupported_version"
+    assert [process["role"] for process in processes] == ["pytest_preflight"]
+    assert processes[0]["argv"][:3] == ["uv", "run", "--frozen"]
+    preflight_record = json.loads(processes[0]["stdout"]["text"])
+    assert preflight_record["pytest_version"] == [9, 0, 0]
+    assert not test_module_imported.exists()
+    assert not (consumer / ".pytest_cache").exists()
+    assert not list(consumer.rglob("artifact.json"))
+    assert not list(consumer.rglob("pytest-writer-*.json"))
+
+
 def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
     test_file = tmp_path / "tests" / "test_example.py"
     test_file.parent.mkdir()
@@ -127,6 +312,7 @@ def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
     )
 
     assert result == 0
+    plugin_name = runner.calls[1].command[runner.calls[1].command.index("-p") + 1]
     assert [call.command for call in runner.calls] == [
         ("uv", "run", "python", "-c", runner.calls[0].command[-1]),
         (
@@ -136,7 +322,7 @@ def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
                 "-m",
                 "pytest",
                 "-p",
-                "pyrepo_check_pytest_evidence_plugin",
+                plugin_name,
                 "tests/test_example.py::test_exact_behavior",
         )
     ]
@@ -163,6 +349,106 @@ def test_recording_runner_opt_in_publishes_raw_pytest_protocol(tmp_path: Path) -
     assert artifact["state"] == "finalized"
     assert artifact["effective_args"] == ["tests"]
     assert artifact["writer_id"] == json.loads(markers[0].read_text())["writer_id"]
+
+
+def test_recording_runner_uses_exclusive_writer_marker_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "artifact.json"
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    collision = "collision"
+    writer_id = f"recording-runner-{os.getpid()}-{collision}"
+    marker_path = writer_directory / f"pytest-writer-{writer_id}.json"
+    marker_path.write_text("occupied", encoding="utf-8")
+    monkeypatch.setattr(
+        uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=collision),
+    )
+    runner = RecordingRunner(publish_pytest_artifact=True)
+
+    with pytest.raises(FileExistsError):
+        runner(
+            ("consumer-python", "-m", "pytest", "-p", "owned_plugin"),
+            cwd=tmp_path,
+            check=False,
+            env={
+                "PYREPO_CHECK_PYTEST_JSON": str(artifact_path),
+                "PYREPO_CHECK_PYTEST_WRITER_DIR": str(writer_directory),
+            },
+        )
+
+    assert marker_path.read_text(encoding="utf-8") == "occupied"
+    assert not artifact_path.exists()
+
+
+def test_recording_runner_registers_writer_before_atomic_artifact_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = tmp_path / "artifact.json"
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    replacements: list[tuple[Path, Path]] = []
+    original_replace = os.replace
+
+    def observe_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        markers = list(writer_directory.glob("pytest-writer-*.json"))
+        assert len(markers) == 1
+        assert source_path.parent == artifact_path.parent
+        assert source_path.name.startswith(f".{artifact_path.name}.")
+        assert source_path.name.endswith(".tmp")
+        assert source_path.is_file()
+        assert destination_path == artifact_path
+        replacements.append((source_path, destination_path))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", observe_replace)
+    runner = RecordingRunner(publish_pytest_artifact=True)
+
+    runner(
+        ("consumer-python", "-m", "pytest", "-p", "owned_plugin"),
+        cwd=tmp_path,
+        check=False,
+        env={
+            "PYREPO_CHECK_PYTEST_JSON": str(artifact_path),
+            "PYREPO_CHECK_PYTEST_WRITER_DIR": str(writer_directory),
+        },
+    )
+
+    assert len(replacements) == 1
+    assert artifact_path.is_file()
+    assert not list(tmp_path.glob(f".{artifact_path.name}.*.tmp"))
+
+
+def test_recording_runner_repeated_primaries_leave_distinct_writer_markers(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "artifact.json"
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    environment = {
+        "PYREPO_CHECK_PYTEST_JSON": str(artifact_path),
+        "PYREPO_CHECK_PYTEST_WRITER_DIR": str(writer_directory),
+    }
+    runner = RecordingRunner(publish_pytest_artifact=True)
+    command = ("consumer-python", "-m", "pytest", "-p", "owned_plugin")
+
+    runner(command, cwd=tmp_path, check=False, env=environment)
+    first_writer_id = json.loads(artifact_path.read_text(encoding="utf-8"))["writer_id"]
+    runner(command, cwd=tmp_path, check=False, env=environment)
+    second_writer_id = json.loads(artifact_path.read_text(encoding="utf-8"))["writer_id"]
+
+    marker_ids = {
+        json.loads(marker.read_text(encoding="utf-8"))["writer_id"]
+        for marker in writer_directory.glob("pytest-writer-*.json")
+    }
+    assert first_writer_id != second_writer_id
+    assert marker_ids == {first_writer_id, second_writer_id}
 
 
 @pytest.mark.parametrize(

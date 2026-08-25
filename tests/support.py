@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import subprocess  # nosec B404
 from typing import cast
+import uuid
 
 
 _SUPPORTED_PYTEST_PREFLIGHT = (
@@ -111,7 +113,25 @@ def _publish_pytest_artifact(
     plugin_index = command.index("-p", module_index + 2)
     artifact_path = Path(environment["PYREPO_CHECK_PYTEST_JSON"])
     writer_directory = Path(environment["PYREPO_CHECK_PYTEST_WRITER_DIR"])
-    writer_id = "recording-runner"
+    writer_id = f"recording-runner-{os.getpid()}-{uuid.uuid4().hex}"
+    marker_path = writer_directory / f"pytest-writer-{writer_id}.json"
+
+    def open_owner_only(path: str, flags: int) -> int:
+        return os.open(path, flags, 0o600)
+
+    with open(  # noqa: PTH123
+        marker_path,
+        "x",
+        encoding="utf-8",
+        opener=open_owner_only,
+    ) as marker_file:
+        json.dump(
+            {"schema_version": 1, "writer_id": writer_id, "pid": os.getpid()},
+            marker_file,
+            separators=(",", ":"),
+        )
+        marker_file.flush()
+        os.fsync(marker_file.fileno())
     artifact = {
         "schema_version": 1,
         "state": "finalized",
@@ -153,8 +173,16 @@ def _publish_pytest_artifact(
             "worker_metadata": False,
         },
     }
-    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
-    (writer_directory / f"pytest-writer-{writer_id}.json").write_text(
-        json.dumps({"schema_version": 1, "writer_id": writer_id, "pid": 1}),
-        encoding="utf-8",
+    temporary_path = artifact_path.with_name(
+        f".{artifact_path.name}.{writer_id}.{uuid.uuid4().hex}.tmp"
     )
+    with open(  # noqa: PTH123
+        temporary_path,
+        "x",
+        encoding="utf-8",
+        opener=open_owner_only,
+    ) as temporary_file:
+        json.dump(artifact, temporary_file, separators=(",", ":"))
+        temporary_file.flush()
+        os.fsync(temporary_file.fileno())
+    os.replace(temporary_path, artifact_path)

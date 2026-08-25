@@ -463,6 +463,7 @@ def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
 
     captured = capsysbinary.readouterr()
     assert result == 0
+    plugin_name = runner.calls[1].command[runner.calls[1].command.index("-p") + 1]
     assert [call.command for call in runner.calls] == [
         ("uv", "run", "python", "-c", runner.calls[0].command[-1]),
         (
@@ -472,7 +473,7 @@ def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
             "-m",
             "pytest",
             "-p",
-            "pyrepo_check_pytest_evidence_plugin",
+            plugin_name,
             "tests/unit",
             "-m",
             "not slow",
