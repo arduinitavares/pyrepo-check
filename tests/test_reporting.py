@@ -178,13 +178,148 @@ def coverage_result() -> CoverageResult:
     )
 
 
-def coverage_execution_observation(content: bytes) -> CoverageExecutionObservation:
+def coverage_execution_observation(
+    content: bytes,
+    *,
+    json_exit_code: int | None = 0,
+) -> CoverageExecutionObservation:
     return CoverageExecutionObservation(
         preflight=CoveragePreflightObservation(
             "supported", CoveragePreflightRecord((3, 13, 15), True, "7.15.2"), None
         ),
         artifact=CoverageArtifactObservation("snapshot", content, None),
-        json_exit_code=0,
+        json_exit_code=json_exit_code,
+    )
+
+
+def coverage_enabled_pytest_check(
+    root: Path,
+    *,
+    fail_under: int | float | None = 90,
+) -> PlannedCheck:
+    check = pytest_planned_check(root)
+    assert check.pytest is not None
+    return replace(
+        check,
+        pytest=replace(
+            check.pytest,
+            coverage=CoverageExecutionPlan(
+                check.pytest.consumer_python,
+                root / "pyproject.toml",
+                fail_under,
+            ),
+        ),
+    )
+
+
+def coverage_process(
+    check: PlannedCheck,
+    role: str,
+    returncode: int | None = 0,
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    spawn_error: str | None = None,
+) -> ExecutedProcess:
+    return ExecutedProcess(
+        role=cast(Any, role),
+        command=("coverage", role),
+        cwd=check.cwd,
+        returncode=returncode,
+        duration_ms=1,
+        stdout=CapturedBytes(stdout, 0),
+        stderr=CapturedBytes(stderr, 0),
+        spawn_error=spawn_error,
+    )
+
+
+def coverage_json_content(source: Path) -> bytes:
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("value = 1\n")
+    return reporting.json.dumps(
+        {
+            "meta": {"format": 3, "version": "7.15.2", "branch_coverage": True},
+            "files": {
+                str(source): {
+                    "summary": {
+                        "covered_lines": 1,
+                        "missing_lines": 0,
+                        "num_statements": 1,
+                        "covered_branches": 0,
+                        "missing_branches": 0,
+                        "num_branches": 0,
+                    },
+                    "missing_lines": [],
+                    "missing_branches": [],
+                }
+            },
+            "totals": {
+                "covered_lines": 1,
+                "missing_lines": 0,
+                "num_statements": 1,
+                "covered_branches": 0,
+                "missing_branches": 0,
+                "num_branches": 0,
+            },
+        }
+    ).encode()
+
+
+def build_coverage_report(
+    tmp_path: Path,
+    *,
+    mode: RunMode = "strict_aggregate",
+    targets: tuple[str, ...] = (),
+    fail_under: int | float | None = 90,
+    coverage_json_exit_code: int | None = 0,
+    coverage_json_stdout: bytes = b"",
+    coverage_json_stderr: bytes = b"",
+) -> RunReportV1:
+    check = coverage_enabled_pytest_check(tmp_path, fail_under=fail_under)
+    source = tmp_path / "src" / "example.py"
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+    return build_run_report(
+        tmp_path,
+        run_plan(
+            (check,),
+            mode=mode,
+            targets=targets,
+            planned_coverage_scope="partial" if targets else "complete",
+        ),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    planned=check,
+                    processes=(
+                        pytest_preflight_process(check),
+                        coverage_process(check, "coverage_preflight"),
+                        primary,
+                        coverage_process(
+                            check,
+                            "coverage_json",
+                            coverage_json_exit_code,
+                            stdout=coverage_json_stdout,
+                            stderr=coverage_json_stderr,
+                        ),
+                    ),
+                    pytest=finalized_pytest_execution_observation(),
+                    coverage=coverage_execution_observation(
+                        coverage_json_content(source),
+                        json_exit_code=coverage_json_exit_code,
+                    ),
+                ),
+            ),
+            coverage_json_exit_code or 0,
+        ),
     )
 
 
@@ -356,6 +491,45 @@ def test_unavailable_coverage_is_null_and_adds_its_exact_advisory(tmp_path: Path
     assert validate_report_v1(report) is None
 
 
+@pytest.mark.parametrize(
+    ("mode", "targets", "expected_scope"),
+    (
+        ("focused", (), "complete"),
+        ("strict_aggregate", ("tests/test_example.py",), "partial"),
+    ),
+    ids=("focused", "direct-target"),
+)
+def test_unconfigured_coverage_guidance_builds_valid_report_and_renders(
+    tmp_path: Path,
+    mode: RunMode,
+    targets: tuple[str, ...],
+    expected_scope: str,
+) -> None:
+    report = build_coverage_report(
+        tmp_path,
+        mode=mode,
+        targets=targets,
+        fail_under=None,
+    )
+
+    assert report.coverage is not None
+    assert report.coverage.status == "guidance"
+    assert report.coverage.scope == expected_scope
+    assert report.coverage.threshold == CoverageThreshold(
+        False, None, False, None, "not_configured"
+    )
+    assert validate_report_v1(report) is None
+    assert "coverage: src/example.py" in render_terminal(report)
+    payload = reporting.json.loads(serialize_json(report))
+    assert payload["coverage"]["threshold"] == {
+        "configured": False,
+        "value": None,
+        "evaluated": False,
+        "passed": None,
+        "skipped_reason": "not_configured",
+    }
+
+
 def test_coverage_preflight_failure_owns_the_pytest_check_before_primary(tmp_path: Path) -> None:
     check = pytest_planned_check(tmp_path)
     assert check.pytest is not None
@@ -412,6 +586,281 @@ def test_coverage_preflight_failure_owns_the_pytest_check_before_primary(tmp_pat
     assert report.coverage is not None
     assert report.coverage.error == CoverageError("preflight_invalid", "coverage probe failed")
     assert validate_report_v1(report) is None
+
+
+def test_pytest_preflight_failure_owns_dual_preflight_failure(tmp_path: Path) -> None:
+    check = coverage_enabled_pytest_check(tmp_path)
+    pytest_preflight = replace(
+        pytest_preflight_process(check), returncode=1, stderr=CapturedBytes(b"pytest", 0)
+    )
+    coverage_preflight = coverage_process(
+        check, "coverage_preflight", 1, stderr=b"coverage"
+    )
+    pytest_observation = PytestExecutionObservation(
+        PytestPreflightObservation("preflight_invalid", None, "pytest probe failed"),
+        PytestArtifactObservation("not_attempted", None, (), None),
+        None,
+    )
+    coverage_observation = CoverageExecutionObservation(
+        CoveragePreflightObservation("preflight_invalid", None, "coverage probe failed"),
+        CoverageArtifactObservation("not_attempted", None, None),
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="complete"),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    check,
+                    (pytest_preflight, coverage_preflight),
+                    pytest_observation,
+                    coverage_observation,
+                ),
+            ),
+            1,
+        ),
+    )
+
+    assert report.checks[0].error == CheckError("pytest_preflight_failed", "pytest probe failed")
+    assert report.coverage is not None
+    assert report.coverage.error == CoverageError("preflight_invalid", "coverage probe failed")
+    assert validate_report_v1(report) is None
+
+
+def test_pytest_launcher_failure_owns_check_when_coverage_preflight_is_unattempted(
+    tmp_path: Path,
+) -> None:
+    check = coverage_enabled_pytest_check(tmp_path)
+    pytest_preflight = replace(
+        pytest_preflight_process(check),
+        returncode=None,
+        spawn_error="FileNotFoundError: python",
+    )
+    pytest_observation = PytestExecutionObservation(
+        PytestPreflightObservation("spawn_failed", None, "FileNotFoundError: python"),
+        PytestArtifactObservation("not_attempted", None, (), None),
+        None,
+    )
+    coverage_observation = CoverageExecutionObservation(
+        CoveragePreflightObservation(
+            "preflight_invalid", None, "coverage preflight was not attempted"
+        ),
+        CoverageArtifactObservation("not_attempted", None, None),
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="complete"),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    check,
+                    (pytest_preflight,),
+                    pytest_observation,
+                    coverage_observation,
+                ),
+            ),
+            2,
+        ),
+    )
+
+    assert report.checks[0].error == CheckError(
+        "spawn_failed", "Could not start pytest: FileNotFoundError: python"
+    )
+    assert report.coverage is not None
+    assert report.coverage.error == CoverageError(
+        "preflight_invalid", "coverage preflight was not attempted"
+    )
+    assert validate_report_v1(report) is None
+
+
+def test_malformed_zero_exit_coverage_preflight_owns_not_started_pytest_check(
+    tmp_path: Path,
+) -> None:
+    check = coverage_enabled_pytest_check(tmp_path)
+    coverage_preflight = coverage_process(
+        check, "coverage_preflight", 0, stderr=b"malformed probe"
+    )
+    coverage_observation = CoverageExecutionObservation(
+        CoveragePreflightObservation("preflight_invalid", None, "malformed coverage probe"),
+        CoverageArtifactObservation("not_attempted", None, None),
+    )
+
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="complete"),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    check,
+                    (pytest_preflight_process(check), coverage_preflight),
+                    finalized_pytest_execution_observation(),
+                    coverage_observation,
+                ),
+            ),
+            2,
+        ),
+    )
+
+    assert report.pytest is not None
+    assert report.pytest.error == PytestError(
+        "not_started", "pytest primary process was not observed"
+    )
+    assert report.checks[0].error == CheckError(
+        "coverage_preflight_failed", "malformed coverage probe"
+    )
+    assert validate_report_v1(report) is None
+
+
+def test_validation_rejects_primary_after_typed_coverage_preflight_failure(
+    tmp_path: Path,
+) -> None:
+    check = coverage_enabled_pytest_check(tmp_path)
+    primary = ExecutedProcess(
+        role="primary",
+        command=check.command,
+        cwd=check.cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+    coverage_observation = CoverageExecutionObservation(
+        CoveragePreflightObservation("preflight_invalid", None, "malformed coverage probe"),
+        CoverageArtifactObservation("not_attempted", None, None),
+    )
+    report = build_run_report(
+        tmp_path,
+        run_plan((check,), mode="strict_aggregate", planned_coverage_scope="complete"),
+        ExecutionResult(
+            (
+                ExecutedCheck(
+                    check,
+                    (
+                        pytest_preflight_process(check),
+                        coverage_process(check, "coverage_preflight"),
+                        primary,
+                    ),
+                    finalized_pytest_execution_observation(),
+                    coverage_observation,
+                ),
+            ),
+            2,
+        ),
+    )
+
+    assert report.coverage is not None
+    assert report.coverage.error == CoverageError("preflight_invalid", "malformed coverage probe")
+    with pytest.raises(ReportingError, match=r"^invalid report:"):
+        validate_report_v1(report)
+
+
+def test_report_validation_recomputes_coverage_context_and_process_invariants(
+    tmp_path: Path,
+) -> None:
+    strict = build_coverage_report(tmp_path / "strict")
+    focused = build_coverage_report(
+        tmp_path / "focused", mode="focused", fail_under=None
+    )
+    direct = build_coverage_report(
+        tmp_path / "direct",
+        targets=("tests/test_example.py",),
+        fail_under=None,
+    )
+    failed = build_coverage_report(tmp_path / "failed", coverage_json_exit_code=2)
+    assert strict.coverage is not None
+    assert focused.coverage is not None
+    assert direct.coverage is not None
+    assert failed.coverage is not None
+
+    focused_eligible = replace(
+        focused,
+        coverage=replace(focused.coverage, status="passed", gate_eligible=True),
+    )
+    focused_lower_precedence = replace(
+        focused,
+        coverage=replace(
+            focused.coverage,
+            threshold=replace(focused.coverage.threshold, skipped_reason="focused_run"),
+        ),
+    )
+    direct_complete_scope = replace(direct, coverage=replace(direct.coverage, scope="complete"))
+    missing_coverage_json = replace(
+        strict,
+        checks=(replace(strict.checks[0], processes=strict.checks[0].processes[:-1]),),
+    )
+    wrong_coverage_json_exit = replace(
+        strict,
+        checks=(
+            replace(
+                strict.checks[0],
+                processes=(
+                    *strict.checks[0].processes[:-1],
+                    replace(strict.checks[0].processes[-1], exit_code=1),
+                ),
+            ),
+        ),
+    )
+    primary_after_failed_coverage_preflight = replace(
+        strict,
+        checks=(
+            replace(
+                strict.checks[0],
+                processes=(
+                    strict.checks[0].processes[0],
+                    replace(strict.checks[0].processes[1], exit_code=1),
+                    *strict.checks[0].processes[2:],
+                ),
+            ),
+        ),
+    )
+    failed_with_zero_json_exit = replace(
+        failed,
+        checks=(
+            replace(
+                failed.checks[0],
+                processes=(
+                    *failed.checks[0].processes[:-1],
+                    replace(failed.checks[0].processes[-1], exit_code=0),
+                ),
+            ),
+        ),
+    )
+
+    for invalid in (
+        focused_eligible,
+        focused_lower_precedence,
+        direct_complete_scope,
+        missing_coverage_json,
+        wrong_coverage_json_exit,
+        primary_after_failed_coverage_preflight,
+        failed_with_zero_json_exit,
+    ):
+        with pytest.raises(ReportingError, match=r"^invalid report:"):
+            validate_report_v1(invalid)
+
+
+def test_terminal_renders_post_primary_coverage_json_diagnostics_once(tmp_path: Path) -> None:
+    report = build_coverage_report(
+        tmp_path,
+        coverage_json_exit_code=1,
+        coverage_json_stdout=b"coverage stdout\n",
+        coverage_json_stderr=b"coverage stderr\n",
+    )
+
+    assert report.coverage is not None
+    assert report.coverage.status == "error"
+    assert report.checks[0].status == "passed"
+    assert render_terminal(report) == (
+        "\n==> pyrepo-check summary: error (incomplete)\n"
+        "    error: coverage evidence: coverage JSON generation exited with code 1\n"
+        "    diagnostic: pytest coverage_json stdout: coverage stdout\n"
+        "    diagnostic: pytest coverage_json stderr: coverage stderr\n"
+        "    advisory: Configured coverage threshold was not applied to this run.\n"
+        "    passed: pytest\n"
+    )
 
 
 def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> None:

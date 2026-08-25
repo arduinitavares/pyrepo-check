@@ -783,6 +783,9 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
     "mutate",
     (
         lambda result: replace(result, coverage_version=1),
+        lambda result: replace(result, coverage_version=None),
+        lambda result: replace(result, coverage_version=""),
+        lambda result: replace(result, coverage_version="7.15.2-dev"),
         lambda result: replace(result, evidence_complete=1),
         lambda result: replace(result, gate_eligible=0),
         lambda result: replace(result, totals=CoverageTotals(CoverageCounts(True, 5), result.totals.branches)),
@@ -792,6 +795,18 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
         lambda result: replace(result, files=tuple(reversed(result.files))),
         lambda result: replace(
             result, files=(replace(result.files[0], path="src/../alpha.py"), *result.files[1:])
+        ),
+        lambda result: replace(
+            result, files=(replace(result.files[0], path="src//alpha.py"), *result.files[1:])
+        ),
+        lambda result: replace(
+            result, files=(replace(result.files[0], path="src/"), *result.files[1:])
+        ),
+        lambda result: replace(
+            result, files=(replace(result.files[0], path="src/\x00alpha.py"), *result.files[1:])
+        ),
+        lambda result: replace(
+            result, files=(replace(result.files[0], path="C:/alpha.py"), *result.files[1:])
         ),
         lambda result: replace(
             result,
@@ -806,6 +821,9 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
     ),
     ids=(
         "version-type",
+        "missing-version",
+        "empty-version",
+        "unstable-version",
         "evidence-bool",
         "eligible-bool",
         "count-bool",
@@ -814,6 +832,10 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
         "evaluated-passed",
         "file-order",
         "noncanonical-path",
+        "double-separator-path",
+        "trailing-separator-path",
+        "nul-path",
+        "windows-absolute-path",
         "missing-lines-order",
     ),
 )
@@ -866,6 +888,31 @@ def test_coverage_result_builds_strict_unconfigured_pass_without_evaluation(
     assert result.threshold == CoverageThreshold(
         False, None, False, None, "not_configured"
     )
+    validate_coverage_result(result)
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected_scope"),
+    (
+        (_plan(mode="focused", fail_under=None), "complete"),
+        (_plan(targets=("tests/test_alpha.py",), fail_under=None), "partial"),
+    ),
+    ids=("focused", "direct-target"),
+)
+def test_coverage_result_validates_unconfigured_guidance_from_builder(
+    tmp_path: Path,
+    plan: RunPlan,
+    expected_scope: str,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(root, plan, _pytest_result(), _coverage_observation())
+
+    assert result is not None
+    assert result.status == "guidance"
+    assert result.scope == expected_scope
+    assert result.threshold == CoverageThreshold(False, None, False, None, "not_configured")
+    assert validate_coverage_result(result) is None
 
 
 @pytest.mark.parametrize(
@@ -1015,8 +1062,9 @@ def test_coverage_result_maps_every_preflight_and_artifact_error(
     assert result.files == ()
     assert result.error == CoverageError(expected_code, f"{expected_code} diagnostic")
     assert result.coverage_version == (
-        "7.15.2" if preflight == "supported" else None
+        "7.15.2" if preflight in {"supported", "unsupported_version"} else None
     )
+    validate_coverage_result(result)
 
 
 @pytest.mark.parametrize(

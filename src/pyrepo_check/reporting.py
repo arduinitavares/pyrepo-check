@@ -11,6 +11,7 @@ from pyrepo_check.coverage_evidence import (
     CoverageCounts,
     CoverageResult,
     build_coverage_result,
+    coverage_gate_policy_for_context,
     validate_coverage_result,
 )
 from pyrepo_check.execution import (
@@ -153,6 +154,24 @@ _PYTEST_ARTIFACT_ERROR_CODES = frozenset(
         "artifact_missing",
         "artifact_invalid",
         "artifact_not_finalized",
+    )
+)
+_COVERAGE_PREFLIGHT_ERROR_CODES = frozenset(
+    (
+        "unsupported_python",
+        "module_unavailable",
+        "unsupported_version",
+        "preflight_invalid",
+        "spawn_failed",
+        "terminated_by_signal",
+    )
+)
+_COVERAGE_PREPRIMARY_ERROR_CODES = frozenset(
+    (
+        "unsupported_python",
+        "module_unavailable",
+        "unsupported_version",
+        "preflight_invalid",
     )
 )
 
@@ -369,6 +388,7 @@ def render_terminal(report: AgentReportV1) -> str:
             lines.append("    error: coverage evidence is incomplete.")
         else:
             lines.append(f"    error: coverage evidence: {report.coverage.error.message}")
+    pytest_check = next((check for check in report.checks if check.name == "pytest"), None)
     for check in report.checks:
         if check.status != "error":
             continue
@@ -376,11 +396,17 @@ def render_terminal(report: AgentReportV1) -> str:
         if error is not None and not _is_duplicate_pytest_result_error(check, report.pytest):
             lines.append(f"    error: {check.name}: {error.message}")
         _append_helper_diagnostics(lines, check)
+    if (
+        report.coverage is not None
+        and report.coverage.status == "error"
+        and pytest_check is not None
+        and pytest_check.status != "error"
+    ):
+        _append_process_diagnostics(lines, pytest_check, frozenset(("coverage_json",)))
     for check in report.checks:
         if check.status != "failed":
             continue
         _append_failed_line(lines, check.name, _first_positive_exit_code(check.processes))
-    pytest_check = next((check for check in report.checks if check.name == "pytest"), None)
     if (
         report.pytest is not None
         and report.pytest.status == "failed"
@@ -446,8 +472,20 @@ def _is_duplicate_pytest_result_error(
 
 
 def _append_helper_diagnostics(lines: list[str], check: CheckResult) -> None:
+    _append_process_diagnostics(
+        lines,
+        check,
+        frozenset(("pytest_preflight", "coverage_preflight", "coverage_json")),
+    )
+
+
+def _append_process_diagnostics(
+    lines: list[str],
+    check: CheckResult,
+    roles: frozenset[ProcessRole],
+) -> None:
     for process in check.processes:
-        if process.role not in {"pytest_preflight", "coverage_preflight", "coverage_json"}:
+        if process.role not in roles:
             continue
         for stream_name, captured in (("stdout", process.stdout), ("stderr", process.stderr)):
             if not captured.captured or not captured.text:
@@ -748,7 +786,14 @@ def _validate_run_report(report: RunReportV1) -> None:
         )
         for check in report.checks
     }
-    _validate_coverage_projection(selection, report.coverage)
+    pytest_check = next((check for check in report.checks if check.name == "pytest"), None)
+    _validate_coverage_projection(
+        report.mode,
+        selection,
+        report.pytest,
+        report.coverage,
+        pytest_check,
+    )
     _validate_advisories(report.advisories, report.checks, report.pytest, report.coverage, selection)
 
     expected_complete = _run_complete(report.checks, report.pytest, report.coverage)
@@ -834,7 +879,11 @@ def _validate_selection(selection: Selection) -> bool:
 
 
 def _validate_coverage_projection(
-    selection: Selection, coverage: CoverageResult | None
+    mode: RunMode,
+    selection: Selection,
+    pytest_result: PytestResult | None,
+    coverage: CoverageResult | None,
+    pytest_check: CheckResult | None,
 ) -> None:
     expected_null = selection.planned_coverage_scope in {"not_requested", "unavailable"}
     if (coverage is None) != expected_null:
@@ -844,6 +893,84 @@ def _validate_coverage_projection(
             validate_coverage_result(coverage)
         except ValueError as error:
             _invalid(f"invalid coverage result: {error}")
+        if pytest_result is None or pytest_check is None:
+            _invalid("planned coverage requires a pytest report")
+            return
+        _validate_coverage_report_context(
+            mode,
+            selection,
+            pytest_result,
+            coverage,
+            pytest_check,
+        )
+
+
+def _validate_coverage_report_context(
+    mode: RunMode,
+    selection: Selection,
+    pytest_result: PytestResult,
+    coverage: CoverageResult,
+    pytest_check: CheckResult,
+) -> None:
+    expected_scope = (
+        "complete"
+        if (
+            selection.planned_coverage_scope == "complete"
+            and pytest_result.scope == "complete"
+            and coverage.evidence_complete
+        )
+        else "partial"
+    )
+    if coverage.scope != expected_scope:
+        _invalid("coverage scope contradicts observed pytest and coverage evidence")
+    policy = coverage_gate_policy_for_context(
+        mode=mode,
+        targets=selection.targets,
+        test_shortcut=selection.test_shortcut,
+        pytest_result=pytest_result,
+        evidence_complete=coverage.evidence_complete,
+        configured=coverage.threshold.configured,
+    )
+    if coverage.gate_eligible is not policy.gate_eligible:
+        _invalid("coverage gate eligibility contradicts report context")
+    if coverage.status == "error":
+        if policy.skipped_reason != "evidence_error":
+            _invalid("coverage error must be backed by incomplete evidence")
+        return
+    if coverage.threshold.skipped_reason != policy.skipped_reason:
+        _invalid("coverage threshold skip reason contradicts report context")
+    expected_status = (
+        "guidance"
+        if not policy.gate_eligible
+        else "failed" if coverage.threshold.passed is False else "passed"
+    )
+    if coverage.status != expected_status:
+        _invalid("coverage status contradicts report context")
+    _validate_complete_coverage_processes(pytest_check, coverage)
+
+
+def _validate_complete_coverage_processes(
+    pytest_check: CheckResult,
+    coverage: CoverageResult,
+) -> None:
+    expected_roles = (
+        "pytest_preflight",
+        "coverage_preflight",
+        "primary",
+        "coverage_json",
+    )
+    if tuple(process.role for process in pytest_check.processes) != expected_roles:
+        _invalid("complete coverage requires every attempted coverage process")
+    coverage_preflight = pytest_check.processes[1]
+    if coverage_preflight.outcome != "exited" or coverage_preflight.exit_code != 0:
+        _invalid("coverage primary requires a successful coverage preflight")
+    coverage_json = pytest_check.processes[-1]
+    expected_exit_code = 2 if coverage.status == "failed" else 0
+    if (
+        coverage_json.outcome != "exited"
+        or coverage_json.exit_code != expected_exit_code
+    ):
+        _invalid("coverage JSON process contradicts coverage result")
 
 
 def _validate_check_result(
@@ -920,6 +1047,23 @@ def _validate_pytest_check_result(
     if preflight is not None and preflight.role != "pytest_preflight":
         _invalid("pytest processes must start with pytest_preflight")
     _validate_pytest_process_order(processes, coverage_planned=coverage is not None)
+    if (
+        coverage_preflight is not None
+        and primary is not None
+        and (
+            coverage_preflight.outcome != "exited"
+            or coverage_preflight.exit_code != 0
+        )
+    ):
+        _invalid("pytest primary cannot follow a failed coverage preflight")
+    if (
+        primary is not None
+        and coverage is not None
+        and coverage.status == "error"
+        and coverage.error is not None
+        and coverage.error.code in _COVERAGE_PREPRIMARY_ERROR_CODES
+    ):
+        _invalid("pytest primary cannot follow a typed coverage preflight failure")
     _validate_pytest_execution_shape(result, preflight, primary)
 
     if check.error is not None and check.error.code == "cleanup_failed":
@@ -927,14 +1071,12 @@ def _validate_pytest_check_result(
             _invalid("cleanup failure requires pytest check error")
         return "error"
     expected_error = _expected_pytest_check_error(result)
-    if (
-        selection.planned_coverage_scope in {"partial", "complete"}
-        and primary is None
-        and coverage_preflight is not None
-        and (
-            coverage_preflight.outcome != "exited"
-            or coverage_preflight.exit_code != 0
-        )
+    if _coverage_preflight_owns_pytest_check(
+        result,
+        coverage,
+        preflight,
+        coverage_preflight,
+        primary,
     ):
         expected_error = "coverage_preflight_failed"
     if expected_error is None:
@@ -980,6 +1122,29 @@ def _expected_pytest_check_error(result: PytestResult) -> CheckErrorCode | None:
     if result.error.code in _PYTEST_PREFLIGHT_ERROR_CODES:
         return "pytest_preflight_failed"
     return "pytest_evidence_error"
+
+
+def _coverage_preflight_owns_pytest_check(
+    result: PytestResult,
+    coverage: CoverageResult | None,
+    pytest_preflight: ProcessResult | None,
+    coverage_preflight: ProcessResult | None,
+    primary: ProcessResult | None,
+) -> bool:
+    return (
+        result.status == "error"
+        and result.error is not None
+        and result.error.code == "not_started"
+        and pytest_preflight is not None
+        and pytest_preflight.outcome == "exited"
+        and pytest_preflight.exit_code == 0
+        and coverage_preflight is not None
+        and primary is None
+        and coverage is not None
+        and coverage.status == "error"
+        and coverage.error is not None
+        and coverage.error.code in _COVERAGE_PREFLIGHT_ERROR_CODES
+    )
 
 
 def _validate_pytest_execution_shape(
@@ -1704,7 +1869,7 @@ def _pytest_check_error(
     )
     if cleanup_error is not None:
         return CheckError("cleanup_failed", f"Could not clean up pytest evidence: {cleanup_error}")
-    if _coverage_preflight_prevented_primary(observation):
+    if _coverage_preflight_prevented_primary(result, observation):
         if observation is None or observation.coverage is None:
             raise AssertionError("coverage preflight observation is unavailable")
         coverage = observation.coverage
@@ -1738,8 +1903,27 @@ def _pytest_check_error(
     return CheckError("pytest_evidence_error", result.error.message)
 
 
-def _coverage_preflight_prevented_primary(observation: ExecutedCheck | None) -> bool:
+def _coverage_preflight_prevented_primary(
+    result: PytestResult,
+    observation: ExecutedCheck | None,
+) -> bool:
     if observation is None or observation.coverage is None:
+        return False
+    if (
+        result.status != "error"
+        or result.error is None
+        or result.error.code != "not_started"
+    ):
+        return False
+    pytest_preflight = next(
+        (process for process in observation.processes if process.role == "pytest_preflight"),
+        None,
+    )
+    if pytest_preflight is None or pytest_preflight.returncode != 0:
+        return False
+    if observation.pytest is None or observation.pytest.preflight.classification != "supported":
+        return False
+    if not any(process.role == "coverage_preflight" for process in observation.processes):
         return False
     if any(process.role == "primary" for process in observation.processes):
         return False

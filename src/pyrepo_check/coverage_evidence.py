@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Literal, cast
 
 from pyrepo_check.artifact_safety import load_bounded_json
@@ -40,6 +41,12 @@ CoverageErrorCode = Literal[
     "artifact_missing",
     "artifact_invalid",
 ]
+
+
+_STABLE_COVERAGE_VERSION = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?$"
+)
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:/")
 
 
 @dataclass(frozen=True)
@@ -167,9 +174,12 @@ def validate_coverage_result(result: CoverageResult) -> None:
             or threshold.skipped_reason != "evidence_error"
         ):
             raise ValueError("coverage error result has inconsistent evidence")
+        _validate_error_coverage_version(result)
         return
     if result.totals is None or result.error is not None or not result.evidence_complete:
         raise ValueError("valid coverage result requires complete totals without an error")
+    if not _is_stable_coverage_version(result.coverage_version):
+        raise ValueError("valid coverage result requires a trusted stable version")
     if result.status in {"passed", "failed"}:
         if result.scope != "complete" or not result.gate_eligible:
             raise ValueError("gating coverage result must be complete and eligible")
@@ -197,7 +207,7 @@ def validate_coverage_result(result: CoverageResult) -> None:
         return
     if result.gate_eligible or threshold.evaluated or threshold.passed is not None:
         raise ValueError("guidance coverage cannot evaluate a threshold")
-    if threshold.skipped_reason in {None, "evidence_error", "not_configured"}:
+    if threshold.skipped_reason in {None, "evidence_error"}:
         raise ValueError("guidance coverage requires a non-error skip reason")
 
 
@@ -251,10 +261,13 @@ def _validate_coverage_file(file: CoverageFile) -> None:
     if (
         not isinstance(file.path, str)
         or not file.path
+        or "\x00" in file.path
         or file.path.startswith("./")
         or file.path.startswith("/")
+        or _WINDOWS_ABSOLUTE_PATH.match(file.path) is not None
         or "\\" in file.path
-        or any(part in {".", ".."} for part in file.path.split("/"))
+        or file.path.endswith("/")
+        or any(part in {"", ".", ".."} for part in file.path.split("/"))
     ):
         raise ValueError("coverage file path must be project-relative POSIX text")
     if not isinstance(file.statements, FileStatementCoverage):
@@ -313,6 +326,24 @@ def _validate_coverage_error(error: CoverageError) -> None:
         "artifact_invalid",
     } or not isinstance(error.message, str):
         raise ValueError("invalid coverage error")
+
+
+def _validate_error_coverage_version(result: CoverageResult) -> None:
+    if result.error is None:
+        raise AssertionError("coverage error result must have an error")
+    if result.error.code == "unsupported_version":
+        if not _is_stable_coverage_version(result.coverage_version):
+            raise ValueError("unsupported coverage version requires a trusted stable version")
+    elif result.error.code in {
+        "unsupported_python",
+        "module_unavailable",
+        "preflight_invalid",
+    } and result.coverage_version is not None:
+        raise ValueError("untrusted coverage preflight cannot have a version")
+
+
+def _is_stable_coverage_version(value: object) -> bool:
+    return isinstance(value, str) and _STABLE_COVERAGE_VERSION.fullmatch(value) is not None
 
 
 def validate_coverage_json(
@@ -539,10 +570,16 @@ def build_coverage_result(
 def _trusted_coverage_version(
     observation: CoverageExecutionObservation | None,
 ) -> str | None:
-    if observation is None or observation.preflight.classification != "supported":
+    if observation is None or observation.preflight.classification not in {
+        "supported",
+        "unsupported_version",
+    }:
         return None
     record = observation.preflight.record
-    return record.coverage_version if record is not None else None
+    if record is None:
+        return None
+    version = record.coverage_version
+    return version if _is_stable_coverage_version(version) else None
 
 
 def _coverage_observation_error(
@@ -555,11 +592,18 @@ def _coverage_observation_error(
         )
     preflight = observation.preflight
     if preflight.classification != "supported":
+        if preflight.classification == "unsupported_version" and _trusted_coverage_version(
+            observation
+        ) is None:
+            return CoverageError(
+                "preflight_invalid",
+                "unsupported coverage preflight has no trusted stable version",
+            )
         return CoverageError(
             cast(CoverageErrorCode, preflight.classification),
             preflight.diagnostic or f"coverage preflight: {preflight.classification}",
         )
-    if preflight.record is None or preflight.record.coverage_version is None:
+    if _trusted_coverage_version(observation) is None:
         return CoverageError(
             "preflight_invalid",
             "supported coverage preflight has no trusted version",
@@ -726,19 +770,49 @@ def coverage_gate_policy(
     evidence_complete: bool,
 ) -> CoverageGatePolicy:
     """Select native threshold eligibility from finalized public evidence."""
-    configured = _coverage_threshold_is_configured(plan)
-    gate_eligible = _gate_is_eligible(plan, pytest_result, evidence_complete)
-    skipped_reason = _threshold_skipped_reason(
-        plan,
-        pytest_result,
-        evidence_complete,
-        configured,
+    return coverage_gate_policy_for_context(
+        mode=plan.mode,
+        targets=plan.targets,
+        test_shortcut=plan.test_shortcut,
+        pytest_result=pytest_result,
+        evidence_complete=evidence_complete,
+        configured=_coverage_threshold_is_configured(plan),
+    )
+
+
+def coverage_gate_policy_for_context(
+    *,
+    mode: str,
+    targets: tuple[str, ...],
+    test_shortcut: str | None,
+    pytest_result: PytestResult,
+    evidence_complete: bool,
+    configured: bool,
+) -> CoverageGatePolicy:
+    """Recompute coverage policy from public report context."""
+    gate_eligible = _gate_is_eligible_from_context(
+        mode=mode,
+        targets=targets,
+        test_shortcut=test_shortcut,
+        pytest_result=pytest_result,
+        evidence_complete=evidence_complete,
+    )
+    skipped_reason = _threshold_skipped_reason_from_context(
+        mode=mode,
+        targets=targets,
+        test_shortcut=test_shortcut,
+        pytest_result=pytest_result,
+        evidence_complete=evidence_complete,
+        configured=configured,
     )
     return CoverageGatePolicy(gate_eligible, skipped_reason, not gate_eligible)
 
 
-def _gate_is_eligible(
-    plan: RunPlan,
+def _gate_is_eligible_from_context(
+    *,
+    mode: str,
+    targets: tuple[str, ...],
+    test_shortcut: str | None,
     pytest_result: PytestResult,
     evidence_complete: bool,
 ) -> bool:
@@ -749,14 +823,17 @@ def _gate_is_eligible(
         and pytest_result.complete
         and pytest_result.scope == "complete"
         and not pytest_result.scope_reasons
-        and not plan.targets
-        and plan.test_shortcut is None
-        and plan.mode == "strict_aggregate"
+        and not targets
+        and test_shortcut is None
+        and mode == "strict_aggregate"
     )
 
 
-def _threshold_skipped_reason(
-    plan: RunPlan,
+def _threshold_skipped_reason_from_context(
+    *,
+    mode: str,
+    targets: tuple[str, ...],
+    test_shortcut: str | None,
     pytest_result: PytestResult,
     evidence_complete: bool,
     configured: bool,
@@ -774,11 +851,11 @@ def _threshold_skipped_reason(
     if (
         pytest_result.scope != "complete"
         or pytest_result.scope_reasons
-        or plan.targets
-        or plan.test_shortcut is not None
+        or targets
+        or test_shortcut is not None
     ):
         return "partial_run"
-    if plan.mode != "strict_aggregate":
+    if mode != "strict_aggregate":
         return "focused_run"
     return None
 
