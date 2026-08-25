@@ -119,7 +119,6 @@ def validate_pytest_execution(
     if not isinstance(document, dict):
         return _failure("artifact_invalid", "pytest artifact root must be an object", pytest_version, primary.returncode)
     try:
-        _schema_version(document)
         state = _string(_required(document, "state"), "state")
     except _ArtifactInvalid as error:
         return _failure("artifact_invalid", str(error), pytest_version, primary.returncode)
@@ -127,6 +126,10 @@ def validate_pytest_execution(
         return _failure("artifact_invalid", "pytest artifact state is invalid", pytest_version, primary.returncode)
     if state != "finalized":
         return _failure("artifact_not_finalized", "pytest artifact is not finalized", pytest_version, primary.returncode)
+    try:
+        _schema_version(document)
+    except _ArtifactInvalid as error:
+        return _failure("artifact_invalid", str(error), pytest_version, primary.returncode)
     if artifact.diagnostic is not None:
         return _failure("artifact_invalid", artifact.diagnostic, pytest_version, primary.returncode)
     try:

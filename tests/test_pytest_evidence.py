@@ -368,3 +368,179 @@ def test_expected_failure_shape_beats_parallelism_and_repeated_reports_are_retri
     assert invalid_result.code == "artifact_invalid"
     assert isinstance(repeated_result, PytestValidationFailure)
     assert repeated_result.code == "unsupported_retries"
+
+
+def test_started_artifact_precedes_schema_validation() -> None:
+    document = _artifact_document(_check())
+    document["state"] = "started"
+    document["schema_version"] = 2
+
+    result = validate_pytest_execution(_with_document(_check(), document))
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == "artifact_not_finalized"
+
+
+_PRECEDENCE_CODES = {
+    "preflight-specific": "preflight_invalid",
+    "preflight-spawn": "spawn_failed",
+    "preflight-signal": "terminated_by_signal",
+    "primary-spawn": "spawn_failed",
+    "primary-signal": "terminated_by_signal",
+    "artifact-missing": "artifact_missing",
+    "artifact-not-finalized": "artifact_not_finalized",
+    "artifact-invalid": "artifact_invalid",
+    "parallelism": "unsupported_parallelism",
+    "retry": "unsupported_retries",
+    "exit-mismatch": "exit_code_mismatch",
+}
+_PRECEDENCE_ORDER = tuple(_PRECEDENCE_CODES)
+
+
+def _check_with_defects(*defects: str) -> ExecutedCheck:
+    check = _check()
+    document = _artifact_document(check)
+    artifact_state: ArtifactState = "snapshot"
+    artifact_diagnostic: str | None = None
+    preflight: PytestPreflightObservation | None = None
+    primary: ExecutedProcess | None = None
+    for defect in defects:
+        if defect == "preflight-specific":
+            preflight = PytestPreflightObservation("preflight_invalid", None, "invalid")
+        elif defect == "preflight-spawn":
+            preflight = PytestPreflightObservation("spawn_failed", None, "spawn failed")
+        elif defect == "preflight-signal":
+            preflight = PytestPreflightObservation("terminated_by_signal", None, "signal")
+        elif defect == "primary-spawn":
+            primary = replace(_check().processes[0], returncode=None, spawn_error="spawn failed")
+        elif defect == "primary-signal":
+            primary = replace(_check().processes[0], returncode=-9)
+        elif defect == "artifact-missing":
+            artifact_state = "missing"
+        elif defect == "artifact-not-finalized":
+            document["state"] = "started"
+        elif defect == "artifact-invalid":
+            document["state"] = "finalized"
+            document["schema_version"] = 2
+        elif defect == "parallelism":
+            flags = cast(dict[str, object], document["flags"])
+            flags["unsupported_parallelism"] = True
+        elif defect == "retry":
+            flags = cast(dict[str, object], document["flags"])
+            flags["unsupported_retries"] = True
+        elif defect == "exit-mismatch":
+            session = cast(dict[str, object], document["session"])
+            session["exit_code"] = 1
+        else:
+            raise AssertionError(f"unhandled defect: {defect}")
+    check = _with_document(check, document)
+    assert check.pytest is not None
+    artifact = replace(
+        check.pytest.artifact, state=artifact_state, diagnostic=artifact_diagnostic
+    )
+    return replace(
+        check,
+        processes=(primary,) if primary is not None else check.processes,
+        pytest=replace(
+            check.pytest,
+            preflight=preflight if preflight is not None else check.pytest.preflight,
+            artifact=artifact,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("higher", "lower", "expected_code"),
+    tuple(
+        (higher, lower, _PRECEDENCE_CODES[higher])
+        for index, higher in enumerate(_PRECEDENCE_ORDER)
+        for lower in _PRECEDENCE_ORDER[index + 1 :]
+    ),
+)
+def test_every_higher_precedence_category_wins_over_every_lower_category(
+    higher: str, lower: str, expected_code: str
+) -> None:
+    result = validate_pytest_execution(_check_with_defects(lower, higher))
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == expected_code
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("unsafe_path", "read_failed", "malformed-marker", "multiple-writers", "writer-mismatch"),
+)
+def test_artifact_observations_map_to_artifact_invalid(defect: str) -> None:
+    check = _check()
+    assert check.pytest is not None
+    if defect in {"unsafe_path", "read_failed"}:
+        check = replace(
+            check,
+            pytest=replace(
+                check.pytest,
+                artifact=replace(check.pytest.artifact, state=cast(ArtifactState, defect)),
+            ),
+        )
+    elif defect == "malformed-marker":
+        check = replace(
+            check,
+            pytest=replace(
+                check.pytest,
+                artifact=replace(check.pytest.artifact, diagnostic="writer marker malformed"),
+            ),
+        )
+    elif defect == "multiple-writers":
+        check = replace(
+            check,
+            pytest=replace(check.pytest, artifact=replace(check.pytest.artifact, writer_ids=("a", "b"))),
+        )
+    elif defect == "writer-mismatch":
+        document = _artifact_document(check)
+        document["writer_id"] = "other"
+        check = _with_document(check, document)
+    else:
+        raise AssertionError(f"unhandled defect: {defect}")
+
+    result = validate_pytest_execution(check)
+
+    assert isinstance(result, PytestValidationFailure)
+    assert result.code == "artifact_invalid"
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_kind", "expected_reason", "strict", "affects_exit"),
+    (
+        ("none", "none", None, None, False),
+        ("xfail", "xfail", "xfail reason", None, False),
+        ("xpass", "xpass_non_strict", "xpass reason", False, False),
+        ("strict-empty", "xpass_strict", None, True, True),
+    ),
+)
+def test_expected_failure_normalization_positive_shapes(
+    kind: str,
+    expected_kind: str,
+    expected_reason: str | None,
+    strict: bool | None,
+    affects_exit: bool,
+) -> None:
+    document = _artifact_document(_check())
+    report = _report(document, 1)
+    if kind == "xfail":
+        report["outcome"] = "skipped"
+        report["wasxfail_present"] = True
+        report["wasxfail"] = "xfail reason"
+    elif kind == "xpass":
+        report["wasxfail_present"] = True
+        report["wasxfail"] = "xpass reason"
+    elif kind == "strict-empty":
+        report["outcome"] = "failed"
+        report["longrepr"] = "[XPASS(strict)] "
+
+    result = validate_pytest_execution(_with_document(_check(), document))
+
+    assert not isinstance(result, PytestValidationFailure)
+    expected = result.reports[1].expected_failure
+    assert expected.kind == expected_kind
+    assert expected.reason == expected_reason
+    assert expected.strict is strict
+    assert expected.affects_exit is affects_exit
