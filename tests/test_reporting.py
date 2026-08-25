@@ -1934,19 +1934,68 @@ def test_validation_rejects_not_started_pytest_version_without_matching_prefligh
             validate_report_v1(invalid)
 
 
-def test_pytest_setup_not_started_projects_missing_primary_model(
+@pytest.mark.parametrize(
+    "boundary",
+    ("run-directory", "plugin-copy", "plugin-chmod", "writer-directory", "environment"),
+)
+def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
 ) -> None:
     check = pytest_planned_check(tmp_path)
 
-    def fail_run_directory(_consumer_root: Path) -> Path:
-        raise PermissionError("temporary directory denied")
+    if boundary == "run-directory":
+        def fail_run_directory(_consumer_root: Path) -> Path:
+            raise PermissionError("temporary directory denied")
 
-    monkeypatch.setattr(pytest_execution, "_create_run_directory", fail_run_directory)
+        monkeypatch.setattr(
+            pytest_execution,
+            "_create_run_directory",
+            fail_run_directory,
+        )
+    elif boundary == "plugin-copy":
+        def fail_copy(_source: Path, _destination: Path) -> None:
+            raise PermissionError("plugin copy denied")
+
+        monkeypatch.setattr(pytest_execution.shutil, "copyfile", fail_copy)
+    elif boundary == "plugin-chmod":
+        def fail_chmod(_path: Path, _mode: int) -> None:
+            raise PermissionError("plugin chmod denied")
+
+        monkeypatch.setattr(pytest_execution.os, "chmod", fail_chmod)
+    elif boundary == "writer-directory":
+        original_mkdir = Path.mkdir
+
+        def fail_writer_directory(
+            path: Path,
+            mode: int = 0o777,
+            parents: bool = False,
+            exist_ok: bool = False,
+        ) -> None:
+            if path.name == "writers":
+                raise PermissionError("writer directory denied")
+            original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(Path, "mkdir", fail_writer_directory)
+    else:
+        def fail_environment(
+            _run_directory: Path,
+            _artifact_path: Path,
+            _writer_directory: Path,
+        ) -> dict[str, str]:
+            raise PermissionError("environment denied")
+
+        monkeypatch.setattr(
+            pytest_execution,
+            "_isolated_environment",
+            fail_environment,
+        )
 
     execution = execute_plan(run_plan((check,)))
     report = build_run_report(tmp_path, run_plan((check,)), execution)
+    validate_report_v1(report)
+    payload = reporting.json.loads(serialize_json(report))
 
     assert execution.checks[0].processes == ()
     assert execution.checks[0].pytest is not None
@@ -1958,6 +2007,8 @@ def test_pytest_setup_not_started_projects_missing_primary_model(
         "missing_primary_process",
         "No primary process observation was recorded.",
     )
+    assert payload["pytest"]["error"]["code"] == "not_started"
+    assert payload["checks"][0]["error"]["code"] == "missing_primary_process"
 
 
 @pytest.mark.parametrize(

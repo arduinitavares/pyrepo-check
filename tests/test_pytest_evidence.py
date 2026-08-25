@@ -26,11 +26,110 @@ from pyrepo_check.pytest_evidence import (
     PytestResult,
     SlowTest,
     SpecialTestOutcome,
+    ValidatedExpectedFailure,
+    ValidatedPhaseReport,
     ValidatedPytestSession,
+    _build_evidence,
     _round_phase_durations,
     build_pytest_result,
     validate_pytest_execution,
 )
+from tests.test_pytest_report_plugin import run_plugin_project
+
+
+class _CountingNodeId(str):
+    comparisons = 0
+
+    def __eq__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return super().__eq__(other)
+
+    __hash__ = str.__hash__
+
+
+@pytest.mark.parametrize(
+    ("test_source", "project_sources", "invocation_args"),
+    (
+        ("def test_case():\n    assert True\n", None, ()),
+        ("def test_case():\n    assert False\n", None, ()),
+        ("import pytest\n\n@pytest.mark.skip(reason='skip')\ndef test_case(): pass\n", None, ()),
+        ("import pytest\n\n@pytest.mark.xfail(reason='xfail')\ndef test_case(): assert False\n", None, ()),
+        (
+            "def test_case(failing_setup): pass\n",
+            {
+                "conftest.py": (
+                    "import pytest\n\n@pytest.fixture\ndef failing_setup():\n"
+                    "    raise RuntimeError('setup')\n"
+                )
+            },
+            (),
+        ),
+        (
+            "def test_case(failing_teardown): pass\n",
+            {
+                "conftest.py": (
+                    "import pytest\n\n@pytest.fixture\ndef failing_teardown():\n"
+                    "    yield\n    raise RuntimeError('teardown')\n"
+                )
+            },
+            (),
+        ),
+        ("def test_case():\n    assert True\n", None, ("--collect-only",)),
+        (
+            "def test_first(): assert False\n\ndef test_second(): assert True\n",
+            None,
+            ("-x",),
+        ),
+        (
+            "def test_kept(): pass\n\ndef test_removed(): pass\n",
+            None,
+            ("-k", "kept"),
+        ),
+    ),
+    ids=(
+        "pass",
+        "fail",
+        "skip",
+        "xfail",
+        "setup-error",
+        "teardown-error",
+        "collect-only",
+        "early-stop",
+        "deselection",
+    ),
+)
+def test_real_plugin_artifact_matrix_passes_task_five_validation(
+    tmp_path: Path,
+    test_source: str,
+    project_sources: dict[str, str] | None,
+    invocation_args: tuple[str, ...],
+) -> None:
+    run = run_plugin_project(
+        tmp_path,
+        test_source,
+        project_sources=project_sources,
+        invocation_args=invocation_args,
+    )
+    check = _check()
+    version = tuple(int(piece) for piece in str(run.artifact["pytest_version"]).split(".")[:3])
+    primary = replace(check.processes[0], returncode=run.completed.returncode)
+    observation = PytestExecutionObservation(
+        preflight=PytestPreflightObservation(
+            "supported",
+            PytestPreflightRecord((3, 13, 15), True, cast(tuple[int, int, int], version)),
+            None,
+        ),
+        artifact=PytestArtifactObservation(
+            "snapshot",
+            run.artifact_path.read_bytes(),
+            (cast(str, run.artifact["writer_id"]),),
+            None,
+        ),
+        cleanup_error=None,
+    )
+    check = replace(check, processes=(primary,), pytest=observation)
+
+    assert isinstance(validate_pytest_execution(check), ValidatedPytestSession)
 
 
 def _check(
@@ -811,6 +910,113 @@ def test_exit_matrix_treats_valid_zero_collected_as_complete_failure() -> None:
     assert result.error is None
 
 
+def test_validation_rejects_false_pass_report_outside_empty_final_collection() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    collection = cast(dict[str, object], document["collection"])
+    collection["initial_nodeids"] = []
+    collection["final_nodeids"] = []
+    document["reports"] = [_phase("not-selected", "call", "passed", 0.0, expected="none")]
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.status == "error"
+    assert result.evidence is None
+    assert result.error is not None
+    assert result.error.code == "artifact_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("initial_nodeids", ["node", "node"]),
+        ("final_nodeids", ["node", "node"]),
+        ("deselected_nodeids", ["gone", "gone"]),
+        ("uncovered_removed_nodeids", ["gone", "gone"]),
+        ("final_nodeids", ["outside"]),
+        ("deselected_nodeids", ["node"]),
+        ("uncovered_removed_nodeids", ["node"]),
+    ),
+)
+def test_validation_rejects_duplicate_or_inconsistent_collection_sets(
+    field: str,
+    value: list[str],
+) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    collection = cast(dict[str, object], document["collection"])
+    if field in {"deselected_nodeids", "uncovered_removed_nodeids"} and value == ["gone", "gone"]:
+        collection["initial_nodeids"] = ["tests/test_ok.py::test_ok", "gone"]
+    collection[field] = value
+
+    result = build_pytest_result(_plan(check), _with_document(check, document))
+
+    assert result.error is not None
+    assert result.error.code == "artifact_invalid"
+    assert result.evidence is None
+
+
+@pytest.mark.parametrize(
+    "phases",
+    (
+        ("call", "setup", "teardown"),
+        ("setup", "teardown", "call"),
+        ("call",),
+        ("teardown",),
+    ),
+)
+def test_validation_rejects_impossible_phase_order(phases: tuple[str, ...]) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["reports"] = [
+        _phase("tests/test_ok.py::test_ok", phase, "passed", 0.0, expected="none")
+        for phase in phases
+    ]
+
+    result = build_pytest_result(_plan(check), _with_document(check, document))
+
+    assert result.error is not None
+    assert result.error.code == "artifact_invalid"
+
+
+def test_evidence_consolidation_uses_linear_membership_operations() -> None:
+    nodeids = tuple(_CountingNodeId(f"node-{index}") for index in range(2_000))
+    reports = tuple(
+        ValidatedPhaseReport(
+            nodeid,
+            "call",
+            "passed",
+            0.0,
+            None,
+            ValidatedExpectedFailure("none", None, None, False),
+        )
+        for nodeid in reversed(nodeids)
+    )
+    validated = ValidatedPytestSession(
+        pytest_version="8.4.2",
+        exit_code=0,
+        effective_args=(),
+        semantic_options={},
+        collection={
+            "final_nodeids": nodeids,
+            "deselected_nodeids": (),
+            "errors": (),
+            "skips": (),
+        },
+        reports=reports,
+        flags={},
+        session={},
+    )
+    _CountingNodeId.comparisons = 0
+
+    evidence, terminal = _build_evidence(validated)
+
+    assert evidence.counts.passed == len(nodeids)
+    assert terminal == set(nodeids)
+    assert _CountingNodeId.comparisons < len(nodeids) * 10
+
+
 @pytest.mark.parametrize(
     ("defect", "expected_code"),
     (("primary-spawn", "spawn_failed"), ("primary-signal", "terminated_by_signal")),
@@ -899,8 +1105,16 @@ def test_scope_classifies_known_neutral_narrowing_unknown_and_collection_reasons
     options["collection_paths"] = []
     collection = cast(dict[str, object], document["collection"])
     if mutate == "deselected":
+        collection["initial_nodeids"] = [
+            "tests/test_ok.py::test_ok",
+            "gone",
+        ]
         collection["deselected_nodeids"] = ["gone"]
     elif mutate == "reduced":
+        collection["initial_nodeids"] = [
+            "tests/test_ok.py::test_ok",
+            "gone",
+        ]
         collection["uncovered_removed_nodeids"] = ["gone"]
     result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
 
@@ -1002,6 +1216,11 @@ def test_scope_uses_fixed_reason_order_for_semantic_mutation_and_incomplete_sess
     options["collection_paths"] = []
     options["keyword"] = "injected"
     collection = cast(dict[str, object], document["collection"])
+    collection["initial_nodeids"] = [
+        "tests/test_ok.py::test_ok",
+        "gone",
+        "missing",
+    ]
     collection["deselected_nodeids"] = ["gone"]
     collection["uncovered_removed_nodeids"] = ["missing"]
     changed = _with_document(check, document)

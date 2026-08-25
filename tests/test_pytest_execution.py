@@ -416,8 +416,12 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
             artifact_path = Path(env["PYREPO_CHECK_PYTEST_JSON"])
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
             artifact_path.write_bytes(b'{"raw":true}')
-            (writer_directory / "pytest-writer-z.json").write_text('{"writer_id":"z"}')
-            (writer_directory / "pytest-writer-a.json").write_text('{"writer_id":"a"}')
+            (writer_directory / "pytest-writer-z.json").write_text(
+                '{"schema_version":1,"writer_id":"z","pid":2}'
+            )
+            (writer_directory / "pytest-writer-a.json").write_text(
+                '{"schema_version":1,"writer_id":"a","pid":1}'
+            )
         return completed(
             command,
             0,
@@ -439,17 +443,37 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
     ("marker_payloads", "writer_ids", "diagnostic"),
     [
         ({}, (), None),
-        ({"pytest-writer-one.json": '{"writer_id":"one"}'}, ("one",), None),
         (
             {
-                "pytest-writer-b.json": '{"writer_id":"b"}',
-                "pytest-writer-a.json": '{"writer_id":"a"}',
+                "pytest-writer-one.json": (
+                    '{"schema_version":1,"writer_id":"one","pid":1}'
+                )
+            },
+            ("one",),
+            None,
+        ),
+        (
+            {
+                "pytest-writer-b.json": (
+                    '{"schema_version":1,"writer_id":"b","pid":2}'
+                ),
+                "pytest-writer-a.json": (
+                    '{"schema_version":1,"writer_id":"a","pid":1}'
+                ),
             },
             ("a", "b"),
             None,
         ),
         ({"pytest-writer-bad.json": "not-json"}, (), "malformed"),
-        ({"pytest-writer-one.json": '{"writer_id":"other"}'}, (), "ID mismatch"),
+        (
+            {
+                "pytest-writer-one.json": (
+                    '{"schema_version":1,"writer_id":"other","pid":1}'
+                )
+            },
+            (),
+            "ID mismatch",
+        ),
     ],
     ids=("zero", "one", "multiple", "malformed", "mismatched-id"),
 )
@@ -492,6 +516,65 @@ def test_writer_inventory_records_only_regular_valid_markers(
         assert observation.pytest.artifact.diagnostic is None
     else:
         assert diagnostic in (observation.pytest.artifact.diagnostic or "")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        "[]",
+        '{"writer_id":"one","pid":1}',
+        '{"schema_version":2,"writer_id":"one","pid":1}',
+        '{"schema_version":true,"writer_id":"one","pid":1}',
+        '{"schema_version":1,"writer_id":1,"pid":1}',
+        '{"schema_version":1,"writer_id":"other","pid":1}',
+        '{"schema_version":1,"writer_id":"one"}',
+        '{"schema_version":1,"writer_id":"one","pid":true}',
+        '{"schema_version":1,"writer_id":"one","pid":-1}',
+    ),
+    ids=(
+        "not-object",
+        "missing-version",
+        "wrong-version",
+        "boolean-version",
+        "non-string-id",
+        "identity-mismatch",
+        "missing-pid",
+        "boolean-pid",
+        "negative-pid",
+    ),
+)
+def test_writer_inventory_rejects_malformed_marker_shapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+) -> None:
+    safe_run_directory(tmp_path, monkeypatch)
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        del cwd, check, capture_output
+        if env is not None and command[1:3] == ("-m", "pytest"):
+            Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
+            writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
+            (writer_directory / "pytest-writer-one.json").write_text(payload)
+        return completed(
+            command,
+            0,
+            stdout=preflight_document() if command[1] == "-c" else b"",
+            stderr=b"",
+        )
+
+    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+
+    assert observation.pytest is not None
+    assert observation.pytest.artifact.writer_ids == ()
+    assert "writer marker" in (observation.pytest.artifact.diagnostic or "")
 
 
 @pytest.mark.parametrize(
@@ -647,7 +730,9 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
 ) -> None:
     safe_run_directory(tmp_path, monkeypatch)
     replacement = tmp_path / "replacement"
-    replacement.write_text('{"writer_id":"attacker"}')
+    replacement.write_text(
+        '{"schema_version":1,"writer_id":"attacker","pid":999}'
+    )
     open_calls: list[Path] = []
     original_open = pytest_execution.os.open
 
@@ -679,7 +764,9 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
         if env is not None and command[1:3] == ("-m", "pytest"):
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
-            (writer_directory / "pytest-writer-safe.json").write_text('{"writer_id":"safe"}')
+            (writer_directory / "pytest-writer-safe.json").write_text(
+                '{"schema_version":1,"writer_id":"safe","pid":1}'
+            )
         return completed(
             command,
             0,
@@ -738,7 +825,7 @@ def test_cleanup_failure_is_observed_without_losing_snapshot(
     assert observation.pytest.cleanup_error == "PermissionError: cleanup denied"
 
 
-def test_setup_failure_is_observed_and_the_created_run_directory_is_removed(
+def test_setup_failure_is_typed_not_started_and_the_created_run_directory_is_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -754,7 +841,7 @@ def test_setup_failure_is_observed_and_the_created_run_directory_is_removed(
 
     assert observation.processes == ()
     assert observation.pytest is not None
-    assert observation.pytest.preflight.classification == "spawn_failed"
+    assert observation.pytest.preflight.classification == "not_started"
     assert observation.pytest.artifact.state == "not_attempted"
     assert not run_directory.exists()
 

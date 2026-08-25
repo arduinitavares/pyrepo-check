@@ -171,7 +171,7 @@ def execute_pytest(
             artifact = _snapshot_artifact(artifact_path, writer_directory)
     except OSError as error:
         preflight = PytestPreflightObservation(
-            "spawn_failed",
+            "not_started",
             None,
             f"{type(error).__name__}: {error}",
         )
@@ -393,7 +393,28 @@ def _snapshot_writer_ids(writer_directory: Path) -> tuple[tuple[str, ...], str |
         except (_UnsafePathError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             diagnostics.append(f"writer marker is malformed: {marker_path.name}: {error}")
             continue
-        if not isinstance(document, dict) or document.get("writer_id") != marker_id:
+        if not isinstance(document, dict):
+            diagnostics.append(f"writer marker is malformed: {marker_path.name}: root must be an object")
+            continue
+        schema_version = document.get("schema_version")
+        writer_id = document.get("writer_id")
+        pid = document.get("pid")
+        if type(schema_version) is not int or schema_version != 1:
+            diagnostics.append(
+                f"writer marker is malformed: {marker_path.name}: schema_version must be integer 1"
+            )
+            continue
+        if not isinstance(writer_id, str):
+            diagnostics.append(
+                f"writer marker is malformed: {marker_path.name}: writer_id must be a string"
+            )
+            continue
+        if type(pid) is not int or pid < 0:
+            diagnostics.append(
+                f"writer marker is malformed: {marker_path.name}: pid must be a non-negative integer"
+            )
+            continue
+        if writer_id != marker_id:
             diagnostics.append(f"writer marker ID mismatch: {marker_path.name}")
             continue
         writer_ids.append(marker_id)

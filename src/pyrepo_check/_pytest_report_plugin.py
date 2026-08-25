@@ -36,7 +36,11 @@ class _Evidence:
         self.unsupported_parallelism = False
         self.unsupported_retries = False
         self.worker_metadata = False
-        self._deselected_during_collection: list[str] | None = None
+        self._deselected_during_collection_set: set[str] | None = None
+        self._final_nodeid_set: set[str] = set()
+        self._observed_phase_keys: set[tuple[str, str | None]] = set()
+        self._terminal_nodeids: set[str] = set()
+        self._finalized = False
 
     @staticmethod
     def empty_semantic_options() -> dict[str, object]:
@@ -110,11 +114,14 @@ class _Evidence:
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, _ARTIFACT_PATH)
 
-    def has_terminal_outcome(self, nodeid: str) -> bool:
-        return any(
-            report["nodeid"] == nodeid and report["when"] in {"call", "teardown"}
-            for report in self.reports
-        )
+    def finalize(self, exit_code: int, *, stopped_early: bool) -> None:
+        if self._finalized:
+            return
+        self.finishes += 1
+        self.exit_code = exit_code
+        self.stopped_early = stopped_early
+        self.publish("finalized")
+        self._finalized = True
 
 
 _EVIDENCE = _Evidence()
@@ -172,24 +179,24 @@ def pytest_collection_modifyitems(
 ) -> Generator[None, object, None]:
     _EVIDENCE.snapshot_semantic_options(config)
     _EVIDENCE.initial_nodeids = [item.nodeid for item in items]
-    _EVIDENCE._deselected_during_collection = []
+    _EVIDENCE._deselected_during_collection_set = set()
     yield
     _EVIDENCE.final_nodeids = [item.nodeid for item in items]
-    deselected = _EVIDENCE._deselected_during_collection
-    _EVIDENCE._deselected_during_collection = None
-    deselected_nodeids = set(deselected or [])
+    _EVIDENCE._final_nodeid_set = set(_EVIDENCE.final_nodeids)
+    deselected_nodeids = _EVIDENCE._deselected_during_collection_set or set()
+    _EVIDENCE._deselected_during_collection_set = None
     _EVIDENCE.uncovered_removed_nodeids = [
         nodeid
         for nodeid in _EVIDENCE.initial_nodeids
-        if nodeid not in _EVIDENCE.final_nodeids and nodeid not in deselected_nodeids
+        if nodeid not in _EVIDENCE._final_nodeid_set and nodeid not in deselected_nodeids
     ]
 
 
 def pytest_deselected(items: list[pytest.Item]) -> None:
     nodeids = [item.nodeid for item in items]
     _EVIDENCE.deselected_nodeids.extend(nodeids)
-    if _EVIDENCE._deselected_during_collection is not None:
-        _EVIDENCE._deselected_during_collection.extend(nodeids)
+    if _EVIDENCE._deselected_during_collection_set is not None:
+        _EVIDENCE._deselected_during_collection_set.update(nodeids)
 
 
 def pytest_collectreport(report: pytest.CollectReport) -> None:
@@ -211,10 +218,13 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     duration = report.duration if math.isfinite(report.duration) and report.duration >= 0 else 0.0
     wasxfail = getattr(report, "wasxfail", None)
     phase_key = (report.nodeid, report.when)
-    if any((item["nodeid"], item["when"]) == phase_key for item in _EVIDENCE.reports):
+    if phase_key in _EVIDENCE._observed_phase_keys:
         _EVIDENCE.unsupported_retries = True
+    _EVIDENCE._observed_phase_keys.add(phase_key)
     if report.outcome not in {"passed", "failed", "skipped"}:
         _EVIDENCE.unsupported_retries = True
+    if report.when in {"call", "teardown"}:
+        _EVIDENCE._terminal_nodeids.add(report.nodeid)
     _EVIDENCE.reports.append(
         {
             "nodeid": report.nodeid,
@@ -230,27 +240,22 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    _EVIDENCE.finishes += 1
-    _EVIDENCE.exit_code = exitstatus
-    _EVIDENCE.stopped_early = bool(
+    stopped_early = bool(
         session.shouldstop
         or session.shouldfail
         or (
             not _EVIDENCE.collection_errors
-            and any(
-                not _EVIDENCE.has_terminal_outcome(nodeid)
-                for nodeid in _EVIDENCE.final_nodeids
-            )
+            and not _EVIDENCE._final_nodeid_set.issubset(_EVIDENCE._terminal_nodeids)
         )
     )
-    _EVIDENCE.publish("finalized")
+    _EVIDENCE.finalize(exitstatus, stopped_early=stopped_early)
 
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_xdist_setupnodes(config: pytest.Config, specs: list[object]) -> None:
     if specs:
         _EVIDENCE.unsupported_parallelism = True
-        _EVIDENCE.publish("started")
+        _EVIDENCE.finalize(4, stopped_early=True)
         pytest.exit(returncode=4)
 
 

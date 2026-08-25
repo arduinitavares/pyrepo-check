@@ -31,8 +31,17 @@ def _write_test_shortcuts(root: Path, shortcuts: dict[str, object]) -> None:
     )
 
 
-def _write_live_pytest_consumer(root: Path, *, include_pytest: bool = True) -> None:
-    dependencies = '["pytest>=8,<9"]' if include_pytest else "[]"
+def _write_live_pytest_consumer(
+    root: Path,
+    *,
+    include_pytest: bool = True,
+    include_xdist: bool = False,
+) -> None:
+    dependencies = (
+        '["pytest>=8,<9", "pytest-xdist>=3.8,<4"]'
+        if include_xdist
+        else ('["pytest>=8,<9"]' if include_pytest else "[]")
+    )
     shortcut = (
         "\n[tool.pyrepo-check.test-shortcuts]\nunit = [\"tests/test_sample.py::test_selected\"]\n"
         if include_pytest
@@ -132,6 +141,38 @@ def test_structured_pytest_cli_stops_after_unsupported_preflight(tmp_path: Path)
     assert [process["role"] for process in payload["checks"][0]["processes"]] == [
         "pytest_preflight",
     ]
+
+
+def test_structured_pytest_cli_rejects_active_xdist_with_schema_valid_json(
+    tmp_path: Path,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_live_pytest_consumer(consumer, include_xdist=True)
+
+    completed = subprocess.run(  # nosec B603
+        (
+            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            "--format",
+            "json",
+            "pytest",
+            "--",
+            "-n",
+            "1",
+        ),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 4
+    assert completed.stderr == b""
+    assert payload["overall_status"] == "error"
+    assert payload["complete"] is False
+    assert payload["pytest"]["evidence"] is None
+    assert payload["pytest"]["error"]["code"] == "unsupported_parallelism"
+    assert payload["checks"][0]["error"]["code"] == "pytest_evidence_error"
 
 
 def _assert_planning_error_output(

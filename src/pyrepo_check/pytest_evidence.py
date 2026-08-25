@@ -294,9 +294,10 @@ def _build_evidence(
     validated: ValidatedPytestSession,
 ) -> tuple[PytestEvidence, set[str]]:
     final_nodeids = cast(tuple[str, ...], validated.collection["final_nodeids"])
+    final_nodeid_set = set(final_nodeids)
     phases_by_nodeid: dict[str, list[ValidatedPhaseReport]] = {}
     for report in validated.reports:
-        if report.nodeid in final_nodeids:
+        if report.nodeid in final_nodeid_set:
             phases_by_nodeid.setdefault(report.nodeid, []).append(report)
 
     counts = PytestCounts(0, 0, 0, 0, 0, 0)
@@ -611,7 +612,10 @@ def _validate_artifact(
         _object(_required(document, "semantic_options"), "semantic_options")
     )
     collection = _validate_collection(_object(_required(document, "collection"), "collection"))
-    reports, reports_have_retries = _validate_reports(_required(document, "reports"))
+    reports, reports_have_retries = _validate_reports(
+        _required(document, "reports"),
+        cast(tuple[str, ...], collection["final_nodeids"]),
+    )
     flags = _validate_flags(_object(_required(document, "flags"), "flags"))
     return (
         ValidatedPytestSession(
@@ -673,16 +677,63 @@ def _validate_semantic_options(value: dict[object, object]) -> Mapping[str, obje
 
 
 def _validate_collection(value: dict[object, object]) -> Mapping[str, object]:
+    initial_nodeids = tuple(
+        _strings(_required(value, "initial_nodeids"), "collection.initial_nodeids")
+    )
+    final_nodeids = tuple(
+        _strings(_required(value, "final_nodeids"), "collection.final_nodeids")
+    )
+    deselected_nodeids = tuple(
+        _strings(
+            _required(value, "deselected_nodeids"),
+            "collection.deselected_nodeids",
+        )
+    )
+    uncovered_removed_nodeids = tuple(
+        _strings(
+            _required(value, "uncovered_removed_nodeids"),
+            "collection.uncovered_removed_nodeids",
+        )
+    )
+    initial = _unique_nodeids(initial_nodeids, "collection.initial_nodeids")
+    final = _unique_nodeids(final_nodeids, "collection.final_nodeids")
+    deselected = _unique_nodeids(
+        deselected_nodeids, "collection.deselected_nodeids"
+    )
+    uncovered = _unique_nodeids(
+        uncovered_removed_nodeids, "collection.uncovered_removed_nodeids"
+    )
+    if not final.issubset(initial):
+        raise _ArtifactInvalid("collection.final_nodeids must be a subset of initial_nodeids")
+    if not deselected.issubset(initial):
+        raise _ArtifactInvalid(
+            "collection.deselected_nodeids must be a subset of initial_nodeids"
+        )
+    if not uncovered.issubset(initial):
+        raise _ArtifactInvalid(
+            "collection.uncovered_removed_nodeids must be a subset of initial_nodeids"
+        )
+    if final & deselected or final & uncovered or deselected & uncovered:
+        raise _ArtifactInvalid("pytest collection node sets must be pairwise disjoint")
+    if final | deselected | uncovered != initial:
+        raise _ArtifactInvalid("pytest collection node sets must account for initial_nodeids")
     return MappingProxyType(
         {
-            "initial_nodeids": tuple(_strings(_required(value, "initial_nodeids"), "collection.initial_nodeids")),
-            "final_nodeids": tuple(_strings(_required(value, "final_nodeids"), "collection.final_nodeids")),
-            "deselected_nodeids": tuple(_strings(_required(value, "deselected_nodeids"), "collection.deselected_nodeids")),
-            "uncovered_removed_nodeids": tuple(_strings(_required(value, "uncovered_removed_nodeids"), "collection.uncovered_removed_nodeids")),
+            "initial_nodeids": initial_nodeids,
+            "final_nodeids": final_nodeids,
+            "deselected_nodeids": deselected_nodeids,
+            "uncovered_removed_nodeids": uncovered_removed_nodeids,
             "errors": _issues(_required(value, "errors"), "collection.errors"),
             "skips": _issues(_required(value, "skips"), "collection.skips"),
         }
     )
+
+
+def _unique_nodeids(nodeids: tuple[str, ...], name: str) -> set[str]:
+    unique = set(nodeids)
+    if len(unique) != len(nodeids):
+        raise _ArtifactInvalid(f"{name} must contain unique node IDs")
+    return unique
 
 
 def _issues(value: object, name: str) -> tuple[Mapping[str, str], ...]:
@@ -702,15 +753,22 @@ def _issues(value: object, name: str) -> tuple[Mapping[str, str], ...]:
     return tuple(issues)
 
 
-def _validate_reports(value: object) -> tuple[tuple[ValidatedPhaseReport, ...], bool]:
+def _validate_reports(
+    value: object,
+    final_nodeids: tuple[str, ...],
+) -> tuple[tuple[ValidatedPhaseReport, ...], bool]:
     if not isinstance(value, list):
         raise _ArtifactInvalid("reports must be a list")
     raw_reports: list[tuple[str, Literal["setup", "call", "teardown"], Literal["passed", "failed", "skipped"], float, bool, str | None, str | None]] = []
     repeated_or_noncore = False
     seen: set[tuple[str, str]] = set()
+    phases_by_nodeid: dict[str, list[str]] = {}
+    final_nodeid_set = set(final_nodeids)
     for index, item in enumerate(value):
         report = _object(item, f"reports[{index}]")
         nodeid = _string(_required(report, "nodeid"), f"reports[{index}].nodeid")
+        if nodeid not in final_nodeid_set:
+            raise _ArtifactInvalid(f"reports[{index}].nodeid is not in final_nodeids")
         when_value = _string(_required(report, "when"), f"reports[{index}].when")
         outcome_value = _string(_required(report, "outcome"), f"reports[{index}].outcome")
         if when_value not in {"setup", "call", "teardown"}:
@@ -733,8 +791,25 @@ def _validate_reports(value: object) -> tuple[tuple[ValidatedPhaseReport, ...], 
         if (nodeid, when_value) in seen:
             repeated_or_noncore = True
         seen.add((nodeid, when_value))
+        phases_by_nodeid.setdefault(nodeid, []).append(when_value)
         raw_reports.append((nodeid, phase, outcome, duration, present, wasxfail, longrepr))
+    if not repeated_or_noncore:
+        _validate_phase_sequences(phases_by_nodeid)
     return _normalize_expected_failures(raw_reports), repeated_or_noncore
+
+
+def _validate_phase_sequences(phases_by_nodeid: dict[str, list[str]]) -> None:
+    allowed = {
+        ("setup",),
+        ("setup", "call"),
+        ("setup", "teardown"),
+        ("setup", "call", "teardown"),
+    }
+    for nodeid, phases in phases_by_nodeid.items():
+        if tuple(phases) not in allowed:
+            raise _ArtifactInvalid(
+                f"pytest reports for {nodeid} have an impossible phase sequence"
+            )
 
 
 def _normalize_expected_failures(

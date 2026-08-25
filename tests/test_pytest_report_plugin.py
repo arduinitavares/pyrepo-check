@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,10 +9,21 @@ import shutil
 from stat import S_IMODE
 import subprocess  # nosec B404
 import sys
+from types import ModuleType
 from typing import cast
 import uuid
 
 import pytest
+
+
+class _CountingNodeId(str):
+    comparisons = 0
+
+    def __eq__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return super().__eq__(other)
+
+    __hash__ = str.__hash__
 
 
 @dataclass(frozen=True)
@@ -84,6 +96,107 @@ def run_plugin_project(
         marker_paths,
         project,
     )
+
+
+def _load_plugin_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ModuleType:
+    artifact_directory = tmp_path / "direct-plugin-artifacts"
+    artifact_directory.mkdir()
+    writer_directory = artifact_directory / "writers"
+    writer_directory.mkdir()
+    monkeypatch.setenv(
+        "PYREPO_CHECK_PYTEST_JSON",
+        str(artifact_directory / "artifact.json"),
+    )
+    monkeypatch.setenv("PYREPO_CHECK_PYTEST_WRITER_DIR", str(writer_directory))
+    module_path = Path(__file__).parents[1] / "src/pyrepo_check/_pytest_report_plugin.py"
+    spec = importlib.util.spec_from_file_location(
+        f"direct_pytest_report_plugin_{uuid.uuid4().hex}",
+        module_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_plugin_collection_and_phase_tracking_use_linear_membership_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+    evidence = module._Evidence()
+    setattr(module, "_EVIDENCE", evidence)
+    nodeids = [_CountingNodeId(f"node-{index}") for index in range(2_000)]
+
+    class Item:
+        def __init__(self, nodeid: str) -> None:
+            self.nodeid = nodeid
+
+    class Option:
+        keyword = ""
+        markexpr = ""
+        deselect: list[str] = []
+        ignore: list[str] = []
+        ignore_glob: list[str] = []
+        lf = False
+        pyargs = False
+        collectonly = False
+        setuponly = False
+        setupplan = False
+
+    class Config:
+        option = Option()
+
+        @staticmethod
+        def getoption(_name: str, *, default: object) -> object:
+            return default
+
+    items = [Item(nodeid) for nodeid in nodeids]
+    wrapper = module.pytest_collection_modifyitems(None, Config(), items)
+    next(wrapper)
+    deselected = items[1::4]
+    module.pytest_deselected(deselected)
+    items[:] = items[::2]
+    _CountingNodeId.comparisons = 0
+    with pytest.raises(StopIteration):
+        next(wrapper)
+
+    class Report:
+        duration = 0.0
+        outcome = "passed"
+        when = "call"
+        longrepr = None
+
+        def __init__(self, nodeid: str) -> None:
+            self.nodeid = nodeid
+
+    for nodeid in reversed(nodeids):
+        module.pytest_runtest_logreport(Report(nodeid))
+
+    assert evidence.final_nodeids == nodeids[::2]
+    assert evidence.deselected_nodeids == nodeids[1::4]
+    assert evidence.uncovered_removed_nodeids == nodeids[3::4]
+    assert [report["nodeid"] for report in evidence.reports] == list(reversed(nodeids))
+    assert _CountingNodeId.comparisons < len(nodeids) * 10
+
+
+def test_plugin_finalization_is_idempotent_after_an_early_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_plugin_module(tmp_path, monkeypatch)
+    evidence = module._Evidence()
+    evidence.starts = 1
+
+    evidence.finalize(4, stopped_early=True)
+    evidence.finalize(4, stopped_early=True)
+
+    assert evidence.finishes == 1
+    assert evidence.exit_code == 4
+    assert evidence.stopped_early is True
 
 
 def test_plugin_finalizes_one_atomic_session_for_a_passing_test(tmp_path: Path) -> None:
@@ -464,6 +577,14 @@ def test_plugin_rejects_xdist_before_a_worker_can_import_tests(tmp_path: Path) -
     )
 
     assert run.completed.returncode == 4
+    assert run.artifact["state"] == "finalized"
+    assert run.artifact["session"] == {
+        "starts": 1,
+        "finishes": 1,
+        "exit_code": 4,
+        "collection_completed": False,
+        "stopped_early": True,
+    }
     assert run.artifact["flags"] == {
         "unsupported_parallelism": True,
         "unsupported_retries": False,
