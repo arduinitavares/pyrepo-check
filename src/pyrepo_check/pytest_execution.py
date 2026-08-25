@@ -654,102 +654,104 @@ def _snapshot_writer_ids(
     diagnostics: list[str] = []
     writer_descriptor: int | None = None
     try:
-        if run_descriptor is None:
-            entries = os.scandir(writer_directory)
-        else:
-            writer_descriptor = os.open(
-                writer_directory.name,
-                _secure_directory_open_flags(),
-                dir_fd=run_descriptor,
+        try:
+            if run_descriptor is None:
+                entries = os.scandir(writer_directory)
+            else:
+                writer_descriptor = os.open(
+                    writer_directory.name,
+                    _secure_directory_open_flags(),
+                    dir_fd=run_descriptor,
+                )
+                os.set_inheritable(writer_descriptor, False)
+                entries = os.scandir(writer_descriptor)
+        except OSError as error:
+            return (), f"writer inventory failed: {error}"
+        marker_seen = False
+        try:
+            with entries:
+                for entry_count, entry in enumerate(entries, start=1):
+                    retained_ids = (writer_id,) if writer_id is not None else ()
+                    if entry_count > _MAX_WRITER_DIRECTORY_ENTRIES:
+                        diagnostics.append(
+                            f"writer directory contains more than "
+                            f"{_MAX_WRITER_DIRECTORY_ENTRIES} entries"
+                        )
+                        return retained_ids, "; ".join(diagnostics)
+                    marker_id = _marker_id(entry.name)
+                    if marker_id is None:
+                        continue
+                    if marker_seen:
+                        diagnostics.append("multiple writer markers were found")
+                        return retained_ids, "; ".join(diagnostics)
+                    marker_seen = True
+                    try:
+                        loaded_document = _load_bounded_json(
+                            _read_regular_file(
+                                Path(entry.path)
+                                if writer_descriptor is None
+                                else Path(entry.name),
+                                max_bytes=_MAX_WRITER_MARKER_BYTES,
+                                dir_fd=writer_descriptor,
+                            )
+                        )
+                    except (
+                        _UnsafePathError,
+                        _BoundedReadError,
+                        OSError,
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        ValueError,
+                    ) as error:
+                        diagnostics.append(f"writer marker is malformed: {entry.name}: {error}")
+                        continue
+                    if not isinstance(loaded_document, dict):
+                        diagnostics.append(
+                            f"writer marker is malformed: {entry.name}: root must be an object"
+                        )
+                        continue
+                    document = cast(dict[object, object], loaded_document)
+                    schema_version = document.get("schema_version")
+                    document_writer_id = document.get("writer_id")
+                    pid = document.get("pid")
+                    if type(schema_version) is not int or schema_version != 1:
+                        diagnostics.append(
+                            f"writer marker is malformed: {entry.name}: "
+                            "schema_version must be integer 1"
+                        )
+                        continue
+                    if not isinstance(document_writer_id, str):
+                        diagnostics.append(
+                            f"writer marker is malformed: {entry.name}: "
+                            "writer_id must be a string"
+                        )
+                        continue
+                    if type(pid) is not int or pid < 0:
+                        diagnostics.append(
+                            f"writer marker is malformed: {entry.name}: "
+                            "pid must be a non-negative integer"
+                        )
+                        continue
+                    if document_writer_id != marker_id:
+                        diagnostics.append(f"writer marker ID mismatch: {entry.name}")
+                        continue
+                    writer_id = marker_id
+        except OSError as error:
+            retained_ids = (writer_id,) if writer_id is not None else ()
+            qualification = (
+                f" after validated writer {writer_id}" if writer_id is not None else ""
             )
-            os.set_inheritable(writer_descriptor, False)
-            entries = os.scandir(writer_descriptor)
-    except OSError as error:
+            diagnostics.append(
+                f"writer inventory failed{qualification}: {type(error).__name__}: {error}"
+            )
+            return retained_ids, "; ".join(diagnostics)
+        return ((writer_id,) if writer_id is not None else ()), "; ".join(diagnostics) or None
+    finally:
         if writer_descriptor is not None:
             try:
                 os.close(writer_descriptor)
             except OSError:
                 pass
-        return (), f"writer inventory failed: {error}"
-    marker_seen = False
-    try:
-        with entries:
-            for entry_count, entry in enumerate(entries, start=1):
-                retained_ids = (writer_id,) if writer_id is not None else ()
-                if entry_count > _MAX_WRITER_DIRECTORY_ENTRIES:
-                    diagnostics.append(
-                        f"writer directory contains more than "
-                        f"{_MAX_WRITER_DIRECTORY_ENTRIES} entries"
-                    )
-                    return retained_ids, "; ".join(diagnostics)
-                marker_id = _marker_id(entry.name)
-                if marker_id is None:
-                    continue
-                if marker_seen:
-                    diagnostics.append("multiple writer markers were found")
-                    return retained_ids, "; ".join(diagnostics)
-                marker_seen = True
-                try:
-                    loaded_document = _load_bounded_json(
-                        _read_regular_file(
-                            Path(entry.path)
-                            if writer_descriptor is None
-                            else Path(entry.name),
-                            max_bytes=_MAX_WRITER_MARKER_BYTES,
-                            dir_fd=writer_descriptor,
-                        )
-                    )
-                except (
-                    _UnsafePathError,
-                    _BoundedReadError,
-                    OSError,
-                    UnicodeDecodeError,
-                    json.JSONDecodeError,
-                    ValueError,
-                ) as error:
-                    diagnostics.append(f"writer marker is malformed: {entry.name}: {error}")
-                    continue
-                if not isinstance(loaded_document, dict):
-                    diagnostics.append(
-                        f"writer marker is malformed: {entry.name}: root must be an object"
-                    )
-                    continue
-                document = cast(dict[object, object], loaded_document)
-                schema_version = document.get("schema_version")
-                document_writer_id = document.get("writer_id")
-                pid = document.get("pid")
-                if type(schema_version) is not int or schema_version != 1:
-                    diagnostics.append(
-                        f"writer marker is malformed: {entry.name}: "
-                        "schema_version must be integer 1"
-                    )
-                    continue
-                if not isinstance(document_writer_id, str):
-                    diagnostics.append(
-                        f"writer marker is malformed: {entry.name}: "
-                        "writer_id must be a string"
-                    )
-                    continue
-                if type(pid) is not int or pid < 0:
-                    diagnostics.append(
-                        f"writer marker is malformed: {entry.name}: "
-                        "pid must be a non-negative integer"
-                    )
-                    continue
-                if document_writer_id != marker_id:
-                    diagnostics.append(f"writer marker ID mismatch: {entry.name}")
-                    continue
-                writer_id = marker_id
-    except OSError as error:
-        retained_ids = (writer_id,) if writer_id is not None else ()
-        qualification = (
-            f" after validated writer {writer_id}" if writer_id is not None else ""
-        )
-        diagnostics.append(
-            f"writer inventory failed{qualification}: {type(error).__name__}: {error}"
-        )
-        return retained_ids, "; ".join(diagnostics)
-    return ((writer_id,) if writer_id is not None else ()), "; ".join(diagnostics) or None
 
 
 def _marker_id(name: str) -> str | None:

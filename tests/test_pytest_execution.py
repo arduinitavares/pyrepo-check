@@ -280,6 +280,61 @@ def test_writer_directory_entry_cap_is_exact(
         assert "more than 1024 entries" in diagnostic
 
 
+@pytest.mark.parametrize(
+    "case",
+    ("success", "entry-cap-early-return"),
+)
+def test_descriptor_relative_writer_snapshot_closes_inventory_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    writer_directory = tmp_path / "writers"
+    writer_directory.mkdir()
+    if case == "success":
+        (writer_directory / "pytest-writer-one.json").write_text(
+            '{"schema_version":1,"writer_id":"one","pid":1}'
+        )
+    else:
+        for index in range(pytest_execution._MAX_WRITER_DIRECTORY_ENTRIES + 1):
+            (writer_directory / f"unrelated-{index}").touch()
+
+    original_open = os.open
+    inventory_descriptors: list[int] = []
+    run_descriptor = original_open(tmp_path, pytest_execution._secure_directory_open_flags())
+
+    def capture_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if dir_fd == run_descriptor:
+            inventory_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(pytest_execution.os, "open", capture_open)
+    try:
+        writer_ids, diagnostic = pytest_execution._snapshot_writer_ids(
+            writer_directory,
+            run_descriptor=run_descriptor,
+        )
+        if case == "success":
+            assert writer_ids == ("one",)
+            assert diagnostic is None
+        else:
+            assert writer_ids == ()
+            assert diagnostic == "writer directory contains more than 1024 entries"
+
+        assert len(inventory_descriptors) == 1
+        with pytest.raises(OSError):
+            os.fstat(inventory_descriptors[0])
+    finally:
+        os.close(run_descriptor)
+
+
 def test_second_writer_marker_stops_before_reading_any_later_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
