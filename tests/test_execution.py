@@ -6,7 +6,7 @@ import subprocess  # nosec B404
 
 import pytest
 
-from pyrepo_check.execution import ExecutionResult, execute_plan
+from pyrepo_check.execution import ExecutedProcess, ExecutionResult, execute_plan
 from pyrepo_check.planning import OutputFormat, PlannedCheck, RunPlan
 from tests.support import RecordingRunner
 
@@ -59,7 +59,17 @@ def test_zero_return_codes_produce_exit_zero(tmp_path: Path) -> None:
 
     assert isinstance(result, ExecutionResult)
     assert result.exit_code == 0
-    assert tuple(check.returncode for check in result.checks) == (0, 0)
+    assert tuple(
+        process.returncode for check in result.checks for process in check.processes
+    ) == (0, 0)
+    assert all(
+        len(check.processes) == 1
+        and isinstance(check.processes[0], ExecutedProcess)
+        and check.processes[0].role == "primary"
+        and check.processes[0].command == check.planned.command
+        and check.processes[0].cwd == check.planned.cwd
+        for check in result.checks
+    )
 
 
 def test_terminal_commands_run_in_plan_order_with_exact_arguments(tmp_path: Path) -> None:
@@ -110,7 +120,7 @@ def test_json_commands_capture_output_without_printing_banner(
 
     assert [call.capture_output for call in runner.calls] == [True, True]
     assert capsys.readouterr().out == ""
-    assert [(check.stdout, check.stderr) for check in result.checks] == [
+    assert [(check.processes[0].stdout, check.processes[0].stderr) for check in result.checks] == [
         (b"first", b""),
         (b"second", b"error"),
     ]
@@ -122,7 +132,7 @@ def test_terminal_observations_do_not_claim_uncaptured_output(tmp_path: Path) ->
         runner=RecordingRunner(stdout=(b"ignored",), stderr=(b"ignored",)),
     )
 
-    assert [(check.stdout, check.stderr) for check in result.checks] == [
+    assert [(check.processes[0].stdout, check.processes[0].stderr) for check in result.checks] == [
         (None, None),
         (None, None),
     ]
@@ -145,7 +155,7 @@ def test_duration_rounds_to_nearest_millisecond(
         clock_ns=lambda: next(clock_values),
     )
 
-    assert result.checks[0].duration_ms == duration_ms
+    assert result.checks[0].processes[0].duration_ms == duration_ms
 
 
 def test_backwards_clock_clamps_duration_to_zero(tmp_path: Path) -> None:
@@ -157,7 +167,7 @@ def test_backwards_clock_clamps_duration_to_zero(tmp_path: Path) -> None:
         clock_ns=lambda: next(clock_values),
     )
 
-    assert result.checks[0].duration_ms == 0
+    assert result.checks[0].processes[0].duration_ms == 0
 
 
 @pytest.mark.parametrize("output_format", ["terminal", "json"])
@@ -216,7 +226,9 @@ def test_negative_return_codes_are_recorded_and_later_checks_run(tmp_path: Path)
 
     result = execute_plan(make_plan(tmp_path), runner=runner)
 
-    assert tuple(check.returncode for check in result.checks) == (-9, 4)
+    assert tuple(
+        process.returncode for check in result.checks for process in check.processes
+    ) == (-9, 4)
     assert result.exit_code == 4
     assert len(runner.calls) == 2
 
@@ -235,10 +247,10 @@ def test_spawn_errors_are_recorded_and_later_checks_run(
         clock_ns=lambda: next(clock_values),
     )
 
-    assert result.checks[0].returncode is None
-    assert result.checks[0].duration_ms == 1
-    assert result.checks[0].spawn_error == f"{type(error).__name__}: {error}"
-    assert result.checks[1].returncode == 0
+    assert result.checks[0].processes[0].returncode is None
+    assert result.checks[0].processes[0].duration_ms == 1
+    assert result.checks[0].processes[0].spawn_error == f"{type(error).__name__}: {error}"
+    assert result.checks[1].processes[0].returncode == 0
     assert len(runner.calls) == 2
 
 

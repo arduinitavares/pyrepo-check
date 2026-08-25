@@ -5,7 +5,7 @@ import pytest
 
 from pyrepo_check.cli import main
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.execution import ExecutedCheck, ExecutionResult, ProcessRunner
+from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult, ProcessRunner
 from pyrepo_check.planning import (
     PlannedCheck,
     PlanningFacts,
@@ -53,6 +53,32 @@ def _assert_planning_error_output(
         ).encode()
 
 
+def executed_check(
+    planned: PlannedCheck,
+    returncode: int | None,
+    *,
+    duration_ms: int = 1,
+    stdout: bytes | None = None,
+    stderr: bytes | None = None,
+    spawn_error: str | None = None,
+) -> ExecutedCheck:
+    return ExecutedCheck(
+        planned=planned,
+        processes=(
+            ExecutedProcess(
+                role="primary",
+                command=planned.command,
+                cwd=planned.cwd,
+                returncode=returncode,
+                duration_ms=duration_ms,
+                stdout=stdout,
+                stderr=stderr,
+                spawn_error=spawn_error,
+            ),
+        ),
+    )
+
+
 def test_cli_builds_request_and_executes_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -87,14 +113,7 @@ def test_cli_builds_request_and_executes_plan(
         assert runner is injected_runner
         return ExecutionResult(
             checks=(
-                ExecutedCheck(
-                    planned=planned_check,
-                    returncode=7,
-                    duration_ms=1,
-                    stdout=None,
-                    stderr=None,
-                    spawn_error=None,
-                ),
+                executed_check(planned_check, 7),
             ),
             exit_code=7,
         )
@@ -733,14 +752,7 @@ def test_json_malformed_execution_cardinality_uses_reporting_fallback(
     (tmp_path / "src").mkdir()
 
     def observed(check: PlannedCheck, returncode: int) -> ExecutedCheck:
-        return ExecutedCheck(
-            planned=check,
-            returncode=returncode,
-            duration_ms=1,
-            stdout=b"",
-            stderr=b"",
-            spawn_error=None,
-        )
+        return executed_check(check, returncode, stdout=b"", stderr=b"")
 
     def malformed_execution(
         plan: RunPlan,
@@ -798,14 +810,7 @@ def test_json_missing_execution_observation_is_a_schema_valid_error_report(
     ) -> ExecutionResult:
         del runner
         ty = plan.checks[1]
-        observation = ExecutedCheck(
-            planned=ty,
-            returncode=0,
-            duration_ms=1,
-            stdout=b"",
-            stderr=b"",
-            spawn_error=None,
-        )
+        observation = executed_check(ty, 0, stdout=b"", stderr=b"")
         return ExecutionResult(checks=(observation,), exit_code=0)
 
     monkeypatch.setattr("pyrepo_check.cli.execute_plan", incomplete_execution)

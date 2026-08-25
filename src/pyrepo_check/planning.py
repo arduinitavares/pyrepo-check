@@ -76,10 +76,18 @@ class PlanningFacts:
 
 
 @dataclass(frozen=True)
+class PytestExecutionPlan:
+    consumer_python: tuple[str, ...]
+    pytest_args: tuple[str, ...]
+    artifact_protocol: Literal["pytest_v1"] = "pytest_v1"
+
+
+@dataclass(frozen=True)
 class PlannedCheck:
     name: CheckName
     command: tuple[str, ...]
     cwd: Path
+    pytest: PytestExecutionPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -213,7 +221,7 @@ def build_checks(
     strict_all: bool = False,
     pytest_args: Sequence[str] | None = None,
 ) -> dict[str, PlannedCheck]:
-    prefix = _uv_python_prefix(config)
+    consumer_python = _uv_consumer_python(config)
     explicit_targets = tuple(targets)
     effective_pytest_args = (
         explicit_targets if pytest_args is None else tuple(pytest_args)
@@ -221,17 +229,22 @@ def build_checks(
     strict_targets = (".",) if strict_all and not explicit_targets else ()
     ruff_targets = explicit_targets or strict_targets or config.ruff_targets
     bandit_targets = explicit_targets or strict_targets or config.bandit_targets
+    pytest = PytestExecutionPlan(
+        consumer_python=consumer_python,
+        pytest_args=effective_pytest_args,
+    )
 
     return {
         "ruff": PlannedCheck(
             name="ruff",
-            command=(*prefix, "ruff", "check", *ruff_targets),
+            command=(*consumer_python, "-m", "ruff", "check", *ruff_targets),
             cwd=config.root,
         ),
         "annotations": PlannedCheck(
             name="annotations",
             command=(
-                *prefix,
+                *consumer_python,
+                "-m",
                 "ruff",
                 "check",
                 *ruff_targets,
@@ -245,7 +258,8 @@ def build_checks(
         "annotations-fix": PlannedCheck(
             name="annotations-fix",
             command=(
-                *prefix,
+                *consumer_python,
+                "-m",
                 "ruff",
                 "check",
                 *ruff_targets,
@@ -258,13 +272,14 @@ def build_checks(
         ),
         "ty": PlannedCheck(
             name="ty",
-            command=(*prefix, "ty", "check", *explicit_targets),
+            command=(*consumer_python, "-m", "ty", "check", *explicit_targets),
             cwd=config.root,
         ),
         "bandit": PlannedCheck(
             name="bandit",
             command=(
-                *prefix,
+                *consumer_python,
+                "-m",
                 "bandit",
                 "-c",
                 "pyproject.toml",
@@ -277,8 +292,9 @@ def build_checks(
         ),
         "pytest": PlannedCheck(
             name="pytest",
-            command=(*prefix, "pytest", *effective_pytest_args),
+            command=(*pytest.consumer_python, "-m", "pytest", *pytest.pytest_args),
             cwd=config.root,
+            pytest=pytest,
         ),
     }
 
@@ -328,10 +344,10 @@ def _is_path_like(token: str) -> bool:
     return any(marker in token for marker in ("/", "\\", "::")) or "." in Path(token).name
 
 
-def _uv_python_prefix(config: ProjectConfig) -> tuple[str, ...]:
+def _uv_consumer_python(config: ProjectConfig) -> tuple[str, ...]:
     if config.frozen:
-        return ("uv", "run", "--frozen", "python", "-m")
-    return ("uv", "run", "python", "-m")
+        return ("uv", "run", "--frozen", "python")
+    return ("uv", "run", "python")
 
 
 def _bandit_target_args(

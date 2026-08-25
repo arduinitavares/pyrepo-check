@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 import shlex
 import subprocess  # nosec B404
 import time
@@ -17,13 +18,21 @@ ProcessRunner = Callable[
 
 
 @dataclass(frozen=True)
-class ExecutedCheck:
-    planned: PlannedCheck
+class ExecutedProcess:
+    role: str
+    command: tuple[str, ...]
+    cwd: Path
     returncode: int | None
     duration_ms: int
     stdout: bytes | None
     stderr: bytes | None
     spawn_error: str | None
+
+
+@dataclass(frozen=True)
+class ExecutedCheck:
+    planned: PlannedCheck
+    processes: tuple[ExecutedProcess, ...]
 
 
 @dataclass(frozen=True)
@@ -78,25 +87,37 @@ def execute_plan(
         executed.append(
             ExecutedCheck(
                 planned=check,
-                returncode=returncode,
-                duration_ms=duration_ms,
-                stdout=stdout,
-                stderr=stderr,
-                spawn_error=spawn_error,
+                processes=(
+                    ExecutedProcess(
+                        role="primary",
+                        command=check.command,
+                        cwd=check.cwd,
+                        returncode=returncode,
+                        duration_ms=duration_ms,
+                        stdout=stdout,
+                        stderr=stderr,
+                        spawn_error=spawn_error,
+                    ),
+                ),
             )
         )
 
     first_positive = next(
         (
-            check.returncode
+            process.returncode
             for check in executed
-            if check.returncode is not None and check.returncode > 0
+            for process in check.processes
+            if process.returncode is not None and process.returncode > 0
         ),
         None,
     )
     if first_positive is not None:
         exit_code = first_positive
-    elif any(check.returncode is None or check.returncode < 0 for check in executed):
+    elif any(
+        process.returncode is None or process.returncode < 0
+        for check in executed
+        for process in check.processes
+    ):
         exit_code = 2
     else:
         exit_code = 0

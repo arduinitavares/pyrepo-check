@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 import pyrepo_check.reporting as reporting
-from pyrepo_check.execution import ExecutedCheck, ExecutionResult
+from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
@@ -56,11 +56,18 @@ def executed_check(
 ) -> ExecutedCheck:
     return ExecutedCheck(
         planned=planned,
-        returncode=returncode,
-        duration_ms=duration_ms,
-        stdout=stdout,
-        stderr=stderr,
-        spawn_error=spawn_error,
+        processes=(
+            ExecutedProcess(
+                role="primary",
+                command=planned.command,
+                cwd=planned.cwd,
+                returncode=returncode,
+                duration_ms=duration_ms,
+                stdout=stdout,
+                stderr=stderr,
+                spawn_error=spawn_error,
+            ),
+        ),
     )
 
 

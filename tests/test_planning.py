@@ -7,6 +7,7 @@ from pyrepo_check.planning import (
     PlannedCheck,
     PlanningFacts,
     PlanningFailure,
+    PytestExecutionPlan,
     RunPlan,
     RunRequest,
     build_checks as build_planned_checks,
@@ -177,6 +178,55 @@ def test_plans_authoritative_pytest_scope_metadata(
 
     assert plan.pytest_args == expected_args
     assert plan.planned_test_scope == expected_scope
+
+
+@pytest.mark.parametrize(
+    ("positionals", "shortcut", "frozen", "expected_args"),
+    (
+        (("pytest", "tests/test_cli.py::test_name"), None, False, ("tests/test_cli.py::test_name",)),
+        (("pytest",), "unit", True, ("tests/unit", "-m", "not slow")),
+    ),
+)
+def test_pytest_execution_plan_exposes_consumer_command_and_pytest_args(
+    tmp_path: Path,
+    positionals: tuple[str, ...],
+    shortcut: str | None,
+    frozen: bool,
+    expected_args: tuple[str, ...],
+) -> None:
+    plan = plan_run(
+        RunRequest(tmp_path, positionals, False, False, test_shortcut=shortcut),
+        make_config(
+            tmp_path,
+            frozen=frozen,
+            test_shortcuts=(ConfigTestShortcut("unit", ("tests/unit", "-m", "not slow")),),
+        ),
+        PlanningFacts(frozenset()),
+    )
+    pytest_check = plan.checks[0]
+
+    assert isinstance(pytest_check.pytest, PytestExecutionPlan)
+    assert pytest_check.pytest.consumer_python == (
+        "uv",
+        "run",
+        *(("--frozen",) if frozen else ()),
+        "python",
+    )
+    assert pytest_check.pytest.pytest_args == expected_args
+    assert pytest_check.pytest.artifact_protocol == "pytest_v1"
+    assert pytest_check.command == (
+        *pytest_check.pytest.consumer_python,
+        "-m",
+        "pytest",
+        *pytest_check.pytest.pytest_args,
+    )
+
+
+def test_pytest_execution_plan_is_not_attached_to_ordinary_checks(tmp_path: Path) -> None:
+    checks = build_planned_checks(make_config(tmp_path, frozen=True))
+
+    assert isinstance(checks["pytest"].pytest, PytestExecutionPlan)
+    assert all(check.pytest is None for name, check in checks.items() if name != "pytest")
 
 
 def test_builds_legacy_frozen_command_matrix(tmp_path: Path) -> None:

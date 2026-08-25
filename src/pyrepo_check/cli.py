@@ -184,9 +184,10 @@ def _write_reporting_fallback(error: Exception) -> None:
 def _fallback_exit_code(execution: ExecutionResult) -> int:
     first_positive = next(
         (
-            check.returncode
+            process.returncode
             for check in execution.checks
-            if check.returncode is not None and check.returncode > 0
+            for process in check.processes
+            if process.returncode is not None and process.returncode > 0
         ),
         None,
     )

@@ -7,7 +7,7 @@ import re
 from typing import Literal, cast
 
 from pyrepo_check.config import TEST_SHORTCUT_NAME_PATTERN
-from pyrepo_check.execution import ExecutedCheck, ExecutionResult
+from pyrepo_check.execution import ExecutedCheck, ExecutedProcess, ExecutionResult
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
@@ -734,8 +734,10 @@ def _build_check_result(
             ),
         )
 
+    if len(observation.processes) != 1:
+        raise ReportingError("ordinary check must contain exactly one primary process")
     process, status, error = _build_process_result(
-        observation,
+        observation.processes[0],
         output_format=output_format,
     )
     return CheckResult(
@@ -747,7 +749,7 @@ def _build_check_result(
 
 
 def _build_process_result(
-    observation: ExecutedCheck,
+    observation: ExecutedProcess,
     *,
     output_format: OutputFormat,
 ) -> tuple[ProcessResult, CheckStatus, CheckError | None]:
@@ -779,9 +781,9 @@ def _build_process_result(
 
     return (
         ProcessResult(
-            role="primary",
-            argv=observation.planned.command,
-            cwd=str(observation.planned.cwd.resolve()),
+            role=cast(ProcessRole, observation.role),
+            argv=observation.command,
+            cwd=str(observation.cwd.resolve()),
             outcome=outcome,
             exit_code=exit_code,
             signal=signal,
