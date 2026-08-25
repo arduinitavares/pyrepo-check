@@ -1,6 +1,6 @@
 # Agent-first quality reporting and focused test execution
 
-**Status:** Milestones A-B and C1 implemented and verified; C2-C3 and D designed and not implemented
+**Status:** Milestones A-B and C1-C2 implemented and verified; C3 and D designed and not implemented
 **Date:** 2026-08-24
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
@@ -9,17 +9,17 @@
 
 As of 2026-08-24, the prior research, design specification, Agent Skill, README
 guidance, repository cleanup, and Milestones A-B implementation are merged and
-pushed on `main`. C1 Test Shortcuts are implemented and verified. Structured
-pytest evidence, coverage execution, and repository coverage adoption remain
-unimplemented. Skill synchronization is explicitly deferred until after
-Milestone D.
+pushed on `main`. C1 Test Shortcuts and C2 structured pytest evidence are
+implemented and verified. C3 coverage execution and repository coverage
+adoption remain unimplemented. Agent Skill synchronization is explicitly
+deferred until after Milestone D.
 
 | Milestone | State | Evidence |
 | --- | --- | --- |
 | A | Implemented and verified | Planner/executor extraction and compatibility coverage. |
 | B | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
-| C2 — structured pytest evidence | Designed; not implemented | No pytest preflight/plugin or structured result exists. |
+| C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
 | C3 — coverage execution and guidance | Designed; not implemented | No coverage preflight/execution/result exists. |
 | D | Designed; not implemented | Repository coverage adoption. |
 
@@ -1337,7 +1337,7 @@ worktree files are never included.
 | A — planning and execution extraction | Implemented and verified | Pure planner tests, executor tests, compatibility tests, and strict gate pass. |
 | B — Agent Report and JSON | Implemented and verified | Terminal and JSON renderers, CLI `--format` integration, exact schema/nullability tests, spawn/signal continuation tests, and the strict `pyrepo-check --all` gate. |
 | C1 — Test Shortcuts | Implemented and verified | Eager config/grammar/path validation, planner expansion/conflict tests, schema-v1 selection, CLI terminal/JSON tests, and strict gate. |
-| C2 — structured pytest evidence | Designed; not implemented | No pytest preflight/plugin or structured result exists. |
+| C2 — structured pytest evidence | Implemented and verified | Pytest preflight, isolated one-run plugin evidence, typed result/reporting, pytest-8.0 through 8.4 matrix, full suite, and strict gate pass. |
 | C3 — coverage execution and guidance | Designed; not implemented | No coverage preflight/execution/result exists. |
 | D — repository coverage adoption | Designed; not implemented | No locked Coverage.py dependency or native coverage policy exists. |
 

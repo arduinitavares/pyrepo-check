@@ -84,10 +84,63 @@ pyrepo-check --format json --all
 
 Use `--format json` when an agent needs a machine-readable result. Its stdout
 is exactly one versioned JSON document followed by a newline; native tool
-stdout and stderr are captured inside that document. In C1, JSON reports the
-selected `test_shortcut`, its exact `pytest_args`, and a partial planned test
-scope. The top-level `pytest` and `coverage` evidence sections remain `null`;
-the selected pytest process is still listed in `selection.checks` and `checks`.
+stdout and stderr are captured inside that document. With pytest selected,
+C2 adds a non-null `pytest` result with trusted session evidence. For example:
+
+```bash
+pyrepo-check --format json pytest
+```
+
+```json
+{
+  "overall_status": "passed",
+  "complete": true,
+  "pytest": {
+    "status": "passed",
+    "complete": true,
+    "scope": "complete",
+    "scope_reasons": [],
+    "exit_code": 0,
+    "evidence": {
+      "collected": 12,
+      "deselected": 0,
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 1,
+        "xfailed": 1,
+        "xpassed": 0
+      },
+      "special_outcomes": [
+        {
+          "nodeid": "tests/test_example.py::test_optional",
+          "outcome": "skipped",
+          "reason": "optional dependency unavailable",
+          "strict": null,
+          "affects_exit": false,
+          "duration_ms": 1
+        }
+      ],
+      "slowest": [
+        {
+          "nodeid": "tests/test_example.py::test_slow",
+          "duration_ms": 42
+        }
+      ]
+    }
+  },
+  "coverage": null
+}
+```
+
+`scope_reasons` explains partial evidence (for example, a planned selector,
+deselection, collection reduction, or an incomplete session). `counts` covers
+passed, failed, errors, skipped, xfailed, and xpassed outcomes;
+`special_outcomes` lists skipped/XFAIL/XPASS nodes; and `slowest` contains up
+to ten nodes in deterministic order. `pytest` is `null` only when pytest was
+not selected. Coverage remains `null`: C3 coverage execution is not yet
+implemented.
 
 The CLI keeps the first positive tool exit code in planned execution order.
 Checks continue after ordinary failures. If execution has only spawn or
