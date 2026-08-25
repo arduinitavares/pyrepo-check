@@ -1672,3 +1672,13 @@ def test_repository_coverage_dependency_is_development_only_and_locked() -> None
     )
     assert major == 7
     assert minor >= 15
+
+
+def test_repository_native_coverage_measurement_policy_is_explicit() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["tool"]["coverage"]["run"] == {
+        "branch": True,
+        "source": ["src/pyrepo_check"],
+        "parallel": False,
+    }

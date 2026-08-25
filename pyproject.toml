@@ -35,6 +35,11 @@ target-version = "py313"
 addopts = "-ra"
 testpaths = ["tests"]
 
+[tool.coverage.run]
+branch = true
+source = ["src/pyrepo_check"]
+parallel = false
+
 [tool.bandit]
 exclude_dirs = [".venv", ".pytest_cache", ".ruff_cache"]
 
