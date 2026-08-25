@@ -98,6 +98,7 @@ class CoverageArtifactObservation:
 class CoverageExecutionObservation:
     preflight: CoveragePreflightObservation
     artifact: CoverageArtifactObservation
+    json_exit_code: int | None = None
 
 
 CoverageDataErrorCode = Literal["data_missing", "unexpected_parallel_data"]

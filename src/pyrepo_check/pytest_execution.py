@@ -548,6 +548,11 @@ def execute_pytest(
                             coverage = CoverageExecutionObservation(
                                 preflight=coverage.preflight,
                                 artifact=coverage_artifact,
+                                json_exit_code=(
+                                    coverage_json_process.returncode
+                                    if coverage_json_process is not None
+                                    else None
+                                ),
                             )
                 elif (
                     coverage is not None

@@ -1,11 +1,37 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
+import json
+import math
 from pathlib import Path
+from typing import Any, Literal
 
 import pytest
 
-from pyrepo_check.coverage_evidence import coverage_gate_policy
+from pyrepo_check.coverage_evidence import (
+    CoverageCounts,
+    CoverageError,
+    CoverageErrorCode,
+    CoverageFile,
+    CoverageResult,
+    CoverageThreshold,
+    CoverageThresholdSkipReason,
+    CoverageTotals,
+    FileBranchCoverage,
+    FileStatementCoverage,
+    build_coverage_result,
+    coverage_gate_policy,
+    validate_coverage_json,
+)
+from pyrepo_check.coverage_execution import (
+    CoverageArtifactObservation,
+    CoverageArtifactState,
+    CoverageExecutionObservation,
+    CoveragePreflightClassification,
+    CoveragePreflightObservation,
+    CoveragePreflightRecord,
+)
 from pyrepo_check.planning import (
     CoverageExecutionPlan,
     PlannedCheck,
@@ -20,6 +46,16 @@ from pyrepo_check.pytest_evidence import (
     TestScope,
     TestScopeReason,
 )
+
+
+CoveragePreflightErrorClassification = Literal[
+    "unsupported_python",
+    "module_unavailable",
+    "unsupported_version",
+    "preflight_invalid",
+    "spawn_failed",
+    "terminated_by_signal",
+]
 
 
 def _plan(
@@ -201,3 +237,934 @@ def test_coverage_gate_policy_keeps_unconfigured_strict_evidence_eligible_but_no
         "not_configured",
         True,
     )
+
+
+def _coverage_project(tmp_path: Path) -> Path:
+    root = tmp_path / "project"
+    for relative_path in ("src/alpha.py", "src/beta.py", "src/gamma.py", "src/zero.py"):
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {relative_path}\n")
+    return root
+
+
+def _coverage_json_document() -> dict[str, Any]:
+    return {
+        "meta": {
+            "format": 3,
+            "version": "7.15.2",
+            "timestamp": "2026-08-25T12:00:00Z",
+            "branch_coverage": True,
+            "show_contexts": False,
+        },
+        "files": {
+            "src/alpha.py": {
+                "executed_lines": [1, 3],
+                "summary": {
+                    "covered_lines": 2,
+                    "num_statements": 4,
+                    "percent_covered": 50.0,
+                    "percent_covered_display": "50",
+                    "missing_lines": 2,
+                    "excluded_lines": 0,
+                    "num_branches": 3,
+                    "num_partial_branches": 1,
+                    "covered_branches": 1,
+                    "missing_branches": 2,
+                },
+                "missing_lines": [4, 2],
+                "excluded_lines": [],
+                "executed_branches": [[1, 2]],
+                "missing_branches": [[5, -1], [-3, 4]],
+            },
+            "src/beta.py": {
+                "executed_lines": [1, 2],
+                "summary": {
+                    "covered_lines": 2,
+                    "num_statements": 3,
+                    "percent_covered": 50.0,
+                    "percent_covered_display": "50",
+                    "missing_lines": 1,
+                    "excluded_lines": 0,
+                    "num_branches": 1,
+                    "num_partial_branches": 0,
+                    "covered_branches": 0,
+                    "missing_branches": 1,
+                },
+                "missing_lines": [3],
+                "excluded_lines": [],
+                "executed_branches": [],
+                "missing_branches": [[7, 8]],
+            },
+            "src/gamma.py": {
+                "executed_lines": [],
+                "summary": {
+                    "covered_lines": 0,
+                    "num_statements": 2,
+                    "percent_covered": 0.0,
+                    "percent_covered_display": "0",
+                    "missing_lines": 2,
+                    "excluded_lines": 0,
+                    "num_branches": 0,
+                    "num_partial_branches": 0,
+                    "covered_branches": 0,
+                    "missing_branches": 0,
+                },
+                "missing_lines": [2, 1],
+                "excluded_lines": [],
+                "executed_branches": [],
+                "missing_branches": [],
+            },
+            "src/zero.py": {
+                "executed_lines": [1],
+                "summary": {
+                    "covered_lines": 1,
+                    "num_statements": 1,
+                    "percent_covered": 100.0,
+                    "percent_covered_display": "100",
+                    "missing_lines": 0,
+                    "excluded_lines": 0,
+                    "num_branches": 0,
+                    "num_partial_branches": 0,
+                    "covered_branches": 0,
+                    "missing_branches": 0,
+                },
+                "missing_lines": [],
+                "excluded_lines": [],
+                "executed_branches": [],
+                "missing_branches": [],
+            },
+        },
+        "totals": {
+            "covered_lines": 5,
+            "num_statements": 10,
+            "percent_covered": 50.0,
+            "percent_covered_display": "50",
+            "missing_lines": 5,
+            "excluded_lines": 0,
+            "num_branches": 4,
+            "num_partial_branches": 1,
+            "covered_branches": 1,
+            "missing_branches": 3,
+        },
+    }
+
+
+def _coverage_json_bytes(document: object) -> bytes:
+    return json.dumps(document, separators=(",", ":")).encode()
+
+
+def test_coverage_json_builds_exact_sorted_gaps_and_file_guidance(tmp_path: Path) -> None:
+    root = _coverage_project(tmp_path)
+
+    totals, files = validate_coverage_json(
+        _coverage_json_bytes(_coverage_json_document()),
+        project_root=root,
+        coverage_version="7.15.2",
+    )
+
+    assert totals == CoverageTotals(CoverageCounts(5, 5), CoverageCounts(1, 3))
+    assert files == (
+        CoverageFile(
+            "src/alpha.py",
+            FileStatementCoverage(2, 2, (2, 4)),
+            FileBranchCoverage(1, 2, ((-3, 4), (5, -1))),
+        ),
+        CoverageFile(
+            "src/beta.py",
+            FileStatementCoverage(2, 1, (3,)),
+            FileBranchCoverage(0, 1, ((7, 8),)),
+        ),
+        CoverageFile(
+            "src/gamma.py",
+            FileStatementCoverage(0, 2, (1, 2)),
+            FileBranchCoverage(0, 0, ()),
+        ),
+        CoverageFile(
+            "src/zero.py",
+            FileStatementCoverage(1, 0, ()),
+            FileBranchCoverage(0, 0, ()),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("location", "member"),
+    (
+        ("root", "future_root"),
+        ("meta", "future_meta"),
+        ("file", "future_file"),
+        ("summary", "future_summary"),
+        ("totals", "future_totals"),
+    ),
+)
+def test_coverage_json_ignores_one_unknown_additive_member(
+    tmp_path: Path, location: str, member: str
+) -> None:
+    root = _coverage_project(tmp_path)
+    document = _coverage_json_document()
+    target: dict[str, Any]
+    if location == "root":
+        target = document
+    elif location == "meta":
+        target = document["meta"]
+    elif location == "file":
+        target = document["files"]["src/alpha.py"]
+    elif location == "summary":
+        target = document["files"]["src/alpha.py"]["summary"]
+    else:
+        target = document["totals"]
+    target[member] = {"future": [1, 2, 3]}
+
+    totals, files = validate_coverage_json(
+        _coverage_json_bytes(document),
+        project_root=root,
+        coverage_version="7.15.2",
+    )
+
+    assert totals.statements == CoverageCounts(5, 5)
+    assert files[0].path == "src/alpha.py"
+
+
+@pytest.mark.parametrize("path_form", ("absolute", "dotdot", "internal_symlink"))
+def test_coverage_json_accepts_paths_that_resolve_to_the_measured_file(
+    tmp_path: Path, path_form: str
+) -> None:
+    root = _coverage_project(tmp_path)
+    document = _coverage_json_document()
+    alpha = document["files"].pop("src/alpha.py")
+    if path_form == "absolute":
+        key = str((root / "src/alpha.py").resolve())
+    elif path_form == "dotdot":
+        key = "src/../src/alpha.py"
+    else:
+        (root / "alias.py").symlink_to(root / "src/alpha.py")
+        key = "alias.py"
+    document["files"][key] = alpha
+
+    _totals, files = validate_coverage_json(
+        _coverage_json_bytes(document),
+        project_root=root,
+        coverage_version="7.15.2",
+    )
+
+    assert files[0].path == "src/alpha.py"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "root_not_object",
+        "meta_missing",
+        "meta_not_object",
+        "files_not_object",
+        "totals_not_object",
+        "format_bool",
+        "format_wrong",
+        "version_not_string",
+        "version_mismatch",
+        "branch_coverage_false",
+        "file_name_empty",
+        "file_record_not_object",
+        "summary_not_object",
+        "summary_field_missing",
+        "count_bool",
+        "count_float",
+        "count_negative",
+        "missing_lines_not_array",
+        "missing_line_bool",
+        "missing_line_zero",
+        "missing_line_negative",
+        "duplicate_line",
+        "missing_branches_not_array",
+        "branch_arc_not_pair",
+        "branch_endpoint_bool",
+        "branch_endpoint_zero",
+        "duplicate_arc",
+        "statement_arithmetic",
+        "statement_gap_count",
+        "branch_arithmetic",
+        "branch_gap_count",
+        "totals_arithmetic",
+        "totals_disagree",
+        "unknown_nonfinite",
+    ),
+)
+def test_coverage_json_rejects_one_schema_or_arithmetic_defect(
+    tmp_path: Path, mutation: str
+) -> None:
+    root = _coverage_project(tmp_path)
+    document: Any = _coverage_json_document()
+    if mutation == "root_not_object":
+        document = []
+    elif mutation == "meta_missing":
+        del document["meta"]
+    elif mutation == "meta_not_object":
+        document["meta"] = []
+    elif mutation == "files_not_object":
+        document["files"] = []
+    elif mutation == "totals_not_object":
+        document["totals"] = []
+    elif mutation == "format_bool":
+        document["meta"]["format"] = True
+    elif mutation == "format_wrong":
+        document["meta"]["format"] = 2
+    elif mutation == "version_not_string":
+        document["meta"]["version"] = 7
+    elif mutation == "version_mismatch":
+        document["meta"]["version"] = "7.15.1"
+    elif mutation == "branch_coverage_false":
+        document["meta"]["branch_coverage"] = False
+    elif mutation == "file_name_empty":
+        document["files"][""] = document["files"].pop("src/alpha.py")
+    elif mutation == "file_record_not_object":
+        document["files"]["src/alpha.py"] = []
+    elif mutation == "summary_not_object":
+        document["files"]["src/alpha.py"]["summary"] = []
+    elif mutation == "summary_field_missing":
+        del document["files"]["src/alpha.py"]["summary"]["covered_lines"]
+    elif mutation == "count_bool":
+        document["files"]["src/alpha.py"]["summary"]["covered_lines"] = True
+    elif mutation == "count_float":
+        document["files"]["src/alpha.py"]["summary"]["covered_lines"] = 2.0
+    elif mutation == "count_negative":
+        document["files"]["src/alpha.py"]["summary"]["covered_lines"] = -1
+    elif mutation == "missing_lines_not_array":
+        document["files"]["src/alpha.py"]["missing_lines"] = {}
+    elif mutation == "missing_line_bool":
+        document["files"]["src/alpha.py"]["missing_lines"][0] = True
+    elif mutation == "missing_line_zero":
+        document["files"]["src/alpha.py"]["missing_lines"][0] = 0
+    elif mutation == "missing_line_negative":
+        document["files"]["src/alpha.py"]["missing_lines"][0] = -1
+    elif mutation == "duplicate_line":
+        document["files"]["src/alpha.py"]["missing_lines"] = [2, 2]
+    elif mutation == "missing_branches_not_array":
+        document["files"]["src/alpha.py"]["missing_branches"] = {}
+    elif mutation == "branch_arc_not_pair":
+        document["files"]["src/alpha.py"]["missing_branches"][0] = [5]
+    elif mutation == "branch_endpoint_bool":
+        document["files"]["src/alpha.py"]["missing_branches"][0][0] = True
+    elif mutation == "branch_endpoint_zero":
+        document["files"]["src/alpha.py"]["missing_branches"][0][0] = 0
+    elif mutation == "duplicate_arc":
+        document["files"]["src/alpha.py"]["missing_branches"] = [[5, -1], [5, -1]]
+    elif mutation == "statement_arithmetic":
+        document["files"]["src/alpha.py"]["summary"]["num_statements"] = 5
+    elif mutation == "statement_gap_count":
+        document["files"]["src/alpha.py"]["summary"]["missing_lines"] = 1
+    elif mutation == "branch_arithmetic":
+        document["files"]["src/alpha.py"]["summary"]["num_branches"] = 4
+    elif mutation == "branch_gap_count":
+        document["files"]["src/alpha.py"]["summary"]["missing_branches"] = 1
+    elif mutation == "totals_arithmetic":
+        document["totals"]["num_statements"] = 11
+    elif mutation == "totals_disagree":
+        document["totals"]["covered_lines"] = 4
+    else:
+        document["meta"]["future"] = math.nan
+
+    with pytest.raises(ValueError):
+        validate_coverage_json(
+            _coverage_json_bytes(document),
+            project_root=root,
+            coverage_version="7.15.2",
+        )
+
+
+@pytest.mark.parametrize(
+    "path_defect",
+    ("outside", "symlink_escape", "missing", "directory", "duplicate_normalized"),
+)
+def test_coverage_json_rejects_one_measured_path_defect(
+    tmp_path: Path, path_defect: str
+) -> None:
+    root = _coverage_project(tmp_path)
+    document = _coverage_json_document()
+    if path_defect == "outside":
+        outside = tmp_path / "outside.py"
+        outside.write_text("# outside\n")
+        document["files"][str(outside)] = document["files"].pop("src/alpha.py")
+    elif path_defect == "symlink_escape":
+        outside = tmp_path / "outside.py"
+        outside.write_text("# outside\n")
+        (root / "escape.py").symlink_to(outside)
+        document["files"]["escape.py"] = document["files"].pop("src/alpha.py")
+    elif path_defect == "missing":
+        document["files"]["missing.py"] = document["files"].pop("src/alpha.py")
+    elif path_defect == "directory":
+        document["files"]["src"] = document["files"].pop("src/alpha.py")
+    else:
+        document["files"]["src/../src/alpha.py"] = deepcopy(
+            document["files"]["src/alpha.py"]
+        )
+
+    with pytest.raises(ValueError):
+        validate_coverage_json(
+            _coverage_json_bytes(document),
+            project_root=root,
+            coverage_version="7.15.2",
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        b"\xff",
+        b'{"meta":',
+        (b'{"future":' + b"[" * 65 + b"0" + b"]" * 65 + b"}"),
+    ),
+    ids=("invalid-utf8", "malformed-json", "excessive-nesting"),
+)
+def test_coverage_json_rejects_malformed_or_excessively_nested_bytes(
+    tmp_path: Path, content: bytes
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    with pytest.raises((UnicodeDecodeError, ValueError)):
+        validate_coverage_json(
+            content,
+            project_root=root,
+            coverage_version="7.15.2",
+        )
+
+
+def _coverage_observation(
+    *,
+    preflight: CoveragePreflightClassification = "supported",
+    artifact: CoverageArtifactState = "snapshot",
+    content: bytes | None = None,
+    diagnostic: str | None = None,
+    version: str | None = "7.15.2",
+    json_exit_code: int | None = 0,
+) -> CoverageExecutionObservation:
+    if preflight == "supported":
+        record = CoveragePreflightRecord((3, 13, 15), True, version)
+    elif preflight == "module_unavailable":
+        record = CoveragePreflightRecord((3, 13, 15), False, None)
+    elif preflight in {"unsupported_python", "unsupported_version"}:
+        record = CoveragePreflightRecord((3, 13, 14), True, version)
+    else:
+        record = None
+    return CoverageExecutionObservation(
+        preflight=CoveragePreflightObservation(preflight, record, diagnostic),
+        artifact=CoverageArtifactObservation(
+            artifact,
+            _coverage_json_bytes(_coverage_json_document()) if content is None else content,
+            diagnostic,
+        ),
+        json_exit_code=json_exit_code,
+    )
+
+
+def _plan_without_coverage(scope: str) -> RunPlan:
+    plan = _plan()
+    check = plan.checks[0]
+    assert check.pytest is not None
+    return replace(
+        plan,
+        checks=(replace(check, pytest=replace(check.pytest, coverage=None)),),
+        planned_coverage_scope=scope,
+    )
+
+
+@pytest.mark.parametrize("scope", ("not_requested", "unavailable"))
+def test_coverage_result_is_absent_only_when_coverage_was_not_planned(
+    tmp_path: Path, scope: str
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan_without_coverage(scope),
+        _pytest_result(),
+        None,
+    )
+
+    assert result is None
+
+
+def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(),
+    )
+
+    assert result is not None
+    assert result == CoverageResult(
+        status="passed",
+        scope="complete",
+        evidence_complete=True,
+        coverage_version="7.15.2",
+        gate_eligible=True,
+        threshold=CoverageThreshold(True, 90, True, True, None),
+        totals=CoverageTotals(CoverageCounts(5, 5), CoverageCounts(1, 3)),
+        files=(
+            CoverageFile(
+                "src/alpha.py",
+                FileStatementCoverage(2, 2, (2, 4)),
+                FileBranchCoverage(1, 2, ((-3, 4), (5, -1))),
+            ),
+            CoverageFile(
+                "src/beta.py",
+                FileStatementCoverage(2, 1, (3,)),
+                FileBranchCoverage(0, 1, ((7, 8),)),
+            ),
+            CoverageFile(
+                "src/gamma.py",
+                FileStatementCoverage(0, 2, (1, 2)),
+                FileBranchCoverage(0, 0, ()),
+            ),
+            CoverageFile(
+                "src/zero.py",
+                FileStatementCoverage(1, 0, ()),
+                FileBranchCoverage(0, 0, ()),
+            ),
+        ),
+        error=None,
+    )
+    assert tuple(file.path for file in result.files) == (
+        "src/alpha.py",
+        "src/beta.py",
+        "src/gamma.py",
+        "src/zero.py",
+    )
+
+
+def test_coverage_result_builds_native_threshold_failure_from_exit_two(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(json_exit_code=2),
+    )
+
+    assert result is not None
+    assert result.status == "failed"
+    assert result.gate_eligible is True
+    assert result.threshold == CoverageThreshold(True, 90, True, False, None)
+    assert result.error is None
+
+
+def test_coverage_result_builds_strict_unconfigured_pass_without_evaluation(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(fail_under=None),
+        _pytest_result(),
+        _coverage_observation(),
+    )
+
+    assert result is not None
+    assert result.status == "passed"
+    assert result.gate_eligible is True
+    assert result.threshold == CoverageThreshold(
+        False, None, False, None, "not_configured"
+    )
+
+
+@pytest.mark.parametrize(
+    ("plan", "pytest_result", "expected_scope", "expected_reason"),
+    (
+        (_plan(mode="focused"), _pytest_result(), "complete", "focused_run"),
+        (
+            _plan(mode="focused", targets=("src",)),
+            _pytest_result(),
+            "partial",
+            "partial_run",
+        ),
+        (
+            _plan(mode="focused", shortcut="unit"),
+            _pytest_result(),
+            "partial",
+            "partial_run",
+        ),
+        (_plan(), _pytest_result(exit_code=1), "complete", "pytest_failed"),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=2,
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+            ),
+            "partial",
+            "pytest_incomplete",
+        ),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=3,
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+            ),
+            "partial",
+            "pytest_incomplete",
+        ),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=4,
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+            ),
+            "partial",
+            "pytest_incomplete",
+        ),
+        (_plan(), _pytest_result(exit_code=5), "complete", "no_tests_collected"),
+        (
+            _plan(),
+            _pytest_result(
+                scope="partial",
+                scope_reasons=("effective_narrowing_option",),
+            ),
+            "partial",
+            "partial_run",
+        ),
+    ),
+    ids=(
+        "focused-complete",
+        "direct-target",
+        "shortcut",
+        "pytest-exit-one",
+        "pytest-exit-two",
+        "pytest-exit-three",
+        "pytest-exit-four",
+        "pytest-exit-five",
+        "external-narrowing",
+    ),
+)
+def test_coverage_result_builds_valid_non_gating_guidance(
+    tmp_path: Path,
+    plan: RunPlan,
+    pytest_result: PytestResult,
+    expected_scope: str,
+    expected_reason: CoverageThresholdSkipReason,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(root, plan, pytest_result, _coverage_observation())
+
+    assert result is not None
+    assert result.status == "guidance"
+    assert result.scope == expected_scope
+    assert result.evidence_complete is True
+    assert result.gate_eligible is False
+    assert result.threshold == CoverageThreshold(
+        True, 90, False, None, expected_reason
+    )
+    assert result.totals is not None
+    assert result.error is None
+
+
+@pytest.mark.parametrize(
+    ("preflight", "artifact", "expected_code"),
+    (
+        ("unsupported_python", "not_attempted", "unsupported_python"),
+        ("module_unavailable", "not_attempted", "module_unavailable"),
+        ("unsupported_version", "not_attempted", "unsupported_version"),
+        ("preflight_invalid", "not_attempted", "preflight_invalid"),
+        ("spawn_failed", "not_attempted", "spawn_failed"),
+        ("terminated_by_signal", "not_attempted", "terminated_by_signal"),
+        ("supported", "spawn_failed", "spawn_failed"),
+        ("supported", "terminated_by_signal", "terminated_by_signal"),
+        ("supported", "unsupported_parallelism", "unsupported_parallelism"),
+        ("supported", "unexpected_parallel_data", "unexpected_parallel_data"),
+        ("supported", "data_missing", "data_missing"),
+        ("supported", "not_attempted", "data_missing"),
+        ("supported", "generation_failed", "generation_failed"),
+        ("supported", "artifact_missing", "artifact_missing"),
+        ("supported", "artifact_invalid", "artifact_invalid"),
+    ),
+)
+def test_coverage_result_maps_every_preflight_and_artifact_error(
+    tmp_path: Path,
+    preflight: CoveragePreflightClassification,
+    artifact: CoverageArtifactState,
+    expected_code: CoverageErrorCode,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(
+            preflight=preflight,
+            artifact=artifact,
+            diagnostic=f"{expected_code} diagnostic",
+        ),
+    )
+
+    assert result is not None
+    assert result.status == "error"
+    assert result.scope == "partial"
+    assert result.evidence_complete is False
+    assert result.gate_eligible is False
+    assert result.threshold == CoverageThreshold(
+        True, 90, False, None, "evidence_error"
+    )
+    assert result.totals is None
+    assert result.files == ()
+    assert result.error == CoverageError(expected_code, f"{expected_code} diagnostic")
+    assert result.coverage_version == (
+        "7.15.2" if preflight == "supported" else None
+    )
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later"),
+    (
+        ("unsupported_python", "unsupported_parallelism"),
+        ("module_unavailable", "unexpected_parallel_data"),
+        ("unsupported_version", "data_missing"),
+        ("preflight_invalid", "generation_failed"),
+        ("spawn_failed", "artifact_missing"),
+        ("terminated_by_signal", "artifact_invalid"),
+    ),
+)
+def test_coverage_result_preflight_error_precedes_every_later_artifact_error(
+    tmp_path: Path,
+    earlier: CoveragePreflightErrorClassification,
+    later: CoverageArtifactState,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(
+            preflight=earlier,
+            artifact=later,
+            diagnostic=f"{earlier} wins",
+        ),
+    )
+
+    assert result is not None
+    assert result.error == CoverageError(earlier, f"{earlier} wins")
+
+
+@pytest.mark.parametrize(
+    ("plan", "exit_code"),
+    (
+        (_plan(), 1),
+        (_plan(mode="focused"), 2),
+        (_plan(fail_under=None), 2),
+        (_plan(), 3),
+    ),
+)
+def test_coverage_result_rejects_non_threshold_json_exit(
+    tmp_path: Path, plan: RunPlan, exit_code: int
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        plan,
+        _pytest_result(),
+        _coverage_observation(json_exit_code=exit_code),
+    )
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == "generation_failed"
+
+
+def test_coverage_result_treats_invalid_exit_two_json_as_artifact_invalid(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+    document = _coverage_json_document()
+    document["meta"]["format"] = 2
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(
+            content=_coverage_json_bytes(document),
+            json_exit_code=2,
+        ),
+    )
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == "artifact_invalid"
+
+
+def test_coverage_result_treats_missing_snapshot_content_as_artifact_invalid(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+    observation = _coverage_observation()
+    observation = replace(
+        observation,
+        artifact=replace(observation.artifact, content=None),
+    )
+
+    result = build_coverage_result(root, _plan(), _pytest_result(), observation)
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == "artifact_invalid"
+
+
+def test_coverage_result_retains_trusted_version_on_later_error(tmp_path: Path) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        _coverage_observation(artifact="data_missing", diagnostic="no base data"),
+    )
+
+    assert result is not None
+    assert result.coverage_version == "7.15.2"
+    assert result.error == CoverageError("data_missing", "no base data")
+
+
+def test_coverage_result_keeps_pytest_and_coverage_preflight_failures_independent(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+    pytest_result = replace(
+        _pytest_result(),
+        status="error",
+        complete=False,
+        scope="partial",
+        scope_reasons=("incomplete_session",),
+        evidence=None,
+    )
+
+    data_missing = build_coverage_result(
+        root,
+        _plan(),
+        pytest_result,
+        _coverage_observation(artifact="data_missing", diagnostic="primary did not run"),
+    )
+    coverage_preflight_failed = build_coverage_result(
+        root,
+        _plan(),
+        pytest_result,
+        _coverage_observation(
+            preflight="module_unavailable",
+            artifact="not_attempted",
+            diagnostic="coverage unavailable",
+        ),
+    )
+
+    assert data_missing is not None and data_missing.error is not None
+    assert data_missing.error.code == "data_missing"
+    assert coverage_preflight_failed is not None
+    assert coverage_preflight_failed.error is not None
+    assert coverage_preflight_failed.error.code == "module_unavailable"
+
+
+def test_coverage_result_maps_setup_before_coverage_preflight_to_preflight_invalid(
+    tmp_path: Path,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(root, _plan(), _pytest_result(), None)
+
+    assert result is not None
+    assert result.error is not None
+    assert result.error.code == "preflight_invalid"
+
+
+@pytest.mark.parametrize(
+    ("plan", "pytest_result", "expected_eligible", "expected_reason"),
+    (
+        (_plan(), _pytest_result(), True, None),
+        (_plan(fail_under=None), _pytest_result(), True, "not_configured"),
+        (_plan(mode="focused"), _pytest_result(), False, "focused_run"),
+        (
+            _plan(mode="focused", targets=("src",)),
+            _pytest_result(),
+            False,
+            "partial_run",
+        ),
+        (
+            _plan(mode="focused", shortcut="unit"),
+            _pytest_result(),
+            False,
+            "partial_run",
+        ),
+        (
+            _plan(),
+            _pytest_result(scope="partial", scope_reasons=("deselected_tests",)),
+            False,
+            "partial_run",
+        ),
+        (_plan(), _pytest_result(exit_code=1), False, "pytest_failed"),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=2,
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+            ),
+            False,
+            "pytest_incomplete",
+        ),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=3,
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+            ),
+            False,
+            "pytest_incomplete",
+        ),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=4,
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+            ),
+            False,
+            "pytest_incomplete",
+        ),
+        (_plan(), _pytest_result(exit_code=5), False, "no_tests_collected"),
+        (_plan(), replace(_pytest_result(), evidence=None), False, "evidence_error"),
+    ),
+)
+def test_coverage_result_agrees_with_every_gate_policy_row(
+    tmp_path: Path,
+    plan: RunPlan,
+    pytest_result: PytestResult,
+    expected_eligible: bool,
+    expected_reason: CoverageThresholdSkipReason | None,
+) -> None:
+    root = _coverage_project(tmp_path)
+
+    result = build_coverage_result(root, plan, pytest_result, _coverage_observation())
+
+    assert result is not None
+    assert result.gate_eligible is expected_eligible
+    assert result.threshold.skipped_reason == expected_reason
+    if expected_reason == "evidence_error":
+        assert result.status == "error"
+        assert result.evidence_complete is False
+    else:
+        assert result.evidence_complete is True
