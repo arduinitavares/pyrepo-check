@@ -13,6 +13,26 @@ import pytest
 PYTEST_8_VERSIONS = ("8.0.2", "8.1.1", "8.2.2", "8.3.5", "8.4.2")
 
 
+def test_isolated_matrix_reports_process_failure_before_reading_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a missing artifact hiding an isolated uv/pytest startup failure."""
+    completed = subprocess.CompletedProcess(
+        args=("uv", "run"),
+        returncode=2,
+        stdout="isolated stdout",
+        stderr="isolated stderr",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(AssertionError, match="isolated pytest failed") as captured:
+        run_isolated_pytest_project(tmp_path, "8.0.2")
+
+    assert "isolated stdout" in str(captured.value)
+    assert "isolated stderr" in str(captured.value)
+
+
 def run_isolated_pytest_project(
     tmp_path: Path, pytest_version: str
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
@@ -88,6 +108,11 @@ def test_deselected():
         text=True,
         capture_output=True,
         check=False,
+    )
+    assert completed.returncode == 1, (
+        f"isolated pytest failed for pytest {pytest_version}\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
     )
     return completed, json.loads(artifact_path.read_text(encoding="utf-8"))
 

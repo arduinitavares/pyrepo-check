@@ -294,6 +294,72 @@ def test_plugin_records_pytest_8_expected_failure_shapes(
     assert all(report["longrepr"] is None or isinstance(report["longrepr"], str) for report in reports)
 
 
+@pytest.mark.parametrize(
+    ("fixture_source", "test_source", "expected_reports"),
+    [
+        (
+            """import pytest
+
+
+@pytest.fixture
+def xfail_in_setup():
+    pytest.xfail("setup reason")
+""",
+            "def test_case(xfail_in_setup):\n    assert True\n",
+            [
+                ("setup", "skipped", True, "setup reason"),
+                ("teardown", "passed", False, None),
+            ],
+        ),
+        (
+            """import pytest
+
+
+@pytest.fixture
+def xfail_in_teardown():
+    yield
+    pytest.xfail("teardown reason")
+""",
+            "def test_case(xfail_in_teardown):\n    assert True\n",
+            [
+                ("setup", "passed", False, None),
+                ("call", "passed", False, None),
+                ("teardown", "skipped", True, "teardown reason"),
+            ],
+        ),
+    ],
+)
+def test_plugin_records_fixture_xfail_phases_without_early_stop(
+    tmp_path: Path,
+    fixture_source: str,
+    test_source: str,
+    expected_reports: list[tuple[str, str, bool, str | None]],
+) -> None:
+    """Catch losing setup or teardown XFAIL metadata and terminal coverage."""
+    run = run_plugin_project(
+        tmp_path,
+        test_source,
+        project_sources={"conftest.py": fixture_source},
+    )
+
+    collection = cast(dict[str, object], run.artifact["collection"])
+    reports = cast(list[dict[str, object]], run.artifact["reports"])
+    session = cast(dict[str, object], run.artifact["session"])
+    assert run.completed.returncode == 0
+    assert collection["final_nodeids"] == ["test_sample.py::test_case"]
+    assert [
+        (
+            report["when"],
+            report["outcome"],
+            report["wasxfail_present"],
+            report["wasxfail"],
+        )
+        for report in reports
+    ] == expected_reports
+    assert {report["nodeid"] for report in reports} == {"test_sample.py::test_case"}
+    assert session["stopped_early"] is False
+
+
 @pytest.mark.parametrize("invocation_args", (("-x",), ("--maxfail=1",)))
 def test_plugin_marks_early_stop_when_a_collected_node_lacks_terminal_outcome(
     tmp_path: Path,
@@ -420,12 +486,18 @@ def test_plugin_rejects_real_reruns(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "injected_outcome",
-    ("passed", "rerun"),
+    ("nodeid", "when", "outcome"),
+    (
+        ("test_sample.py::test_ok", "setup", "passed"),
+        ("test_sample.py::test_ok", "teardown", "passed"),
+        ("synthetic.py::test_rerun", "call", "rerun"),
+    ),
 )
-def test_plugin_rejects_synthetic_repeated_phase_and_noncore_outcome(
+def test_plugin_rejects_synthetic_repeated_phases_and_noncore_outcomes(
     tmp_path: Path,
-    injected_outcome: str,
+    nodeid: str,
+    when: str,
+    outcome: str,
 ) -> None:
     """Catch retry-like reports injected by another pytest plugin."""
     run = run_plugin_project(
@@ -440,12 +512,12 @@ from _pytest.reports import TestReport
 def pytest_sessionfinish(session, exitstatus):
     session.config.hook.pytest_runtest_logreport(
         report=TestReport(
-            nodeid=\"test_sample.py::test_ok\",
-            location=(\"test_sample.py\", 0, \"test_ok\"),
+            nodeid={nodeid!r},
+            location=(\"synthetic.py\", 0, \"test_rerun\"),
             keywords={{}},
-            outcome={injected_outcome!r},
+            outcome={outcome!r},
             longrepr=None,
-            when=\"setup\",
+            when={when!r},
             sections=(),
             duration=0.0,
             start=0.0,
