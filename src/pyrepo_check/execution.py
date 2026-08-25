@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 from pyrepo_check.planning import PlannedCheck, RunPlan
 
 if TYPE_CHECKING:
+    from pyrepo_check.coverage_execution import CoverageExecutionObservation
     from pyrepo_check.pytest_execution import PytestExecutionObservation
 
 
@@ -99,6 +100,7 @@ class ExecutedCheck:
     planned: PlannedCheck
     processes: tuple[ExecutedProcess, ...]
     pytest: PytestExecutionObservation | None = None
+    coverage: CoverageExecutionObservation | None = None
 
 
 @dataclass(frozen=True)

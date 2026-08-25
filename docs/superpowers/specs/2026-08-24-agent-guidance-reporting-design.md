@@ -481,6 +481,19 @@ supported range proceeds. A stable version is ASCII decimal `major.minor` or
 suffixes are unsupported. Its stdout/stderr and result are recorded as the
 `coverage_preflight` process.
 
+When coverage is planned, the executor creates its coverage observation before
+workspace setup and attempts `pytest_preflight`, then `coverage_preflight`,
+before an optional primary process. A pytest preflight that exits, is signaled,
+or emits invalid evidence does not suppress a safe coverage preflight; its own
+failure remains the pytest result while coverage retains its independent
+preflight result. A pytest preflight spawn error means the launcher is unusable,
+so coverage remains `preflight_invalid` with a `not_attempted` artifact. A
+platform, temporary-directory, or verified-workspace failure attempts neither
+preflight and leaves the planned coverage observation in that same state. The
+primary runs only when both preflights are supported, and coverage never falls
+back to a plain pytest process. Task 4 intentionally leaves coverage artifact
+reading and Coverage JSON parsing to the later reporting task.
+
 ### Collection and single-process data
 
 The coverage pytest command is an argument vector equivalent to:

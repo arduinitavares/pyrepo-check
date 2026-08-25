@@ -32,6 +32,15 @@ from pyrepo_check.execution import (
     ProcessRunner,
     execute_process,
 )
+from pyrepo_check.coverage_execution import (
+    CoverageArtifactObservation,
+    CoverageExecutionObservation,
+    classify_coverage_preflight,
+    coverage_environment,
+    coverage_preflight_command,
+    coverage_primary_command,
+    invalid_coverage_observation,
+)
 from pyrepo_check.planning import OutputFormat, PlannedCheck
 
 if sys.platform == "darwin":
@@ -304,6 +313,12 @@ def execute_pytest(
     if pytest_plan is None:
         raise ValueError("pytest execution requires PlannedCheck.pytest metadata")
     artifact = PytestArtifactObservation("not_attempted", None, (), None)
+    coverage_plan = pytest_plan.coverage
+    coverage: CoverageExecutionObservation | None = (
+        invalid_coverage_observation("coverage execution setup did not run")
+        if coverage_plan is not None
+        else None
+    )
     processes: list[ExecutedProcess] = []
     preflight = PytestPreflightObservation(
         "not_started",
@@ -312,6 +327,8 @@ def execute_pytest(
     )
     capability_error = _platform_capability_error()
     if capability_error is not None:
+        if coverage_plan is not None:
+            coverage = invalid_coverage_observation(capability_error)
         return ExecutedCheck(
             planned=check,
             processes=(),
@@ -324,10 +341,13 @@ def execute_pytest(
                 artifact=artifact,
                 cleanup_error=None,
             ),
+            coverage=coverage,
         )
     try:
         run_directory = _create_run_directory(check.cwd)
     except OSError as error:
+        if coverage_plan is not None:
+            coverage = invalid_coverage_observation(f"{type(error).__name__}: {error}")
         return ExecutedCheck(
             planned=check,
             processes=(),
@@ -340,6 +360,7 @@ def execute_pytest(
                 artifact=artifact,
                 cleanup_error=None,
             ),
+            coverage=coverage,
         )
 
     cleanup_error: str | None = None
@@ -357,6 +378,15 @@ def execute_pytest(
             run_directory.path,
             artifact_path,
             writer_directory,
+        )
+        coverage_env = (
+            coverage_environment(
+                environment,
+                run_directory=run_directory.path,
+                config_path=coverage_plan.config_path.resolve(),
+            )
+            if coverage_plan is not None
+            else None
         )
         verified_run.verify("immediately before preflight")
         process = _run_preflight(
@@ -377,7 +407,74 @@ def execute_pytest(
                 str(error),
             )
         else:
-            if preflight.classification == "supported":
+            if coverage_plan is not None:
+                if process.spawn_error is not None:
+                    coverage = invalid_coverage_observation(
+                        "pytest preflight launcher failed; coverage preflight was not attempted"
+                    )
+                else:
+                    try:
+                        verified_run.verify("immediately before coverage preflight")
+                    except OSError as error:
+                        coverage = invalid_coverage_observation(str(error))
+                    else:
+                        coverage_process = execute_process(
+                            role="coverage_preflight",
+                            command=coverage_preflight_command(
+                                coverage_plan.consumer_python
+                            ),
+                            cwd=check.cwd,
+                            capture_output=True,
+                            runner=runner,
+                            clock_ns=clock_ns,
+                            environment=coverage_env,
+                        )
+                        processes.append(coverage_process)
+                        coverage_preflight = classify_coverage_preflight(coverage_process)
+                        coverage = CoverageExecutionObservation(
+                            preflight=coverage_preflight,
+                            artifact=CoverageArtifactObservation("not_attempted", None),
+                        )
+                        try:
+                            verified_run.verify("after coverage preflight")
+                        except OSError as error:
+                            coverage = invalid_coverage_observation(str(error))
+                if (
+                    preflight.classification == "supported"
+                    and coverage is not None
+                    and coverage.preflight.classification == "supported"
+                ):
+                    if coverage_env is None:
+                        raise AssertionError("coverage environment is unavailable")
+                    processes.append(
+                        _run_primary(
+                            command=coverage_primary_command(
+                                consumer_python=coverage_plan.consumer_python,
+                                config_path=coverage_plan.config_path.resolve(),
+                                run_directory=run_directory.path,
+                                plugin_module=plugin_module,
+                                pytest_args=pytest_plan.pytest_args,
+                            ),
+                            cwd=check.cwd,
+                            runner=runner,
+                            clock_ns=clock_ns,
+                            environment=coverage_env,
+                            capture_output=output_format == "json",
+                        )
+                    )
+                    try:
+                        verified_run.verify("after coverage pytest primary")
+                    except OSError as error:
+                        artifact = PytestArtifactObservation(
+                            "unsafe_path", None, (), str(error)
+                        )
+                    else:
+                        artifact = _snapshot_artifact(
+                            artifact_path,
+                            writer_directory,
+                            run_descriptor=verified_run.descriptor,
+                        )
+            elif preflight.classification == "supported":
                 processes.append(
                     _run_primary(
                         command=(
@@ -442,6 +539,7 @@ def execute_pytest(
             artifact=artifact,
             cleanup_error=cleanup_error,
         ),
+        coverage=coverage,
     )
 
 
