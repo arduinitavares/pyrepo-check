@@ -17,7 +17,11 @@ from pyrepo_check.pytest_execution import (
     PytestPreflightObservation,
     PytestPreflightRecord,
 )
-from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
+from pyrepo_check.pytest_evidence import (
+    PytestValidationFailure,
+    ValidatedPytestSession,
+    validate_pytest_execution,
+)
 
 
 def _check(
@@ -412,12 +416,16 @@ _ARTIFACT_INVALID_DEFECTS = (
     "artifact-invalid-writer-mismatch",
     "artifact-invalid-expected-failure",
 )
+_CONTENT_BEARING_ARTIFACT_INVALID_DEFECTS = (
+    "artifact-invalid-schema",
+    "artifact-invalid-malformed-marker",
+    "artifact-invalid-multiple-writers",
+    "artifact-invalid-writer-mismatch",
+    "artifact-invalid-expected-failure",
+)
 _MISSING_ARTIFACT_LATER_DEFECTS = (
     "artifact-invalid-malformed-marker",
     "artifact-invalid-multiple-writers",
-    "parallelism",
-    "retry",
-    "exit-mismatch",
 )
 _NOT_FINALIZED_ARTIFACT_LATER_DEFECTS = (
     "artifact-invalid-schema",
@@ -513,6 +521,84 @@ def _check_with_defects(*defects: str) -> ExecutedCheck:
     )
 
 
+def _assert_observable_defect(check: ExecutedCheck, defect: str) -> None:
+    assert check.pytest is not None
+    observation = check.pytest
+    preflight_codes = {
+        "preflight-unsupported-python": "unsupported_python",
+        "preflight-module-unavailable": "module_unavailable",
+        "preflight-unsupported-version": "unsupported_version",
+        "preflight-invalid": "preflight_invalid",
+        "preflight-spawn": "spawn_failed",
+        "preflight-signal": "terminated_by_signal",
+    }
+    if defect in preflight_codes:
+        assert observation.preflight.classification == preflight_codes[defect]
+    elif defect == "primary-spawn":
+        assert check.processes[0].spawn_error is not None
+    elif defect == "primary-signal":
+        assert check.processes[0].returncode is not None
+        assert check.processes[0].returncode < 0
+    elif defect == "artifact-missing":
+        assert observation.artifact.state == "missing"
+        assert observation.artifact.content is None
+    elif defect == "artifact-not-finalized":
+        assert observation.artifact.state == "snapshot"
+        assert _observable_document(check, defect)["state"] == "started"
+    elif defect == "artifact-invalid-schema":
+        assert _observable_document(check, defect)["schema_version"] == 2
+    elif defect == "artifact-invalid-unsafe-path":
+        assert observation.artifact.state == "unsafe_path"
+        assert observation.artifact.content is None
+    elif defect == "artifact-invalid-read-failed":
+        assert observation.artifact.state == "read_failed"
+        assert observation.artifact.content is None
+    elif defect == "artifact-invalid-malformed-marker":
+        assert observation.artifact.diagnostic == "writer marker malformed"
+    elif defect == "artifact-invalid-multiple-writers":
+        assert observation.artifact.writer_ids == ("writer-1", "writer-2")
+    elif defect == "artifact-invalid-writer-mismatch":
+        assert _observable_document(check, defect)["writer_id"] == "other-writer"
+    elif defect == "artifact-invalid-expected-failure":
+        report = _report(_observable_document(check, defect), 1)
+        assert report["outcome"] == "failed"
+        assert report["wasxfail_present"] is True
+    elif defect == "parallelism":
+        flags = cast(dict[str, object], _observable_document(check, defect)["flags"])
+        assert flags["unsupported_parallelism"] is True
+    elif defect == "retry":
+        flags = cast(dict[str, object], _observable_document(check, defect)["flags"])
+        assert flags["unsupported_retries"] is True
+    elif defect == "exit-mismatch":
+        session = cast(dict[str, object], _observable_document(check, defect)["session"])
+        assert session["exit_code"] != check.processes[0].returncode
+    else:
+        raise AssertionError(f"unhandled observable defect: {defect}")
+
+
+def _observable_document(check: ExecutedCheck, defect: str) -> dict[str, object]:
+    assert check.pytest is not None
+    if check.pytest.artifact.content is None:
+        raise AssertionError(f"{defect} requires artifact content")
+    return _artifact_document(check)
+
+
+def _validate_observable_combination(
+    higher: str, lower: str
+) -> ValidatedPytestSession | PytestValidationFailure:
+    check = _check_with_defects(lower, higher)
+    _assert_observable_defect(check, lower)
+    _assert_observable_defect(check, higher)
+    return validate_pytest_execution(check)
+
+
+def test_fixture_guard_rejects_discarded_document_only_mutation() -> None:
+    check = _check_with_defects("artifact-missing", "parallelism")
+
+    with pytest.raises(AssertionError, match="parallelism requires artifact content"):
+        _assert_observable_defect(check, "parallelism")
+
+
 @pytest.mark.parametrize(
     ("preflight_defect", "lower_defect", "expected_code"),
     tuple(
@@ -524,7 +610,7 @@ def _check_with_defects(*defects: str) -> ExecutedCheck:
 def test_each_preflight_specific_code_wins_over_every_lower_observation(
     preflight_defect: str, lower_defect: str, expected_code: str
 ) -> None:
-    result = validate_pytest_execution(_check_with_defects(lower_defect, preflight_defect))
+    result = _validate_observable_combination(preflight_defect, lower_defect)
 
     assert isinstance(result, PytestValidationFailure)
     assert result.code == expected_code
@@ -539,7 +625,7 @@ def test_each_preflight_specific_code_wins_over_every_lower_observation(
         *(("primary-signal", lower, "terminated_by_signal") for lower in _PREFLIGHT_LATER_DEFECTS[2:]),
         *(("artifact-missing", lower, "artifact_missing") for lower in _MISSING_ARTIFACT_LATER_DEFECTS),
         *(("artifact-not-finalized", lower, "artifact_not_finalized") for lower in _NOT_FINALIZED_ARTIFACT_LATER_DEFECTS),
-        *((artifact_invalid, lower, "artifact_invalid") for artifact_invalid in _ARTIFACT_INVALID_DEFECTS for lower in ("parallelism", "retry", "exit-mismatch")),
+        *((artifact_invalid, lower, "artifact_invalid") for artifact_invalid in _CONTENT_BEARING_ARTIFACT_INVALID_DEFECTS for lower in ("parallelism", "retry", "exit-mismatch")),
         ("parallelism", "retry", "unsupported_parallelism"),
         ("parallelism", "exit-mismatch", "unsupported_parallelism"),
         ("retry", "exit-mismatch", "unsupported_retries"),
@@ -548,7 +634,7 @@ def test_each_preflight_specific_code_wins_over_every_lower_observation(
 def test_each_meaningful_higher_precedence_observation_wins(
     higher: str, lower: str, expected_code: str
 ) -> None:
-    result = validate_pytest_execution(_check_with_defects(lower, higher))
+    result = _validate_observable_combination(higher, lower)
 
     assert isinstance(result, PytestValidationFailure)
     assert result.code == expected_code
