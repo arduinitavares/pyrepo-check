@@ -130,9 +130,11 @@ ordering, strict-gate policy, Test Shortcut expansion, or tool command shapes.
 ### `config.py`: project facts
 
 `ProjectConfig` retains existing focused Ruff/Bandit targets and frozen-mode
-detection. It adds validated Test Shortcut definitions and detects whether the
-native Coverage.py configuration has the minimum fields required by this
-feature. It does not reinterpret Coverage.py exclusions or thresholds.
+detection. It adds validated Test Shortcut definitions and native Coverage.py
+facts: the absolute `pyproject.toml` path and an optional finite numeric
+`[tool.coverage.report].fail_under` value, retained without rounding or
+translation. The report table itself is optional. It does not reinterpret
+Coverage.py exclusions, precision, or other settings.
 
 ### `planning.py`: repository-quality policy
 
@@ -144,8 +146,8 @@ ordered `RunPlan`. It owns:
 - target precedence and strict repository-root behavior;
 - aggregate ordering and mutating-check exclusion;
 - Test Shortcut expansion and conflicts;
-- whether pytest is plain or coverage-instrumented;
-- exact tool command construction; and
+- whether coverage is requested and its static consumer-owned command
+  components; and
 - expected structured artifacts.
 
 Plan types live with the planner rather than in a generic models module.
@@ -155,6 +157,10 @@ Plan types live with the planner rather than in a generic models module.
 The executor owns subprocess invocation, working directory, duration
 measurement, stdout/stderr policy, continue-after-failure behavior, and exit
 aggregation. Every command is an argument vector executed without a shell.
+It supplies ephemeral run-owned paths and makes evidence-dependent choices,
+including whether a Coverage JSON command must add `--fail-under=0`; the shared
+pure threshold-eligibility policy prevents the executor and reporter from
+disagreeing.
 Production uses `subprocess.Popen` in binary mode and drains captured stdout and
 stderr concurrently with one reader thread per pipe. Each reader retains only
 the final 65,536 raw bytes in a fixed-size tail accumulator and records the
@@ -470,7 +476,9 @@ The preflight runs consumer Python with an argument-vector `-c` probe that
 emits the Python version and, on supported Python, imports `coverage` and emits
 `coverage.__version__`. Consumer Python below 3.13.15 is
 `CoverageError.unsupported_python`; only a stable Coverage.py release in the
-supported range proceeds. Its stdout/stderr and result are recorded as the
+supported range proceeds. A stable version is ASCII decimal `major.minor` or
+`major.minor.patch` only; pre-release, development, post-release, and local
+suffixes are unsupported. Its stdout/stderr and result are recorded as the
 `coverage_preflight` process.
 
 ### Collection and single-process data
@@ -530,6 +538,11 @@ uv run [--frozen] python -m coverage json \
   --keep-combined \
   [--fail-under=0]
 ```
+
+The Coverage JSON document is read through the bounded no-follow evidence
+reader with a 128 MiB ceiling. The SQLite data file is never retained in a
+Python observation: it is stream-copied and SHA-256 checked in 64 KiB chunks
+with a 512 MiB ceiling.
 
 Threshold eligibility requires all of:
 
@@ -1263,7 +1276,10 @@ percentages are calculated only for terminal display from exact integer counts.
 `Path.resolve(strict=False)` paths with native separators. Targets, pytest
 arguments, argument vectors, and node IDs preserve their original spelling and
 order. Coverage paths are project-relative with `/` separators and no leading
-`./`; a measured file outside the project root invalidates the artifact.
+`./`; each JSON file key resolves against the consumer root and must be an
+existing regular measured file whose resolved path remains contained by that
+resolved root. A measured file outside the project root invalidates the
+artifact.
 
 Durations are integer milliseconds rounded to nearest, with half milliseconds
 rounded upward. Process duration uses a monotonic clock around spawn through
@@ -1531,3 +1547,8 @@ The work is complete when all of the following are proven:
     strict aggregate gate.
 13. Dependency auditing, changed-code coverage, complexity, mutation, and
     flaky repetition remain outside this change.
+
+C3 completion deliberately excludes criterion 12: that dependency-locking and
+repository-coverage adoption requirement belongs to Milestone D. C3 therefore
+remains **Designed; not implemented** until its own implementation and evidence
+are complete.

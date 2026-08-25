@@ -5,6 +5,8 @@ import re
 import pytest
 
 from pyrepo_check.config import (
+    CoverageConfig,
+    InvalidCoverageConfigError,
     InvalidTestShortcutError,
     ProjectConfig,
     TestShortcut as ConfigTestShortcut,
@@ -307,3 +309,202 @@ def test_collects_existing_relative_and_absolute_positionals(tmp_path: Path) -> 
     )
 
     assert result == frozenset(("api.py", str(absolute)))
+
+
+def _write_coverage_config(root: Path, coverage_toml: str) -> Path:
+    pyproject_path = root / "pyproject.toml"
+    pyproject_path.write_text(coverage_toml, encoding="utf-8")
+    return pyproject_path
+
+
+@pytest.mark.parametrize("pyproject", (None, "[tool.pytest.ini_options]"))
+def test_loads_no_coverage_config_when_coverage_table_is_absent(
+    tmp_path: Path, pyproject: str | None
+) -> None:
+    if pyproject is not None:
+        _write_coverage_config(tmp_path, pyproject)
+
+    assert load_project_config(tmp_path).coverage is None
+
+
+@pytest.mark.parametrize(
+    "coverage_toml",
+    (
+        "[tool.coverage.report]\nshow_missing = true",
+        "[tool.coverage]\n",
+    ),
+)
+def test_rejects_partial_or_unrelated_coverage_configuration(
+    tmp_path: Path, coverage_toml: str
+) -> None:
+    _write_coverage_config(tmp_path, coverage_toml)
+
+    with pytest.raises(InvalidCoverageConfigError, match="pyproject.toml"):
+        load_project_config(tmp_path)
+
+
+@pytest.mark.parametrize("source_key", ("source", "source_pkgs", "source_dirs"))
+def test_loads_valid_coverage_source_family(tmp_path: Path, source_key: str) -> None:
+    pyproject_path = _write_coverage_config(
+        tmp_path,
+        f"[tool.coverage.run]\nbranch = true\n{source_key} = [\"src/package\"]",
+    )
+
+    config = load_project_config(tmp_path)
+
+    assert config.coverage == CoverageConfig(config_path=pyproject_path, fail_under=None)
+
+
+def test_loads_coverage_config_with_multiple_source_families_and_threshold(
+    tmp_path: Path,
+) -> None:
+    pyproject_path = _write_coverage_config(
+        tmp_path,
+        """
+[tool.coverage.run]
+branch = true
+source = ["src/package"]
+source_pkgs = ["package"]
+source_dirs = ["src"]
+
+[tool.coverage.report]
+fail_under = 87.5
+""".strip(),
+    )
+
+    assert load_project_config(tmp_path).coverage == CoverageConfig(
+        config_path=pyproject_path,
+        fail_under=87.5,
+    )
+
+
+@pytest.mark.parametrize(("fail_under", "expected"), (("87", 87), ("87.5", 87.5)))
+def test_loads_finite_numeric_coverage_threshold(
+    tmp_path: Path, fail_under: str, expected: int | float
+) -> None:
+    _write_coverage_config(
+        tmp_path,
+        "\n".join(
+            (
+                "[tool.coverage.run]",
+                "branch = true",
+                'source = ["src/package"]',
+                "[tool.coverage.report]",
+                f"fail_under = {fail_under}",
+            )
+        ),
+    )
+
+    coverage = load_project_config(tmp_path).coverage
+
+    assert coverage is not None
+    assert coverage.fail_under == expected
+
+
+@pytest.mark.parametrize(
+    "run_options",
+    (
+        "",
+        "parallel = false",
+        "concurrency = []",
+        "patch = []",
+        "parallel = false\nconcurrency = []\npatch = []",
+    ),
+)
+def test_loads_inactive_coverage_parallelism_options(
+    tmp_path: Path, run_options: str
+) -> None:
+    _write_coverage_config(
+        tmp_path,
+        "\n".join(
+            option
+            for option in (
+                "[tool.coverage.run]",
+                "branch = true",
+                'source = ["src/package"]',
+                run_options,
+            )
+            if option
+        ),
+    )
+
+    assert load_project_config(tmp_path).coverage is not None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("parallel", '"false"'),
+        ("parallel", "0"),
+        ("parallel", "[]"),
+        ("parallel", "{ enabled = false }"),
+        ("concurrency", '"thread"'),
+        ("concurrency", "0"),
+        ("concurrency", "false"),
+        ("concurrency", "true"),
+        ("concurrency", "{ enabled = false }"),
+        ("concurrency", '["thread"]'),
+        ("concurrency", "[1]"),
+        ("concurrency", '["thread", 1]'),
+        ("patch", '"subprocess"'),
+        ("patch", "0"),
+        ("patch", "false"),
+        ("patch", "true"),
+        ("patch", "{ enabled = false }"),
+        ("patch", '["subprocess"]'),
+        ("patch", "[1]"),
+        ("patch", '["subprocess", 1]'),
+    ),
+)
+def test_rejects_invalid_coverage_parallelism_options(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    _write_coverage_config(
+        tmp_path,
+        "\n".join(
+            (
+                "[tool.coverage.run]",
+                "branch = true",
+                'source = ["src/package"]',
+                f"{key} = {value}",
+            )
+        ),
+    )
+
+    with pytest.raises(InvalidCoverageConfigError, match="pyproject.toml"):
+        load_project_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "coverage_toml",
+    (
+        '[tool.coverage.run]\nsource = ["src/package"]',
+        '[tool.coverage.run]\nbranch = false\nsource = ["src/package"]',
+        '[tool.coverage.run]\nbranch = "true"\nsource = ["src/package"]',
+        '[tool.coverage.run]\nbranch = true',
+        '[tool.coverage.run]\nbranch = true\nsource = []',
+        '[tool.coverage.run]\nbranch = true\nsource = [""]',
+        '[tool.coverage.run]\nbranch = true\nsource = [1]',
+        '[tool.coverage.run]\nbranch = true\nsource = "src/package"',
+        '[tool.coverage]\nrun = []',
+        '[tool.coverage.run]\nbranch = true\nsource = []\nsource_pkgs = [" "]',
+        '[tool.coverage.run]\nbranch = true\nsource_dirs = [1]',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\nparallel = true',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\nconcurrency = ["thread"]',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\npatch = ["subprocess"]',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\n[tool.coverage.report]\nfail_under = true',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\n[tool.coverage.report]\nfail_under = "90"',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\n[tool.coverage.report]\nfail_under = nan',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\n[tool.coverage.report]\nfail_under = inf',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\n[tool.coverage.report]\nfail_under = -inf',
+        '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\n[tool.coverage.report]\nfail_under = []',
+        '[tool.coverage]\nreport = []\n[tool.coverage.run]\nbranch = true\nsource = ["src/package"]',
+    ),
+)
+def test_rejects_invalid_coverage_configuration(
+    tmp_path: Path, coverage_toml: str
+) -> None:
+    _write_coverage_config(tmp_path, coverage_toml)
+
+    with pytest.raises(InvalidCoverageConfigError, match="pyproject.toml"):
+        load_project_config(tmp_path)

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 import re
 import tomllib
 
@@ -18,10 +19,20 @@ class InvalidTestShortcutError(ValueError):
     """Raised when configured Test Shortcut data violates version 1."""
 
 
+class InvalidCoverageConfigError(ValueError):
+    """Raised when native Coverage.py configuration is incomplete or unsafe."""
+
+
 @dataclass(frozen=True)
 class TestShortcut:
     name: str
     pytest_args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CoverageConfig:
+    config_path: Path
+    fail_under: int | float | None
 
 
 @dataclass(frozen=True)
@@ -31,6 +42,7 @@ class ProjectConfig:
     bandit_targets: tuple[str, ...]
     frozen: bool
     test_shortcuts: tuple[TestShortcut, ...] = ()
+    coverage: CoverageConfig | None = None
 
 
 def collect_existing_positionals(
@@ -47,7 +59,8 @@ def _target_exists(root: Path, target: str) -> bool:
 
 def load_project_config(root: Path, *, no_frozen: bool = False) -> ProjectConfig:
     resolved_root = root.resolve()
-    table = _load_tool_table(resolved_root / "pyproject.toml")
+    pyproject_path = resolved_root / "pyproject.toml"
+    table, coverage = _load_configuration_tables(pyproject_path)
     return ProjectConfig(
         root=resolved_root,
         ruff_targets=_configured_targets(
@@ -64,24 +77,108 @@ def load_project_config(root: Path, *, no_frozen: bool = False) -> ProjectConfig
         ),
         frozen=(resolved_root / "uv.lock").exists() and not no_frozen,
         test_shortcuts=_configured_test_shortcuts(table, root=resolved_root),
+        coverage=_configured_coverage(coverage, config_path=pyproject_path),
     )
 
 
-def _load_tool_table(pyproject_path: Path) -> dict[str, Any]:
+def _load_configuration_tables(
+    pyproject_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     if not pyproject_path.exists():
-        return {}
+        return {}, None
 
     with pyproject_path.open("rb") as file:
         data = tomllib.load(file)
 
     tool = data.get("tool", {})
     if not isinstance(tool, dict):
-        return {}
+        return {}, None
 
     table = tool.get("pyrepo-check", {})
     if not isinstance(table, dict):
         raise ValueError("[tool.pyrepo-check] must be a TOML table")
-    return table
+    raw_coverage = tool.get("coverage")
+    if raw_coverage is None:
+        return table, None
+    if not isinstance(raw_coverage, dict):
+        raise InvalidCoverageConfigError(
+            f"Invalid coverage configuration in {pyproject_path}: "
+            "[tool.coverage] must be a TOML table"
+        )
+    return table, raw_coverage
+
+
+def _configured_coverage(
+    table: dict[str, Any] | None,
+    *,
+    config_path: Path,
+) -> CoverageConfig | None:
+    if table is None:
+        return None
+
+    run = table.get("run")
+    if not isinstance(run, dict):
+        _invalid_coverage(config_path, "[tool.coverage.run] must be a TOML table")
+    if run.get("branch") is not True:
+        _invalid_coverage(config_path, "[tool.coverage.run].branch must be true")
+    if not _has_coverage_source(run):
+        _invalid_coverage(
+            config_path,
+            "[tool.coverage.run] requires a non-empty source, source_pkgs, or source_dirs entry",
+        )
+    if "parallel" in run and (
+        not isinstance(run["parallel"], bool) or run["parallel"]
+    ):
+        _invalid_coverage(
+            config_path,
+            "[tool.coverage.run].parallel must be false when present",
+        )
+    for key in ("concurrency", "patch"):
+        if key not in run:
+            continue
+        value = run[key]
+        if (
+            not isinstance(value, list)
+            or not all(isinstance(item, str) for item in value)
+            or value
+        ):
+            _invalid_coverage(
+                config_path,
+                f"[tool.coverage.run].{key} must be an empty list of strings when present",
+            )
+
+    report = table.get("report")
+    if report is not None and not isinstance(report, dict):
+        _invalid_coverage(config_path, "[tool.coverage.report] must be a TOML table")
+    fail_under = None if report is None else report.get("fail_under")
+    if fail_under is not None and (
+        isinstance(fail_under, bool)
+        or not isinstance(fail_under, int | float)
+        or not math.isfinite(fail_under)
+    ):
+        _invalid_coverage(
+            config_path,
+            "[tool.coverage.report].fail_under must be a finite TOML integer or float",
+        )
+    return CoverageConfig(config_path=config_path, fail_under=fail_under)
+
+
+def _has_coverage_source(run: dict[str, Any]) -> bool:
+    found = False
+    for key in ("source", "source_pkgs", "source_dirs"):
+        value = run.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return False
+        found = found or any(item.strip() for item in value)
+    return found
+
+
+def _invalid_coverage(config_path: Path, detail: str) -> NoReturn:
+    raise InvalidCoverageConfigError(
+        f"Invalid coverage configuration in {config_path}: {detail}"
+    )
 
 
 def _configured_targets(
