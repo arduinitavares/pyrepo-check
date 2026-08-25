@@ -2,8 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from pyrepo_check.config import ProjectConfig, TestShortcut as ConfigTestShortcut
+from pyrepo_check.config import (
+    CoverageConfig,
+    ProjectConfig,
+    TestShortcut as ConfigTestShortcut,
+)
 from pyrepo_check.planning import (
+    CoverageExecutionPlan,
     PlannedCheck,
     PlanningFacts,
     PlanningFailure,
@@ -34,6 +39,7 @@ def make_config(
     bandit_targets: tuple[str, ...] = ("src",),
     frozen: bool = False,
     test_shortcuts: tuple[ConfigTestShortcut, ...] = (),
+    coverage: CoverageConfig | None = None,
 ) -> ProjectConfig:
     return ProjectConfig(
         root=root,
@@ -41,6 +47,7 @@ def make_config(
         bandit_targets=bandit_targets,
         frozen=frozen,
         test_shortcuts=test_shortcuts,
+        coverage=coverage,
     )
 
 
@@ -50,6 +57,111 @@ def command_names(plan: RunPlan) -> tuple[str, ...]:
 
 def commands(plan: RunPlan) -> tuple[tuple[str, ...], ...]:
     return tuple(check.command for check in plan.checks)
+
+
+def test_plans_coverage_matrix_without_changing_plain_pytest_commands(tmp_path: Path) -> None:
+    coverage = CoverageConfig(tmp_path / "pyproject.toml", 87.5)
+    shortcut = ConfigTestShortcut("unit", ("tests/unit",))
+    cases = (
+        (("pytest",), False, True, True, (), None, (), "focused", "complete"),
+        (
+            ("pytest", "tests/unit.py"),
+            False,
+            True,
+            True,
+            (),
+            None,
+            ("tests/unit.py",),
+            "focused",
+            "partial",
+        ),
+        (("pytest",), False, True, True, (), shortcut, ("tests/unit",), "focused", "partial"),
+        ((), False, True, True, (), None, (), "strict_aggregate", "complete"),
+        ((), False, False, True, (), None, (), "strict_aggregate", "complete"),
+        ((), False, False, False, (), None, (), "strict_aggregate", "unavailable"),
+        (("pytest",), False, False, True, (), None, (), "focused", "not_requested"),
+        (
+            ("tests/unit.py",),
+            True,
+            True,
+            True,
+            ("tests/unit.py",),
+            None,
+            ("tests/unit.py",),
+            "focused",
+            "partial",
+        ),
+    )
+    for (
+        positionals,
+        all_selected,
+        requested,
+        configured,
+        existing,
+        test_shortcut,
+        expected_pytest_args,
+        mode,
+        scope,
+    ) in cases:
+        plan = plan_run(
+            RunRequest(
+                tmp_path,
+                positionals,
+                all_selected,
+                False,
+                coverage_requested=requested,
+                test_shortcut=test_shortcut.name if test_shortcut else None,
+            ),
+            make_config(
+                tmp_path,
+                coverage=coverage if configured else None,
+                test_shortcuts=(test_shortcut,) if test_shortcut else (),
+            ),
+            PlanningFacts(frozenset(existing)),
+        )
+        pytest_check = next(check for check in plan.checks if check.name == "pytest")
+        pytest_plan = pytest_check.pytest
+        assert pytest_plan is not None
+        assert plan.mode == mode
+        assert plan.planned_coverage_scope == scope
+        assert pytest_plan.pytest_args == expected_pytest_args
+        assert pytest_check.command == (
+            "uv", "run", "python", "-m", "pytest", *expected_pytest_args
+        )
+        if scope in {"not_requested", "unavailable"}:
+            assert pytest_plan.coverage is None
+        else:
+            assert pytest_plan.coverage == CoverageExecutionPlan(
+                ("uv", "run", "python"), tmp_path / "pyproject.toml", 87.5
+            )
+
+
+@pytest.mark.parametrize(
+    ("positionals", "all_selected"),
+    ((('ty',), False), (("tests/unit.py",), False)),
+)
+def test_rejects_explicit_coverage_before_checking_configuration(
+    tmp_path: Path, positionals: tuple[str, ...], all_selected: bool
+) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, positionals, all_selected, False, coverage_requested=True),
+            make_config(tmp_path),
+            PlanningFacts(frozenset(positionals)),
+        )
+
+    assert raised.value.code == "invalid_arguments"
+
+
+def test_requires_native_configuration_for_explicit_pytest_coverage(tmp_path: Path) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, ("pytest",), False, False, coverage_requested=True),
+            make_config(tmp_path),
+            PlanningFacts(frozenset()),
+        )
+
+    assert raised.value.code == "coverage_configuration_required"
 
 
 @pytest.mark.parametrize("frozen", (False, True))

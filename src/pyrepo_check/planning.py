@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
-from pyrepo_check.config import ProjectConfig
+from pyrepo_check.config import CoverageConfig, ProjectConfig
 
 
 CheckName = Literal[
@@ -19,6 +19,7 @@ CheckName = Literal[
 RunMode = Literal["focused", "strict_aggregate"]
 OutputFormat = Literal["terminal", "json"]
 PlannedTestScope = Literal["not_selected", "partial", "complete"]
+PlannedCoverageScope = Literal["not_requested", "unavailable", "partial", "complete"]
 PlanningErrorCode = Literal[
     "invalid_arguments",
     "invalid_project_config",
@@ -26,6 +27,7 @@ PlanningErrorCode = Literal[
     "unknown_check",
     "unknown_test_shortcut",
     "unknown_target",
+    "coverage_configuration_required",
     "internal_planning_error",
 ]
 
@@ -68,6 +70,7 @@ class RunRequest:
     no_frozen: bool
     output_format: OutputFormat = "terminal"
     test_shortcut: str | None = None
+    coverage_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,10 +79,19 @@ class PlanningFacts:
 
 
 @dataclass(frozen=True)
+class CoverageExecutionPlan:
+    consumer_python: tuple[str, ...]
+    config_path: Path
+    fail_under: int | float | None
+    artifact_protocol: Literal["coverage_v1"] = "coverage_v1"
+
+
+@dataclass(frozen=True)
 class PytestExecutionPlan:
     consumer_python: tuple[str, ...]
     pytest_args: tuple[str, ...]
     artifact_protocol: Literal["pytest_v1"] = "pytest_v1"
+    coverage: CoverageExecutionPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,7 @@ class RunPlan:
     test_shortcut: str | None = None
     pytest_args: tuple[str, ...] | None = None
     planned_test_scope: PlannedTestScope = "not_selected"
+    planned_coverage_scope: PlannedCoverageScope = "not_requested"
 
 
 def plan_run(
@@ -145,6 +158,31 @@ def plan_run(
         all_selected=request.all_selected,
     )
     pytest_selected = any(check.name == "pytest" for check in selected)
+    if request.coverage_requested and not pytest_selected:
+        raise PlanningFailure(
+            "invalid_arguments",
+            "--coverage requires pytest to be selected.",
+            hint="Use: pyrepo-check pytest --coverage",
+        )
+    coverage_enabled = request.coverage_requested or (
+        strict_all and config.coverage is not None
+    )
+    if request.coverage_requested and config.coverage is None:
+        raise PlanningFailure(
+            "coverage_configuration_required",
+            "--coverage requires a valid [tool.coverage.run] configuration.",
+            hint="Configure native Coverage.py settings in pyproject.toml.",
+        )
+    elif strict_all and config.coverage is None:
+        planned_coverage_scope = "unavailable"
+    elif coverage_enabled:
+        planned_coverage_scope = (
+            "partial" if targets or shortcut_args is not None else "complete"
+        )
+    else:
+        planned_coverage_scope = "not_requested"
+    if coverage_enabled and config.coverage is not None:
+        selected = _attach_coverage_plan(selected, config.coverage)
     if not pytest_selected:
         planned_pytest_args = None
         planned_test_scope: PlannedTestScope = "not_selected"
@@ -165,6 +203,28 @@ def plan_run(
         test_shortcut=request.test_shortcut if shortcut_args is not None else None,
         pytest_args=planned_pytest_args,
         planned_test_scope=planned_test_scope,
+        planned_coverage_scope=planned_coverage_scope,
+    )
+
+
+def _attach_coverage_plan(
+    selected: tuple[PlannedCheck, ...], coverage: CoverageConfig
+) -> tuple[PlannedCheck, ...]:
+    return tuple(
+        check
+        if check.pytest is None
+        else replace(
+            check,
+            pytest=replace(
+                check.pytest,
+                coverage=CoverageExecutionPlan(
+                    consumer_python=check.pytest.consumer_python,
+                    config_path=coverage.config_path,
+                    fail_under=coverage.fail_under,
+                ),
+            ),
+        )
+        for check in selected
     )
 
 

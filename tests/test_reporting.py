@@ -660,7 +660,10 @@ def test_serialize_json_projects_test_shortcut_selection_in_normative_order(
     assert payload["coverage"] is None
 
 
-@pytest.mark.parametrize("code", ("unknown_test_shortcut", "invalid_test_shortcut"))
+@pytest.mark.parametrize(
+    "code",
+    ("unknown_test_shortcut", "invalid_test_shortcut", "coverage_configuration_required"),
+)
 def test_serialize_json_accepts_test_shortcut_planning_errors(code: str) -> None:
     report = build_planning_error_report(cast(Any, code), "shortcut planning failed")
 

@@ -7,6 +7,7 @@ import sys
 from typing import cast
 
 from pyrepo_check.config import (
+    InvalidCoverageConfigError,
     InvalidTestShortcutError,
     collect_existing_positionals,
     load_project_config,
@@ -58,6 +59,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run a configured Test Shortcut in a pytest-only focused run.",
     )
     parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Plan Coverage.py collection for the selected pytest run.",
+    )
+    parser.add_argument(
         "checks",
         nargs="*",
         help=f"Optional check names and target paths. Checks: {CHECK_HELP}.",
@@ -79,10 +85,18 @@ def main(
         no_frozen=args.no_frozen,
         output_format=output_format,
         test_shortcut=args.shortcut,
+        coverage_requested=args.coverage,
     )
 
     try:
         config = load_project_config(request.root, no_frozen=request.no_frozen)
+    except InvalidCoverageConfigError as error:
+        return _write_planning_error(
+            "invalid_project_config",
+            str(error),
+            hint="Fix native [tool.coverage] settings in pyproject.toml.",
+            output_format=output_format,
+        )
     except InvalidTestShortcutError as error:
         return _write_planning_error(
             "invalid_test_shortcut",

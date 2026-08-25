@@ -76,6 +76,7 @@ _PLANNING_ERROR_CODES = frozenset(
         "unknown_check",
         "unknown_test_shortcut",
         "unknown_target",
+        "coverage_configuration_required",
         "internal_planning_error",
     )
 )

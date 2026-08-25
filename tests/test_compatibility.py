@@ -554,7 +554,7 @@ def test_help_surface_is_unchanged(
     output = capsys.readouterr()
     assert captured.value.code == 0
     assert output.out == """usage: pyrepo-check [-h] [--all] [--root ROOT] [--no-frozen]
-                    [--format {terminal,json}] [--shortcut NAME]
+                    [--format {terminal,json}] [--shortcut NAME] [--coverage]
                     [checks ...]
 
 Run Python repository quality checks.
@@ -573,6 +573,8 @@ options:
                         Output terminal diagnostics or one JSON document.
   --shortcut NAME       Run a configured Test Shortcut in a pytest-only
                         focused run.
+  --coverage            Plan Coverage.py collection for the selected pytest
+                        run.
 """
     assert output.err == ""
 

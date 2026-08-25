@@ -6,8 +6,8 @@ import sys
 
 import pytest
 
-from pyrepo_check.cli import main
-from pyrepo_check.config import ProjectConfig
+from pyrepo_check.cli import main, parse_args
+from pyrepo_check.config import InvalidCoverageConfigError, ProjectConfig
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
@@ -541,6 +541,92 @@ def test_cli_builds_request_and_executes_plan(
         )
     ]
     assert executed_plans == [expected_plan]
+
+
+@pytest.mark.parametrize("argv", (("--coverage", "pytest"), ("pytest", "--coverage")))
+def test_coverage_flag_is_parsed_and_forwarded(
+    tmp_path: Path, argv: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_requests: list[RunRequest] = []
+    planned_check = PlannedCheck("ty", ("ty",), tmp_path)
+    monkeypatch.setattr(
+        "pyrepo_check.cli.plan_run",
+        lambda request, _config, _facts: captured_requests.append(request)
+        or RunPlan("focused", (), (planned_check,)),
+    )
+    monkeypatch.setattr(
+        "pyrepo_check.cli.execute_plan",
+        lambda _plan, *, runner: ExecutionResult((executed_check(planned_check, 0),), 0),
+    )
+
+    assert main(("--root", str(tmp_path), *argv), runner=RecordingRunner()) == 0
+    assert captured_requests[0].coverage_requested is True
+
+
+def test_coverage_flag_appears_in_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        parse_args(("--help",))
+
+    assert raised.value.code == 0
+    assert "--coverage" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+def test_missing_coverage_configuration_is_a_zero_spawn_planning_error(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+) -> None:
+    runner = RecordingRunner()
+    argv = ["--root", str(tmp_path), "pytest", "--coverage"]
+    if output_format == "json":
+        argv[2:2] = ["--format", "json"]
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="coverage_configuration_required",
+        message="--coverage requires a valid [tool.coverage.run] configuration.",
+        hint="Configure native Coverage.py settings in pyproject.toml.",
+    )
+    assert result == 2
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+def test_invalid_native_coverage_configuration_is_a_zero_spawn_project_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    output_format: str,
+) -> None:
+    runner = RecordingRunner()
+    message = "Invalid coverage configuration in pyproject.toml: branch must be true"
+    monkeypatch.setattr(
+        "pyrepo_check.cli.load_project_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(InvalidCoverageConfigError(message)),
+    )
+    argv = ["--root", str(tmp_path), "pytest"]
+    if output_format == "json":
+        argv[2:2] = ["--format", "json"]
+
+    result = main(argv, runner=runner)
+
+    captured = capsysbinary.readouterr()
+    _assert_planning_error_output(
+        captured.out,
+        captured.err,
+        output_format=output_format,
+        code="invalid_project_config",
+        message=message,
+        hint="Fix native [tool.coverage] settings in pyproject.toml.",
+    )
+    assert result == 2
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize("output_format", ("terminal", "json"))
