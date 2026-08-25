@@ -255,6 +255,7 @@ def build_pytest_result(plan: RunPlan, check: ExecutedCheck) -> PytestResult:
         and set(final_nodeids).issubset(terminal_nodeids)
         and _count_total(evidence.counts) == evidence.collected
         and validated.exit_code in {0, 1, 5}
+        and (validated.exit_code != 5 or evidence.collected == 0)
     )
     status, error = _exit_result(validated.exit_code, complete, stopped_early)
     reasons = _scope_reasons(plan, validated, evidence, complete)
@@ -413,7 +414,7 @@ def _collection_issues(value: object) -> tuple[CollectionIssue, ...]:
 
 def _round_phase_durations(reports: list[ValidatedPhaseReport]) -> int:
     duration = sum((Decimal(str(report.duration)) for report in reports), Decimal())
-    return int((duration * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return int((duration * 1000).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _count_total(counts: PytestCounts) -> int:
@@ -557,7 +558,7 @@ def _has_unclassified_option(args: tuple[str, ...]) -> bool:
     while index < len(args):
         argument = args[index]
         if argument == "--":
-            return index + 1 < len(args)
+            return False
         if argument in neutral_with_operand:
             index += 2
             continue

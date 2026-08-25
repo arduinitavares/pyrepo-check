@@ -1030,3 +1030,116 @@ def test_teardown_failure_beats_a_normalized_xfail_without_reparsing_raw_metadat
     assert result.evidence is not None
     assert result.evidence.counts == PytestCounts(0, 0, 1, 0, 0, 0)
     assert result.evidence.special_outcomes == ()
+
+
+def test_exit_five_with_collected_evidence_is_failed_and_incomplete() -> None:
+    check = _check()
+
+    result = build_pytest_result(_plan(check), _with_exit(check, 5))
+
+    assert result.status == "failed"
+    assert result.complete is False
+    assert result.error is None
+    assert result.scope_reasons == ("effective_narrowing_option", "incomplete_session")
+
+
+@pytest.mark.parametrize(
+    "args",
+    (("--", "tests"), ("--", "tests", "--option-looking", "more-tests")),
+)
+def test_scope_treats_every_argument_after_delimiter_as_a_known_positional(
+    args: tuple[str, ...],
+) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["effective_args"] = list(args)
+    options = cast(dict[str, object], document["semantic_options"])
+    options["collection_paths"] = []
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.scope_reasons == ("effective_narrowing_option",)
+
+
+def test_large_finite_phase_duration_rounds_without_rejecting_valid_evidence() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    reports = cast(list[dict[str, object]], document["reports"])
+    reports[1]["duration"] = 1e30
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.evidence is not None
+    assert result.evidence.slowest == (SlowTest("tests/test_ok.py::test_ok", 10**33),)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stopped_early"),
+    ((1, True), (2, False)),
+)
+def test_incomplete_early_stop_or_interruption_keeps_partial_counts(
+    exit_code: int, stopped_early: bool
+) -> None:
+    check = _check()
+    document = _artifact_document(check)
+    reports = cast(list[dict[str, object]], document["reports"])
+    document["reports"] = [reports[0]]
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(
+        _plan(changed), _with_exit(changed, exit_code, stopped_early=stopped_early)
+    )
+
+    assert result.complete is False
+    assert result.evidence is not None
+    assert result.evidence.collected == 1
+    assert result.evidence.counts == PytestCounts(0, 0, 0, 0, 0, 0)
+    assert result.scope_reasons[-1] == "incomplete_session"
+
+
+def test_slowest_keeps_ten_deterministic_entries_at_a_duration_tie_boundary() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    nodeids = [f"test_{index:02d}" for index in range(12)]
+    collection = cast(dict[str, object], document["collection"])
+    collection["initial_nodeids"] = nodeids
+    collection["final_nodeids"] = nodeids
+    reports: list[dict[str, object]] = []
+    for nodeid in reversed(nodeids):
+        reports.extend(_phases(nodeid, "passed", "none", 0.001))
+    document["reports"] = reports
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.evidence is not None
+    assert result.evidence.slowest == tuple(SlowTest(f"test_{index:02d}", 3) for index in range(10))
+
+
+def test_collection_issue_order_breaks_nodeid_ties_by_message() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    collection = cast(dict[str, object], document["collection"])
+    collection["errors"] = [
+        {"nodeid": "same", "message": "zeta"},
+        {"nodeid": "same", "message": "alpha"},
+    ]
+    collection["skips"] = [
+        {"nodeid": "same", "message": "later"},
+        {"nodeid": "same", "message": "earlier"},
+    ]
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(_plan(changed), changed)
+
+    assert result.evidence is not None
+    assert result.evidence.collection_errors == (
+        CollectionIssue("same", "alpha"),
+        CollectionIssue("same", "zeta"),
+    )
+    assert result.evidence.collection_skips == (
+        CollectionIssue("same", "earlier"),
+        CollectionIssue("same", "later"),
+    )
