@@ -55,6 +55,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+from urllib.parse import urlsplit
 
 distribution_name, module_name, environment_root_text = sys.argv[1:]
 
@@ -86,6 +87,15 @@ def contained_by(candidate, root):
 
 def canonical_distribution_name(value):
     return re.sub(r"[-_.]+", "-", value).lower()
+
+
+def unique_json_object(pairs):
+    value = {}
+    for name, member in pairs:
+        if name in value:
+            raise ValueError("duplicate JSON object member")
+        value[name] = member
+    return value
 
 
 try:
@@ -138,7 +148,7 @@ except Exception as error:
     raise SystemExit(0)
 if direct_url_text is not None:
     try:
-        direct_url = json.loads(direct_url_text)
+        direct_url = json.loads(direct_url_text, object_pairs_hook=unique_json_object)
     except Exception as error:
         emit("unusable", version, origin, "direct URL metadata is invalid: %s" % type(error).__name__)
         raise SystemExit(0)
@@ -154,8 +164,25 @@ if direct_url_text is not None:
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
     url = direct_url["url"]
-    if editable is True or (isinstance(url, str) and url.lower().startswith("file:")):
+    if not url or url != url.strip() or any(character.isspace() for character in url):
+        emit("unusable", version, origin, "direct URL metadata is invalid")
+        raise SystemExit(0)
+    try:
+        parsed_url = urlsplit(url)
+        hostname = parsed_url.hostname
+        parsed_url.port
+    except ValueError:
+        emit("unusable", version, origin, "direct URL metadata is invalid")
+        raise SystemExit(0)
+    scheme = parsed_url.scheme.lower()
+    if not scheme:
+        emit("unusable", version, origin, "direct URL metadata is invalid")
+        raise SystemExit(0)
+    if editable is True or scheme == "file" or scheme.endswith("+file"):
         emit("unusable", version, origin, "dependency is not an ordinary distribution")
+        raise SystemExit(0)
+    if not parsed_url.netloc or hostname is None:
+        emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
 
 files = distribution.files

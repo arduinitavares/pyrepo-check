@@ -1660,6 +1660,86 @@ def test_standalone_dependency_probe_rejects_malformed_direct_url_metadata(
     assert "direct URL metadata is invalid" in payload["diagnostic"]
 
 
+@pytest.mark.parametrize(
+    "direct_url_text",
+    (
+        '{"url":"file:///local","url":"https://example.invalid/tool.whl"}',
+        (
+            '{"url":"https://example.invalid/tool.whl",'
+            '"dir_info":{"editable":true},"dir_info":{"editable":false}}'
+        ),
+        (
+            '{"url":"https://example.invalid/tool.whl",'
+            '"dir_info":{"editable":true,"editable":false}}'
+        ),
+    ),
+    ids=(
+        "duplicate-url-hides-local",
+        "duplicate-dir-info-hides-editable",
+        "nested-duplicate-editable",
+    ),
+)
+def test_standalone_dependency_probe_rejects_duplicate_direct_url_members_before_import(
+    tmp_path: Path,
+    direct_url_text: str,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    imported = project / "imported"
+    _write_raw_direct_url_distribution(site_packages, imported, direct_url_text)
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert "direct URL metadata is invalid" in payload["diagnostic"]
+    assert not imported.exists()
+
+
+@pytest.mark.parametrize("url", ("", " ", "\t\n"), ids=("empty", "space", "whitespace"))
+def test_standalone_dependency_probe_rejects_blank_direct_url_before_import(
+    tmp_path: Path,
+    url: str,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    imported = project / "imported"
+    _write_raw_direct_url_distribution(
+        site_packages,
+        imported,
+        json.dumps({"url": url}, separators=(",", ":")),
+    )
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert "direct URL metadata is invalid" in payload["diagnostic"]
+    assert not imported.exists()
+
+
+def test_standalone_dependency_probe_accepts_valid_remote_direct_url(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    imported = project / "imported"
+    _write_raw_direct_url_distribution(
+        site_packages,
+        imported,
+        (
+            '{"url":"https://example.invalid/tool.whl",'
+            '"archive_info":{"hash":"sha256=abc"}}'
+        ),
+    )
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "available"
+    assert imported.read_text(encoding="utf-8") == "imported"
+
+
 @pytest.mark.parametrize("symlink_kind", ("origin", "ancestor"))
 def test_standalone_dependency_probe_rejects_symlinks_before_import(
     tmp_path: Path,
@@ -1819,6 +1899,23 @@ def _write_distribution(
         (metadata / "direct_url.json").write_text(
             json.dumps(direct_url), encoding="utf-8"
         )
+
+
+def _write_raw_direct_url_distribution(
+    site_packages: Path,
+    imported: Path,
+    direct_url_text: str,
+) -> None:
+    _write_distribution(
+        site_packages,
+        version="8.4.2",
+        module_source=(
+            "from pathlib import Path\n"
+            f"Path({str(imported)!r}).write_text('imported', encoding='utf-8')\n"
+        ),
+    )
+    metadata = site_packages / "sample_dep-8.4.2.dist-info/direct_url.json"
+    metadata.write_text(direct_url_text, encoding="utf-8")
 
 
 def _run_dependency_probe(
