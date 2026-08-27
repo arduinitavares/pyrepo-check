@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import inspect
+import os
+import signal
 import subprocess  # nosec B404
+import sys
 import threading
+import tracemalloc
 
 import pytest
 
@@ -139,9 +144,11 @@ def test_public_execute_plan_delegates_once_without_legacy_adapters(
         tool_environment: ToolEnvironmentObservation | None,
         runner: ProcessRunner | None,
         clock_ns: object,
+        terminal_writer: object,
     ) -> object:
         calls.append((delegated_plan, tool_environment, runner))
         assert clock_ns is clock
+        assert terminal_writer is None
         return sentinel
 
     def legacy_must_not_run(*_args: object, **_kwargs: object) -> object:
@@ -315,6 +322,118 @@ def test_production_capture_uses_distinct_readers_and_exact_bounded_tails(
     assert stdout.closed_by_reader and stderr.closed_by_reader
 
 
+def test_capture_streams_24_mib_per_pipe_with_bounded_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    total_bytes = 24 * 1024 * 1024
+    accumulators: list[execution._TailAccumulator] = []
+    accumulator_type = execution._TailAccumulator
+
+    def make_accumulator() -> execution._TailAccumulator:
+        accumulator = accumulator_type()
+        accumulators.append(accumulator)
+        return accumulator
+
+    popen = _FakePopen(
+        _VirtualPipe(total_bytes, ord("x")),
+        _VirtualPipe(total_bytes, ord("y")),
+    )
+    _install_fake_popen(monkeypatch, popen)
+    monkeypatch.setattr(execution, "_TailAccumulator", make_accumulator)
+
+    tracemalloc.start()
+    try:
+        process = execute_process(
+            role="primary",
+            command=("tool",),
+            cwd=tmp_path,
+            capture_output=True,
+            runner=None,
+            clock_ns=monotonic_clock(),
+        )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(accumulators) == 2
+    assert peak_bytes < 4 * 1024 * 1024
+    assert process.stdout == CapturedBytes(
+        b"x" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES
+    )
+    assert process.stderr == CapturedBytes(
+        b"y" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES
+    )
+
+
+def test_reader_start_failure_returns_promptly_when_descendant_retains_pipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready_path = tmp_path / "descendant-ready"
+    pid_path = tmp_path / "descendant-pid"
+    source = (
+        "from pathlib import Path\n"
+        "import subprocess, sys, time\n"
+        f"pid_path = Path({str(pid_path)!r})\n"
+        f"ready_path = Path({str(ready_path)!r})\n"
+        "descendant = subprocess.Popen(\n"  # nosec B603
+        "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "    stdout=sys.stdout, stderr=sys.stderr,\n"
+        ")\n"
+        "pid_path.write_text(str(descendant.pid))\n"
+        "ready_path.write_text('ready')\n"
+        "time.sleep(30)\n"
+    )
+    real_thread = threading.Thread
+    start_calls = 0
+
+    class FailSecondStartThread(real_thread):
+        def start(self) -> None:
+            nonlocal start_calls
+            start_calls += 1
+            if start_calls == 2:
+                raise RuntimeError("synthetic stderr reader start failure")
+            super().start()
+            deadline = execution.time.monotonic() + 2
+            while not ready_path.exists() and execution.time.monotonic() < deadline:
+                threading.Event().wait(0.01)
+            assert ready_path.exists(), "child/descendant readiness handshake failed"
+
+    monkeypatch.setattr(execution.threading, "Thread", FailSecondStartThread)
+    completed = threading.Event()
+    result_holder: list[execution.ExecutedProcess] = []
+
+    def invoke() -> None:
+        result_holder.append(
+            execute_process(
+                role="primary",
+                command=(sys.executable, "-c", source),
+                cwd=tmp_path,
+                capture_output=True,
+                runner=None,
+                clock_ns=execution.time.monotonic_ns,
+            )
+        )
+        completed.set()
+
+    watchdog = real_thread(target=invoke, daemon=True)
+    watchdog.start()
+    returned_promptly = completed.wait(timeout=0.8)
+    try:
+        descendant_pid = int(pid_path.read_text())
+        os.kill(descendant_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    watchdog.join(timeout=2)
+
+    assert returned_promptly, "failure cleanup blocked on a pipe retained by a descendant"
+    assert not watchdog.is_alive(), "descendant pipe probe could not be released"
+    assert result_holder[0].spawn_error == (
+        "stderr reader start failed: RuntimeError: synthetic stderr reader start failure"
+    )
+
+
 def test_pipe_drain_error_is_typed_and_reaps_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -338,6 +457,164 @@ def test_pipe_drain_error_is_typed_and_reaps_child(
     assert process.stdout is None and process.stderr is None
     assert process.spawn_error == "stdout drain failed: OSError: synthetic drain failure"
     assert popen.terminated
+
+
+def test_cleanup_failures_return_with_only_daemon_blocked_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    reader_started = threading.Event()
+
+    class BlockingPipe(_VirtualPipe):
+        def readinto(self, buffer: bytearray | memoryview) -> int:
+            del buffer
+            if self.reader_ident is None:
+                self.reader_ident = threading.get_ident()
+                reader_started.set()
+            release.wait()
+            return 0
+
+        def close(self) -> None:
+            if threading.get_ident() != self.reader_ident:
+                release.wait()
+            super().close()
+
+    blocked = BlockingPipe(0, ord("y"))
+    popen = _FakePopen(
+        _VirtualPipe(0, ord("x"), fail_after_reads=0),
+        blocked,
+        cleanup_errors=True,
+    )
+    _install_fake_popen(monkeypatch, popen)
+    real_thread = threading.Thread
+    readers: list[threading.Thread] = []
+
+    class RecordingThread(real_thread):
+        def __init__(
+            self,
+            *,
+            target: Callable[..., object] | None = None,
+            args: tuple[object, ...] = (),
+            name: str | None = None,
+            daemon: bool | None = None,
+        ) -> None:
+            super().__init__(target=target, args=args, name=name, daemon=daemon)
+            readers.append(self)
+
+    monkeypatch.setattr(execution.threading, "Thread", RecordingThread)
+    completed = threading.Event()
+    result_holder: list[execution.ExecutedProcess] = []
+
+    def invoke() -> None:
+        result_holder.append(
+            execute_process(
+                role="primary",
+                command=("tool",),
+                cwd=tmp_path,
+                capture_output=True,
+                runner=None,
+                clock_ns=monotonic_clock(),
+            )
+        )
+        completed.set()
+
+    watchdog = real_thread(target=invoke, daemon=True)
+    watchdog.start()
+    assert reader_started.wait(timeout=1)
+    returned_promptly = completed.wait(timeout=0.6)
+    try:
+        assert returned_promptly, "failure cleanup blocked on the reader-owned pipe lock"
+        assert popen.terminated and popen.killed
+        assert len(readers) == 2
+        assert all(reader.daemon for reader in readers)
+        assert readers[1].is_alive()
+        assert blocked.close_idents == []
+        assert result_holder[0].spawn_error == (
+            "stdout drain failed: OSError: synthetic drain failure"
+        )
+    finally:
+        release.set()
+        watchdog.join(timeout=1)
+        for reader in readers:
+            reader.join(timeout=1)
+
+    assert not watchdog.is_alive()
+    assert all(not reader.is_alive() for reader in readers)
+
+
+def test_daemon_blocked_reader_does_not_prevent_interpreter_shutdown() -> None:
+    probe = inspect.cleandoc(
+        """
+        from pathlib import Path
+        import threading
+
+        from pyrepo_check import execution
+
+
+        class ErrorPipe:
+            def readinto(self, _buffer):
+                raise OSError("synthetic drain failure")
+
+            def close(self):
+                return None
+
+
+        class BlockingPipe:
+            def readinto(self, _buffer):
+                threading.Event().wait()
+                return 0
+
+            def close(self):
+                threading.Event().wait()
+
+
+        class FailedCleanupProcess:
+            def __init__(self):
+                self.stdout = ErrorPipe()
+                self.stderr = BlockingPipe()
+
+            def terminate(self):
+                raise OSError("synthetic terminate failure")
+
+            def kill(self):
+                raise OSError("synthetic kill failure")
+
+            def wait(self, timeout=None):
+                del timeout
+                raise OSError("synthetic wait failure")
+
+
+        execution.subprocess.Popen = lambda *_args, **_kwargs: FailedCleanupProcess()
+        try:
+            execution._run_bounded_process(
+                ("unused",),
+                cwd=Path.cwd(),
+                capture_output=True,
+                environment=None,
+            )
+        except execution._ProcessExecutionFailure as error:
+            assert str(error) == (
+                "stdout drain failed: OSError: synthetic drain failure"
+            )
+        else:
+            raise AssertionError("expected typed execution failure")
+        print("finished", flush=True)
+        """
+    )
+
+    completed = subprocess.run(  # nosec B603
+        (sys.executable, "-c", probe),
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "finished\n"
+    assert completed.stderr == ""
 
 
 def test_second_reader_start_failure_closes_and_reaps_without_masking_root(

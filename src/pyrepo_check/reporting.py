@@ -22,6 +22,7 @@ from pyrepo_check.execution import (
     ExecutedCheck,
     ExecutedProcess,
     ExecutionResult,
+    format_terminal_environment_line,
     PythonObservation,
     RepositoryCheckObservation,
     RepositoryEnvironmentObservation,
@@ -1172,7 +1173,10 @@ def _validate_coverage_correlation_v2(
     if not instrumented:
         _invalid("available requested Coverage must instrument pytest")
     primary = check.processes[0]
-    if primary.outcome != "exited" or primary.exit_code not in {0, 1, 5}:
+    reserved_pytest_exit = (
+        primary.outcome == "exited" and primary.exit_code in {2, 3, 4}
+    )
+    if primary.outcome != "exited" or primary.exit_code not in {0, 1, 2, 3, 4, 5}:
         if coverage_json is not None:
             _invalid("Coverage JSON cannot follow an incomplete pytest primary")
         if (
@@ -1182,11 +1186,20 @@ def _validate_coverage_correlation_v2(
         ):
             _invalid("incomplete instrumented pytest requires Coverage error evidence")
         return
+    if reserved_pytest_exit and (
+        check.error is None or check.error.code != "check_execution_failed"
+    ):
+        _invalid("reserved pytest exit requires Check-level execution error")
     session_incomplete = (
         pytest_result.error is not None
         and pytest_result.error.code == "session_incomplete"
     )
-    if not pytest_result.complete and not session_incomplete and coverage_json is not None:
+    if (
+        not pytest_result.complete
+        and not session_incomplete
+        and not reserved_pytest_exit
+        and coverage_json is not None
+    ):
         _invalid("Coverage JSON cannot follow incomplete pytest evidence")
     if coverage.status != "error":
         if coverage_json is None:
@@ -1200,7 +1213,11 @@ def _validate_coverage_correlation_v2(
         _invalid("Coverage error result requires a typed error")
     coverage_error = cast(CoverageError, coverage.error)
     if coverage_json is None:
-        if coverage_error.code not in {"data_missing", "unsupported_parallelism"}:
+        if coverage_error.code not in {
+            "data_missing",
+            "unexpected_parallel_data",
+            "unsupported_parallelism",
+        }:
             _invalid("post-primary Coverage error requires its attempted JSON helper")
         return
     expected_outcome = {
@@ -1688,7 +1705,11 @@ def _build_check_result_v2(
     )
 
 
-def render_terminal(report: AgentReportV2) -> str:
+def render_terminal(
+    report: AgentReportV2,
+    *,
+    include_environment: bool = True,
+) -> str:
     """Render a validated report as a complete terminal-ready string."""
     validate_report_v2(report)
     if isinstance(report, PlanningErrorReportV2):
@@ -1703,15 +1724,17 @@ def render_terminal(report: AgentReportV2) -> str:
     lines: list[str] = []
     environment = report.repository_environment
     if (
+        include_environment
+        and
         environment.lock.status == "current"
         and environment.python is not None
         and environment.manager_version is not None
     ):
-        tool_version = ".".join(str(piece) for piece in report.tool_environment.python.version)
-        repository_version = ".".join(str(piece) for piece in environment.python.version)
         lines.append(
-            f"==> environment: tool Python {tool_version} -> "
-            f"repository Python {repository_version} (uv, locked)"
+            format_terminal_environment_line(
+                report.tool_environment.python.version,
+                environment.python.version,
+            ).removesuffix("\n")
         )
     lines.extend(("", f"==> pyrepo-check summary: {report.overall_status} ({run_context})"))
     if environment.error is not None:

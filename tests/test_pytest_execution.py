@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess  # nosec B404
 import threading
 from types import MappingProxyType
@@ -468,6 +469,129 @@ def test_writer_scandir_iteration_error_retains_validated_writer_and_diagnostic(
     )
 
 
+def test_prepared_pytest_multiple_writer_orchestration_fails_closed(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+    delegated = PreparedPytestRunner()
+
+    def duplicate_writer(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        completed = delegated(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        if "--module" in command and env is not None:
+            writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
+            (writer_directory / "pytest-writer-duplicate.json").write_text(
+                '{"schema_version":1,"writer_id":"duplicate","pid":1}',
+                encoding="utf-8",
+            )
+        return completed
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=None,
+        runner=duplicate_writer,
+    )
+
+    assert result.pytest is not None
+    assert len(result.pytest.artifact.writer_ids) == 1
+    assert result.pytest.artifact.diagnostic == "multiple writer markers were found"
+    plan, check = prepared_executed_check(prepared, result, coverage_requested=False)
+    pytest_result = build_pytest_result(plan, check, dependency_version="8.4.2")
+    assert pytest_result.status == "error"
+    assert pytest_result.error is not None
+    assert pytest_result.error.code == "artifact_invalid"
+
+
+def test_prepared_pytest_run_swap_retains_process_without_snapshotting_replacement(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+    record = execution_workspace.create_run_workspace(tmp_path.resolve())
+    verified = execution_workspace.open_verified_workspace(record)
+    launcher = stage_check_launcher(verified)
+    displaced = record.path.with_name(f"{record.path.name}-displaced")
+    replacement_artifact = record.path / "artifact.json"
+    delegated = PreparedPytestRunner()
+
+    def swap_after_primary(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        completed = delegated(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        if "--module" in command:
+            record.path.rename(displaced)
+            record.path.mkdir()
+            replacement_artifact.write_bytes(b'"untrusted replacement"')
+        return completed
+
+    check = CheckInvocation(
+        name="pytest",
+        arguments=("tests",),
+        pytest=PytestExecutionPlan(pytest_args=("tests",), coverage=None),
+    )
+    plan = RunPlan(
+        root=tmp_path.resolve(),
+        repository_python=DefaultRepositoryPython(),
+        mode="focused",
+        targets=(),
+        checks=(check,),
+        output_format="json",
+        planned_coverage_scope="not_requested",
+    )
+    try:
+        result = pytest_execution.execute_prepared_pytest(
+            check,
+            plan=plan,
+            prepared=prepared,
+            pytest_dependency=available_dependency("pytest", "8.4.2"),
+            coverage_dependency=None,
+            workspace=verified,
+            launcher=launcher,
+            output_format="json",
+            runner=swap_after_primary,
+            clock_ns=monotonic_clock(),
+        )
+        assert replacement_artifact.read_bytes() == b'"untrusted replacement"'
+    finally:
+        verified.close()
+        shutil.rmtree(record.path, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+    assert [process.role for process in result.processes] == ["primary"]
+    assert result.start is None
+    assert result.error is not None
+    assert result.error.code == "check_start_evidence_invalid"
+    assert result.pytest is not None
+    assert result.pytest.artifact.state == "unsafe_path"
+    assert result.pytest.artifact.content is None
+    assert result.pytest.artifact.diagnostic == (
+        "run directory identity mismatch after prepared pytest primary"
+    )
+
+
 def test_pytest_uses_prepared_repository_python_and_no_controller_pythonpath(
     tmp_path: Path,
 ) -> None:
@@ -684,21 +808,45 @@ def test_prepared_plain_pytest_rejects_reserved_launcher_exit(
     assert result.error.code == "check_execution_failed"
 
 
-@pytest.mark.parametrize("returncode", (2, 120))
-def test_prepared_instrumented_pytest_rejects_reserved_launcher_exit_without_helper(
+@pytest.mark.parametrize("returncode", (2, 3, 4))
+def test_prepared_instrumented_pytest_preserves_evidence_after_reserved_launcher_exit(
     tmp_path: Path,
     returncode: int,
+) -> None:
+    runner = PreparedPytestRunner(returncodes=(returncode, 0))
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert [process.returncode for process in result.processes] == [returncode, 0]
+    assert result.start is not None
+    assert result.error is not None
+    assert result.error.code == "check_execution_failed"
+    assert result.pytest is not None
+    assert result.pytest.artifact.state == "snapshot"
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "snapshot"
+    helper = result.processes[1]
+    assert helper.role == "coverage_json"
+    assert "--fail-under=0" in helper.command
+
+
+def test_prepared_instrumented_pytest_non_pytest_reserved_exit_skips_helper(
+    tmp_path: Path,
 ) -> None:
     result = run_prepared_pytest_fixture(
         prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
         pytest_dependency=available_dependency("pytest", "8.4.2"),
         coverage_dependency=available_dependency("coverage", "7.15.2"),
         coverage_requested=True,
-        runner=PreparedPytestRunner(returncodes=(returncode,)),
+        runner=PreparedPytestRunner(returncodes=(120,)),
     )
 
-    assert [process.returncode for process in result.processes] == [returncode]
-    assert result.start is not None
+    assert [process.returncode for process in result.processes] == [120]
     assert result.error is not None
     assert result.error.code == "check_execution_failed"
     assert result.coverage is not None

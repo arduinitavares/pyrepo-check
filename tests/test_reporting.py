@@ -389,6 +389,7 @@ def test_public_projections_validate_before_emitting() -> None:
         pytest_run_report(coverage="missing"),
         pytest_run_report(coverage="helper_failure"),
         pytest_run_report(exit_code=2, coverage="primary_failure"),
+        pytest_run_report(exit_code=2, coverage="reserved_evidence"),
         pytest_run_report(cleanup_failure=True),
         pytest_no_primary_report(stage="marker_preparation"),
         pytest_no_primary_report(stage="reporter_staging"),

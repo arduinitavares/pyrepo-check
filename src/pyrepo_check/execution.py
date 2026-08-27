@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import queue
+import shlex
 import subprocess  # nosec B404
 import sys
 import threading
@@ -28,6 +29,7 @@ ProcessRunner = Callable[
     ...,
     subprocess.CompletedProcess[tuple[str, ...]],
 ]
+TerminalWriter = Callable[[str], None]
 
 CAPTURE_LIMIT_BYTES = 65_536
 _PIPE_READ_BYTES = 64 * 1024
@@ -285,6 +287,7 @@ def execute_plan(
     tool_environment: ToolEnvironmentObservation | None = None,
     runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
+    terminal_writer: TerminalWriter | None = None,
 ) -> ExecutionResult:
     from pyrepo_check.repository_executor import execute_repository_plan
 
@@ -293,7 +296,29 @@ def execute_plan(
         tool_environment=tool_environment,
         runner=runner,
         clock_ns=clock_ns,
+        terminal_writer=terminal_writer,
     )
+
+
+def format_terminal_environment_line(
+    tool_python: tuple[int, int, int],
+    repository_python: tuple[int, int, int],
+) -> str:
+    tool_version = ".".join(str(piece) for piece in tool_python)
+    repository_version = ".".join(str(piece) for piece in repository_python)
+    return (
+        f"==> environment: tool Python {tool_version} -> "
+        f"repository Python {repository_version} (uv, locked)\n"
+    )
+
+
+def format_terminal_check_banner(
+    name: CheckName,
+    module: CheckModule,
+    arguments: tuple[str, ...],
+) -> str:
+    command = shlex.join(("python", "-m", module, *arguments))
+    return f"\n==> {name}: {command}\n"
 
 
 def execute_legacy_commands(

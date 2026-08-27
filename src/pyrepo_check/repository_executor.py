@@ -28,8 +28,11 @@ from pyrepo_check.execution import (
     RepositoryEnvironmentObservation,
     RepositoryPreparation,
     ProcessRunner,
+    TerminalWriter,
     ToolEnvironmentObservation,
     execute_process,
+    format_terminal_check_banner,
+    format_terminal_environment_line,
     observe_tool_environment,
 )
 from pyrepo_check import execution_workspace
@@ -154,6 +157,8 @@ def execute_invocation(
     launcher: StagedCheckLauncher,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    capture_output: bool = True,
+    terminal_writer: TerminalWriter | None = None,
 ) -> RepositoryCheckObservation:
     """Execute one real ordinary Check through trusted Repository Python dispatch."""
     marker_path = workspace.workspace.path / f"check-start-{secrets.token_hex(16)}.json"
@@ -167,6 +172,10 @@ def execute_invocation(
             f"Check start evidence could not be prepared: {error}",
         )
     module = CHECK_MODULE[invocation.name]
+    if terminal_writer is not None:
+        terminal_writer(
+            format_terminal_check_banner(invocation.name, module, invocation.arguments)
+        )
     process = execute_process(
         role="primary",
         command=build_launcher_command(
@@ -177,7 +186,7 @@ def execute_invocation(
             use_observed_python_executable=True,
         ),
         cwd=prepared.root,
-        capture_output=True,
+        capture_output=capture_output,
         runner=runner,
         clock_ns=clock_ns,
         environment=prepared.child_environment,
@@ -248,8 +257,11 @@ def execute_repository_plan(
     tool_environment: ToolEnvironmentObservation | None = None,
     runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
+    terminal_writer: TerminalWriter | None = None,
 ) -> RepositoryExecutionResult:
     """Compose preparation, dependencies, per-Check workspaces, and verification."""
+    observed_tool_environment = tool_environment or observe_tool_environment()
+    progress_writer = terminal_writer if plan.output_format == "terminal" else None
     safe = prepare_safe_repository(plan, runner=runner, clock_ns=clock_ns)
     preparation = safe.preparation
     checks: list[RepositoryCheckObservation] = []
@@ -263,6 +275,13 @@ def execute_repository_plan(
             for invocation in plan.checks
         )
     else:
+        if progress_writer is not None:
+            progress_writer(
+                format_terminal_environment_line(
+                    observed_tool_environment.python.version,
+                    preparation.prepared.python.version,
+                )
+            )
         dependencies = {
             dependency.name: dependency for dependency in preparation.observation.dependencies
         }
@@ -278,6 +297,7 @@ def execute_repository_plan(
                         coverage_dependency=dependencies.get("coverage"),
                         runner=runner,
                         clock_ns=clock_ns,
+                        terminal_writer=progress_writer,
                     )
                 )
                 continue
@@ -307,6 +327,7 @@ def execute_repository_plan(
                     coverage_dependency=None,
                     runner=runner,
                     clock_ns=clock_ns,
+                    terminal_writer=progress_writer,
                 )
             )
 
@@ -327,7 +348,7 @@ def execute_repository_plan(
             error=verification.error or repository_observation.error,
         )
     return RepositoryExecutionResult(
-        tool_environment=tool_environment or observe_tool_environment(),
+        tool_environment=observed_tool_environment,
         repository_environment=repository_observation,
         checks=tuple(checks),
     )
@@ -342,6 +363,7 @@ def _execute_in_workspace(
     coverage_dependency: DependencyObservation | None,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    terminal_writer: TerminalWriter | None,
 ) -> RepositoryCheckObservation:
     try:
         run_workspace = execution_workspace.create_run_workspace(prepared.root)
@@ -366,6 +388,8 @@ def _execute_in_workspace(
                 launcher=launcher,
                 runner=runner,
                 clock_ns=clock_ns,
+                capture_output=plan.output_format == "json",
+                terminal_writer=terminal_writer,
             )
         else:
             if pytest_dependency is None:
@@ -381,6 +405,7 @@ def _execute_in_workspace(
                 output_format=plan.output_format,
                 runner=runner,
                 clock_ns=clock_ns,
+                terminal_writer=terminal_writer,
             )
             observation = RepositoryCheckObservation(
                 invocation=invocation,

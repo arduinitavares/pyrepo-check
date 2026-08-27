@@ -292,6 +292,19 @@ def _run_external_json(
     return completed, json.loads(completed.stdout)
 
 
+def _run_external_terminal(
+    consumer: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # nosec B603
+        (str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"), *arguments),
+        cwd=consumer,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _write_forged_legacy_plugin(root: Path) -> None:
     (root / "pyrepo_check_pytest_evidence_plugin.py").write_text(
         """import json
@@ -806,6 +819,78 @@ def test_external_all_without_coverage_config_uses_plain_pytest_once(
     _assert_coverage_consumer_unchanged(consumer, before)
 
 
+@pytest.mark.parametrize(("failing", "expected_returncode"), ((False, 0), (True, 1)))
+def test_external_terminal_ordinary_orders_environment_banner_and_live_output(
+    tmp_path: Path,
+    failing: bool,
+    expected_returncode: int,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_coverage_all_consumer(consumer)
+    if failing:
+        (consumer / "src" / "coverage_consumer" / "__init__.py").write_text(
+            "import os\n", encoding="utf-8"
+        )
+    _lock_and_snapshot_consumer(consumer)
+
+    completed = _run_external_terminal(consumer, "ruff")
+
+    tool_version = ".".join(str(piece) for piece in sys.version_info[:3])
+    environment = (
+        f"==> environment: tool Python {tool_version} -> "
+        f"repository Python {tool_version} (uv, locked)\n"
+    )
+    banner = "==> ruff: python -m ruff check src tests\n"
+    assert completed.returncode == expected_returncode
+    assert completed.stderr == ""
+    assert completed.stdout.startswith(environment)
+    environment_index = completed.stdout.index(environment)
+    banner_index = completed.stdout.index(banner)
+    summary_index = completed.stdout.index("==> pyrepo-check summary:")
+    assert environment_index < banner_index < summary_index
+    assert completed.stdout.count("==> environment:") == 1
+    if failing:
+        assert banner_index < completed.stdout.index("F401") < summary_index
+
+
+@pytest.mark.parametrize(("failing", "expected_returncode"), ((False, 0), (True, 1)))
+def test_external_terminal_pytest_orders_environment_banner_and_live_output(
+    tmp_path: Path,
+    failing: bool,
+    expected_returncode: int,
+) -> None:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _write_coverage_all_consumer(consumer)
+    if failing:
+        _write_coverage_test_source(
+            consumer,
+            'def test_failure() -> None:\n    assert False, "terminal witness"\n',
+        )
+    _lock_and_snapshot_consumer(consumer)
+
+    completed = _run_external_terminal(consumer, "pytest")
+
+    tool_version = ".".join(str(piece) for piece in sys.version_info[:3])
+    environment = (
+        f"==> environment: tool Python {tool_version} -> "
+        f"repository Python {tool_version} (uv, locked)\n"
+    )
+    banner = "==> pytest: python -m pytest\n"
+    assert completed.returncode == expected_returncode
+    assert completed.stderr == ""
+    assert completed.stdout.startswith(environment)
+    environment_index = completed.stdout.index(environment)
+    banner_index = completed.stdout.index(banner)
+    child_output_index = completed.stdout.index("test session starts")
+    summary_index = completed.stdout.index("==> pyrepo-check summary:")
+    assert environment_index < banner_index < child_output_index < summary_index
+    assert completed.stdout.count("==> environment:") == 1
+    if failing:
+        assert banner_index < completed.stdout.index("terminal witness") < summary_index
+
+
 def test_external_missing_coverage_dependency_runs_plain_pytest_and_retains_error(
     tmp_path: Path,
 ) -> None:
@@ -1013,8 +1098,8 @@ def pytest_runtestloop(session: object) -> None:
                 "error",
                 False,
                 "internal_error",
-                "error",
-                "evidence_error",
+                "guidance",
+                "pytest_incomplete",
                 3,
                 0,
             ),
@@ -1166,7 +1251,7 @@ def test_creates_a_coverage_shard() -> None:
     assert pytest_check["status"] == "passed"
     assert pytest_check["error"] is None
     assert payload["coverage"]["status"] == "error"
-    assert payload["coverage"]["error"]["code"] == "data_missing"
+    assert payload["coverage"]["error"]["code"] == "unexpected_parallel_data"
     assert payload["coverage"]["scope"] == "partial"
     assert payload["coverage"]["evidence_complete"] is False
     assert payload["coverage"]["gate_eligible"] is False
@@ -1209,7 +1294,7 @@ def test_external_xdist_coverage_reports_parallelism_without_a_plain_fallback(
     assert payload["pytest"]["complete"] is False
     assert payload["pytest"]["error"]["code"] == "unsupported_parallelism"
     assert payload["coverage"]["status"] == "error"
-    assert payload["coverage"]["error"]["code"] == "data_missing"
+    assert payload["coverage"]["error"]["code"] == "unsupported_parallelism"
     assert pytest_check["error"]["code"] == "check_execution_failed"
     assert [process["role"] for process in processes] == ["primary"]
     assert len(primary_processes) == 1

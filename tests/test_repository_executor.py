@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess  # nosec B404
 
 import pytest
@@ -18,7 +20,7 @@ from pyrepo_check.execution import (
     PreparedRepositoryEnvironment,
 )
 from pyrepo_check import execution_workspace, repository_executor
-from pyrepo_check.planning import CoverageExecutionPlan, RunPlan, build_checks
+from pyrepo_check.planning import CoverageExecutionPlan, OutputFormat, RunPlan, build_checks
 from pyrepo_check.repository_executor import SafeRepositoryPreparation, prepare_safe_repository
 from pyrepo_check.repository_safety import (
     RepositoryStateSnapshot,
@@ -672,6 +674,7 @@ def test_prepared_pytest_launcher_failure_does_not_suppress_later_check(
             capture_output=capture_output,
             env=env,
         )
+        logical: tuple[str, ...] | None = None
         if "--module" in command:
             module_index = command.index("--module")
             separator_index = command.index("--", module_index + 2)
@@ -681,13 +684,16 @@ def test_prepared_pytest_launcher_failure_does_not_suppress_later_check(
                 command[module_index + 1],
                 *command[separator_index + 1 :],
             )
-            if "pytest" in logical:
-                test_support._publish_pytest_artifact(  # noqa: SLF001
-                    logical,
-                    env,
-                    completed.returncode,
-                )
-                test_support._publish_coverage_artifact(logical)  # noqa: SLF001
+        elif "-m" in command:
+            logical = command
+        if logical is not None and "pytest" in logical:
+            test_support._publish_pytest_artifact(  # noqa: SLF001
+                logical,
+                env,
+                completed.returncode,
+            )
+        if logical is not None:
+            test_support._publish_coverage_artifact(logical)  # noqa: SLF001
         return completed
 
     result = repository_executor.execute_repository_plan(
@@ -700,12 +706,195 @@ def test_prepared_pytest_launcher_failure_does_not_suppress_later_check(
     assert pytest_check.start is not None
     assert pytest_check.error is not None
     assert pytest_check.error.code == "check_execution_failed"
-    assert [process.role for process in pytest_check.processes] == ["primary"]
+    assert [process.role for process in pytest_check.processes] == (
+        ["primary", "coverage_json"] if returncode == 2 else ["primary"]
+    )
     assert pytest_check.coverage is not None
-    assert pytest_check.coverage.artifact.state == "data_missing"
+    assert pytest_check.coverage.artifact.state == (
+        "snapshot" if returncode == 2 else "data_missing"
+    )
     assert ty_check.start is not None
     assert ty_check.error is None
-    assert len(marker_runner.calls) == 2
+    assert len(marker_runner.calls) == (3 if returncode == 2 else 2)
+
+
+@pytest.mark.parametrize("output_format", ("terminal", "json"))
+def test_repository_execution_continues_after_terminal_or_capture_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_format: OutputFormat,
+) -> None:
+    plan = replace(
+        _internal_plan(tmp_path.resolve(), "ty", "bandit"),
+        output_format=output_format,
+    )
+    safe = _safe_preparation(
+        plan,
+        dependencies=(
+            available_dependency("ty", "0.0.35"),
+            available_dependency("bandit", "1.9.2"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    runner = launcher_aware_runner(
+        returncodes=(0, 0),
+        publish_valid_marker=True,
+        raise_on_call=1,
+        exception=OSError("synthetic primary failure"),
+    )
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    first, second = result.checks
+    assert first.error is not None
+    assert first.error.code == "spawn_failed"
+    assert second.start is not None
+    assert second.error is None
+    assert [call.capture_output for call in runner.calls] == [
+        output_format == "json",
+        output_format == "json",
+    ]
+
+
+def test_json_repository_execution_ignores_terminal_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    progress: list[str] = []
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=launcher_aware_runner(returncode=0, publish_valid_marker=True),
+        clock_ns=monotonic_clock(),
+        terminal_writer=progress.append,
+    )
+
+    assert result.checks[0].error is None
+    assert progress == []
+
+
+@pytest.mark.parametrize("stage_failure", (False, True), ids=("success", "staging-failure"))
+def test_repository_workspace_descriptors_close_on_all_execution_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage_failure: bool,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    original_close = execution_workspace.VerifiedRunWorkspace.close
+    closed: list[tuple[int, int]] = []
+
+    def close_and_verify(workspace: execution_workspace.VerifiedRunWorkspace) -> None:
+        descriptors = (workspace.parent_descriptor, workspace.descriptor)
+        original_close(workspace)
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+        closed.append(descriptors)
+
+    monkeypatch.setattr(execution_workspace.VerifiedRunWorkspace, "close", close_and_verify)
+    if stage_failure:
+        monkeypatch.setattr(
+            repository_executor,
+            "stage_check_launcher",
+            lambda _workspace: (_ for _ in ()).throw(OSError("staging blocked")),
+        )
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=launcher_aware_runner(returncode=0, publish_valid_marker=True),
+        clock_ns=monotonic_clock(),
+    )
+
+    assert len(closed) == 1
+    if stage_failure:
+        assert result.checks[0].error is not None
+        assert result.checks[0].error.code == "cleanup_failed"
+    else:
+        assert result.checks[0].error is None
+
+
+def test_prepared_pytest_cleanup_preserves_replacement_after_run_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "pytest")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("pytest", "8.4.2"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    delegated = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+    displaced: Path | None = None
+    replacement: Path | None = None
+
+    def swap_after_primary(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        nonlocal displaced, replacement
+        completed = delegated(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        if "--module" in command:
+            module_index = command.index("--module")
+            separator_index = command.index("--", module_index + 2)
+            logical = (
+                "python",
+                "-m",
+                command[module_index + 1],
+                *command[separator_index + 1 :],
+            )
+            test_support._publish_pytest_artifact(logical, env, completed.returncode)  # noqa: SLF001
+            assert env is not None
+            run_path = Path(env["PYREPO_CHECK_PYTEST_JSON"]).parent
+            displaced = run_path.with_name(f"{run_path.name}-displaced")
+            run_path.rename(displaced)
+            run_path.mkdir()
+            replacement = run_path / "replacement"
+            replacement.write_text("keep", encoding="utf-8")
+        return completed
+
+    try:
+        result = repository_executor.execute_repository_plan(
+            plan,
+            runner=swap_after_primary,
+            clock_ns=monotonic_clock(),
+        )
+        assert replacement is not None and replacement.read_text(encoding="utf-8") == "keep"
+    finally:
+        if replacement is not None:
+            shutil.rmtree(replacement.parent, ignore_errors=True)
+        if displaced is not None:
+            shutil.rmtree(displaced, ignore_errors=True)
+
+    check_result = result.checks[0]
+    assert [process.role for process in check_result.processes] == ["primary"]
+    assert check_result.error is not None
+    assert check_result.error.code == "cleanup_failed"
+    assert "identity mismatch" in check_result.error.message
 
 
 def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(

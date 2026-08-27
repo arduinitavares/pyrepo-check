@@ -19,6 +19,7 @@ from pyrepo_check.execution import (
     RepositoryEnvironmentObservation,
     RepositoryExecutionResult,
     ToolEnvironmentObservation,
+    TerminalWriter,
 )
 from pyrepo_check.planning import RunPlan
 from tests.support import RecordingRunner
@@ -190,8 +191,10 @@ def test_schema_v2_focused_ty_uses_injected_repository_environment_once(
         *,
         tool_environment: ToolEnvironmentObservation | None = None,
         runner: ProcessRunner | None = None,
+        terminal_writer: TerminalWriter | None = None,
     ) -> RepositoryExecutionResult:
         del runner
+        assert terminal_writer is None
         assert tool_environment is observed[0]
         return _successful_ty_execution(plan)
 

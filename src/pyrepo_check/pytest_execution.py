@@ -36,7 +36,9 @@ from pyrepo_check.execution import (
     ExecutedProcess,
     PreparedRepositoryEnvironment,
     ProcessRunner,
+    TerminalWriter,
     execute_process,
+    format_terminal_check_banner,
 )
 from pyrepo_check.coverage_execution import (
     CoverageArtifactObservation,
@@ -139,6 +141,7 @@ def execute_prepared_pytest(
     output_format: OutputFormat,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    terminal_writer: TerminalWriter | None = None,
 ) -> PreparedPytestExecution:
     """Run pytest through one already prepared Repository Environment."""
     pytest_plan = check.pytest
@@ -232,6 +235,8 @@ def execute_prepared_pytest(
         capture_output=output_format == "json",
         runner=runner,
         clock_ns=clock_ns,
+        terminal_writer=terminal_writer,
+        banner_arguments=pytest_plan.pytest_args,
     )
     if process is None:
         return PreparedPytestExecution(
@@ -255,7 +260,12 @@ def execute_prepared_pytest(
 
     pytest_observation = PytestExecutionObservation(pytest_preflight, artifact, None)
     if instrumented and coverage is not None:
-        if execution_error is not None:
+        reserved_pytest_exit = (
+            start is not None
+            and process.spawn_error is None
+            and process.returncode in {2, 3, 4}
+        )
+        if execution_error is not None and not reserved_pytest_exit:
             coverage = replace(
                 coverage,
                 artifact=CoverageArtifactObservation(
@@ -299,22 +309,17 @@ def execute_prepared_pytest(
                     check=check,
                     base_environment=primary_environment,
                     python_prefix=locked_repository_prefix(prepared),
-                    force_fail_under_zero=policy.force_fail_under_zero,
+                    force_fail_under_zero=(
+                        policy.force_fail_under_zero or reserved_pytest_exit
+                    ),
                     retain_threshold_exit_two=(
-                        policy.gate_eligible and policy.skipped_reason is None
+                        not reserved_pytest_exit
+                        and policy.gate_eligible
+                        and policy.skipped_reason is None
                     ),
                     runner=runner,
                     clock_ns=clock_ns,
                 )
-                if (
-                    coverage_process is None
-                    and coverage_artifact.state == "unexpected_parallel_data"
-                ):
-                    coverage_artifact = CoverageArtifactObservation(
-                        "data_missing",
-                        None,
-                        coverage_artifact.diagnostic,
-                    )
                 if coverage_process is not None:
                     processes.append(coverage_process)
                 if close_error is not None:
@@ -571,6 +576,8 @@ def _run_prepared_primary(
     capture_output: bool,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    terminal_writer: TerminalWriter | None,
+    banner_arguments: tuple[str, ...],
 ) -> tuple[ExecutedProcess | None, CheckStartObservation | None, CheckExecutionFailure | None]:
     marker_path = workspace.workspace.path / f"check-start-{secrets.token_hex(16)}.json"
     try:
@@ -587,6 +594,8 @@ def _run_prepared_primary(
             ),
         )
 
+    if terminal_writer is not None:
+        terminal_writer(format_terminal_check_banner(invocation.name, "pytest", banner_arguments))
     process = execute_process(
         role="primary",
         command=build_launcher_command(

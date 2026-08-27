@@ -161,11 +161,31 @@ def main(
             tool_environment=tool_environment,
         )
 
-    execution = execute_plan(plan, tool_environment=tool_environment, runner=runner)
+    terminal_progress_emitted = False
+
+    def write_terminal_progress(text: str) -> None:
+        nonlocal terminal_progress_emitted
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        terminal_progress_emitted = True
+
+    execution = execute_plan(
+        plan,
+        tool_environment=tool_environment,
+        runner=runner,
+        terminal_writer=write_terminal_progress if output_format == "terminal" else None,
+    )
     try:
         report = build_run_report(config.root, plan, execution)
         validate_report_v2(report)
-        rendered = serialize_json(report) if output_format == "json" else render_terminal(report)
+        rendered = (
+            serialize_json(report)
+            if output_format == "json"
+            else render_terminal(
+                report,
+                include_environment=not terminal_progress_emitted,
+            )
+        )
         exit_code = select_exit_code(report)
     except Exception as error:
         _write_reporting_fallback(error)

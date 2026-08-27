@@ -208,7 +208,12 @@ def pytest_run_report(
     coverage_result: CoverageResult | None = None
     module = "pytest"
     processes: tuple[ProcessResult, ...]
-    if coverage in {"available", "helper_failure", "primary_failure"}:
+    if coverage in {
+        "available",
+        "helper_failure",
+        "primary_failure",
+        "reserved_evidence",
+    }:
         module = "coverage"
         coverage_dependency = replace(
             pytest_dependency,
@@ -230,6 +235,8 @@ def pytest_run_report(
                 coverage_version="7.15.0",
                 error=CoverageError("data_missing", "pytest did not complete"),
             )
+        elif coverage == "reserved_evidence":
+            coverage_result = replace(complete_coverage_result(), scope="partial")
         else:
             coverage_result = complete_coverage_result()
     elif coverage == "missing":
@@ -271,7 +278,7 @@ def pytest_run_report(
         exit_code=exit_code,
     )
     processes = (primary,)
-    if coverage in {"available", "helper_failure"}:
+    if coverage in {"available", "helper_failure", "reserved_evidence"}:
         processes = (
             *processes,
             process_result(
@@ -287,14 +294,14 @@ def pytest_run_report(
             "pytest launcher returned a reserved exit.",
             None,
         )
-        if coverage == "primary_failure"
+        if coverage in {"primary_failure", "reserved_evidence"}
         else None
     )
     check = CheckResultV2(
         name="pytest",
         status=(
             "error"
-            if cleanup_failure or coverage == "primary_failure"
+            if cleanup_failure or coverage in {"primary_failure", "reserved_evidence"}
             else "passed"
             if exit_code == 0
             else "failed"
@@ -318,6 +325,7 @@ def pytest_run_report(
         "missing",
         "helper_failure",
         "primary_failure",
+        "reserved_evidence",
     }
     overall_status = (
         "error"
@@ -339,7 +347,13 @@ def pytest_run_report(
             planned_coverage_scope=(
                 "complete"
                 if coverage
-                in {"available", "missing", "helper_failure", "primary_failure"}
+                in {
+                    "available",
+                    "missing",
+                    "helper_failure",
+                    "primary_failure",
+                    "reserved_evidence",
+                }
                 else "not_requested"
             ),
         ),
@@ -356,7 +370,7 @@ def pytest_run_report(
                 evidence=complete_pytest_result().evidence,
                 error=PytestError("interrupted", "pytest was interrupted"),
             )
-            if coverage == "primary_failure"
+            if coverage in {"primary_failure", "reserved_evidence"}
             else complete_pytest_result(exit_code=exit_code)
         ),
         coverage=coverage_result,
@@ -3581,6 +3595,7 @@ def test_schema_v2_accepts_exact_pytest_coverage_producer_families() -> None:
         pytest_run_report(coverage="missing"),
         pytest_run_report(coverage="helper_failure"),
         pytest_run_report(exit_code=2, coverage="primary_failure"),
+        pytest_run_report(exit_code=2, coverage="reserved_evidence"),
         pytest_run_report(cleanup_failure=True),
         pytest_workspace_failure_report(),
     )
