@@ -5,6 +5,14 @@
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
 
+> **Proposed successor:** Once implemented, the
+> [Tool and Repository Environments design](2026-08-26-tool-repository-environments-design.md)
+> supersedes this document's Repository Python minimum, pytest/Coverage dependency
+> preflights, frozen/unfrozen execution and `--no-frozen` behavior, schema-v1-only
+> output, missing-Coverage no-fallback rule, inherited-`PYTHONPATH` rule, and
+> positive-child-exit precedence. Until then, this document still describes the
+> shipped behavior.
+
 ## Delivery status
 
 As of 2026-08-25, the prior research, design specification, Agent Skill, README

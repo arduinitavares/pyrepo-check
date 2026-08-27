@@ -1,0 +1,7 @@
+---
+status: accepted
+---
+
+# Separate the Tool Environment from Repository Environments
+
+pyrepo-check is installed once in an isolated Tool Environment while each uv repository owns its Repository Environment, Repository Python, and locked Check Dependencies. One run validates one Repository Python; a successful environment probe through `uv run --locked` proves that the lock is current and may rebuild the repository's `.venv` without authorizing tracked dependency-state changes. Pyrepo-check uses the repository's default dependency selection without guessing group names, leaves Analysis Python authority with Ruff and Ty, and initially supports CPython 3.10 through 3.13 as Repository Python. Missing, incompatible, shadowed, or unusable Check Dependencies fail explicitly without suppressing independent checks; Check tools must be ordinary metadata-backed distributions, while the repository itself may remain editable. A standalone launcher emits trusted inner-start evidence so an outer uv failure cannot masquerade as completed Check findings. Strict annotation and Ty policy remains unchanged, and schema version 2 Environment Evidence distinguishes orchestration from executed checks. This preserves an install-once workflow without forcing the Python requirement of pyrepo-check onto every repository; the trade-off is that each repository must provide a compatible, reproducible quality environment.
