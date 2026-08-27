@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +17,10 @@ from pyrepo_check.execution import (
     CheckExecutionFailure,
     DependencyObservation,
     ExecutedProcess,
+    PreparedRepositoryEnvironment,
+    PythonObservation,
 )
+from pyrepo_check import execution_workspace
 from pyrepo_check.planning import (
     CheckName,
     DefaultRepositoryPython,
@@ -143,6 +148,111 @@ def environment_probe_bytes(
         },
         separators=(",", ":"),
     ).encode()
+
+
+def prepared_repository(
+    root: Path,
+    python: tuple[int, int, int],
+) -> PreparedRepositoryEnvironment:
+    """Build one complete prepared Repository Environment test observation."""
+    resolved = root.resolve()
+    environment_root = resolved / ".venv"
+    executable = environment_root / "bin" / f"python-{'.'.join(map(str, python))}"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"")
+    return PreparedRepositoryEnvironment(
+        root=resolved,
+        path=environment_root,
+        python=PythonObservation("cpython", python, executable),
+        python_selection=DefaultRepositoryPython(),
+        manager_version="0.10.12",
+        child_environment={},
+    )
+
+
+@contextmanager
+def test_workspace(root: Path) -> Iterator[execution_workspace.VerifiedRunWorkspace]:
+    """Hold one real Task 1 workspace and clean it with the production seam."""
+    workspace = execution_workspace.create_run_workspace(root.resolve())
+    verified = execution_workspace.open_verified_workspace(workspace)
+    try:
+        yield verified
+    finally:
+        verified.close()
+        observation = execution_workspace.remove_run_workspace(
+            workspace,
+            repository_root=root.resolve(),
+        )
+        if observation is not None:
+            raise OSError(execution_workspace._cleanup_diagnostic(observation))
+
+
+setattr(test_workspace, "__test__", False)
+
+
+def launcher_aware_runner(
+    *,
+    returncode: int = 0,
+    publish_valid_marker: bool,
+    returncodes: tuple[int, ...] = (),
+    stdout: tuple[bytes | str | None, ...] = (),
+    stderr: tuple[bytes | str | None, ...] = (),
+    raise_on_call: int | None = None,
+    exception: Exception | None = None,
+) -> RecordingRunner:
+    """Return a scripted runner that publishes exact launcher start evidence."""
+
+    def publish(call: RecordedCall) -> None:
+        if not publish_valid_marker or "--evidence" not in call.command:
+            return
+        evidence_index = call.command.index("--evidence")
+        check_index = call.command.index("--check")
+        module_index = call.command.index("--module")
+        separator_index = call.command.index("--", module_index + 2)
+        python_index = call.command.index("--python")
+        executable = Path(call.command[python_index + 1])
+        version = tuple(
+            int(piece) for piece in executable.name.removeprefix("python-").split(".")
+        )
+        arguments = call.command[separator_index + 1 :]
+        digest = hashlib.sha256()
+        for argument in arguments:
+            encoded = argument.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        payload = {
+            "schema_version": 1,
+            "check": call.command[check_index + 1],
+            "module": call.command[module_index + 1],
+            "arguments_sha256": digest.hexdigest(),
+            "python": {
+                "implementation": "cpython",
+                "version": list(version),
+                "executable": str(executable),
+            },
+        }
+        marker = Path(call.command[evidence_index + 1])
+        descriptor = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            content = json.dumps(payload, separators=(",", ":")).encode()
+            os.write(descriptor, content)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    selected_returncodes = returncodes or (returncode,)
+    return RecordingRunner(
+        returncodes=selected_returncodes,
+        stdout=stdout,
+        stderr=stderr,
+        raise_on_call=raise_on_call,
+        exception=exception,
+        on_call=publish,
+    )
 
 
 def available_dependency(name: DependencyName, version: str) -> DependencyObservation:

@@ -5,14 +5,34 @@ import json
 from pathlib import Path
 import subprocess  # nosec B404
 
+import pytest
+
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.planning import CoverageExecutionPlan, build_checks
-from pyrepo_check.repository_executor import prepare_safe_repository
+from pyrepo_check.execution import (
+    DependencyObservation,
+    EnvironmentFailureObservation,
+    RepositoryEnvironmentObservation,
+    RepositoryPreparation,
+    ToolEnvironmentObservation,
+    PythonObservation,
+    PreparedRepositoryEnvironment,
+)
+from pyrepo_check import execution_workspace, repository_executor
+from pyrepo_check.planning import CoverageExecutionPlan, RunPlan, build_checks
+from pyrepo_check.repository_executor import SafeRepositoryPreparation, prepare_safe_repository
+from pyrepo_check.repository_safety import (
+    RepositoryStateSnapshot,
+    RepositoryVerificationResult,
+)
 from tests.support import (
     RecordingRunner,
+    available_dependency,
     environment_probe_bytes,
     focused_plan,
+    launcher_aware_runner,
+    missing_dependency,
     monotonic_clock,
+    prepared_repository,
 )
 
 
@@ -340,3 +360,205 @@ def _dependency_payload(
         },
         separators=(",", ":"),
     ).encode()
+
+
+def _internal_plan(root: Path, *names: str) -> RunPlan:
+    checks = build_checks(ProjectConfig(root=root, ruff_targets=(), bandit_targets=()))
+    plan = focused_plan(root, "ruff")
+    return replace(plan, checks=tuple(checks[name] for name in names))
+
+
+def _safe_preparation(
+    plan: RunPlan,
+    *,
+    dependencies: tuple[DependencyObservation, ...],
+    baseline: RepositoryStateSnapshot | None = None,
+    prepared_environment: PreparedRepositoryEnvironment | None = None,
+) -> SafeRepositoryPreparation:
+    selected = prepared_environment or prepared_repository(plan.root, (3, 12, 11))
+    observation = RepositoryEnvironmentObservation(
+        manager_version="0.10.12",
+        path=selected.path,
+        python_selection=plan.repository_python,
+        python=selected.python,
+        lock_path=plan.root / "uv.lock",
+        lock_status="current",
+        mutation_protection="unobserved",
+        dependencies=dependencies,
+        processes=(),
+        error=None,
+    )
+    return SafeRepositoryPreparation(
+        baseline,
+        RepositoryPreparation(selected, observation),
+    )
+
+
+def test_execute_repository_plan_keeps_dependency_errors_local_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ruff", "ty", "bandit", "pytest")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(
+            missing_dependency("ruff"),
+            available_dependency("ty", "0.0.35"),
+            available_dependency("bandit", "1.9.2"),
+            available_dependency("pytest", "8.4.2"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    runner = launcher_aware_runner(
+        publish_valid_marker=True,
+        returncodes=(0, 1, 0),
+    )
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert tuple(check.invocation.name for check in result.checks) == (
+        "ruff",
+        "ty",
+        "bandit",
+        "pytest",
+    )
+    assert result.checks[0].processes == ()
+    assert result.checks[0].error == missing_dependency("ruff").error
+    assert all(check.start is not None for check in result.checks[1:])
+    primary_calls = [call for call in runner.calls if "--evidence" in call.command]
+    assert tuple(call.command[call.command.index("--module") + 1] for call in primary_calls) == (
+        "ty",
+        "bandit",
+        "pytest",
+    )
+
+
+def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    monkeypatch.setattr(
+        execution_workspace,
+        "create_run_workspace",
+        lambda root: (_ for _ in ()).throw(OSError("setup blocked")),
+    )
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=RecordingRunner(),
+        clock_ns=monotonic_clock(),
+    )
+
+    check = result.checks[0]
+    assert check.error is not None
+    assert check.error.code == "cleanup_failed"
+    assert check.processes == ()
+
+
+def test_cleanup_failure_retains_real_primary_start_and_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    created: list[execution_workspace.RunWorkspace] = []
+    original_create = execution_workspace.create_run_workspace
+    original_remove = execution_workspace.remove_run_workspace
+
+    def record_create(root: Path) -> execution_workspace.RunWorkspace:
+        workspace = original_create(root)
+        created.append(workspace)
+        return workspace
+
+    monkeypatch.setattr(execution_workspace, "create_run_workspace", record_create)
+    monkeypatch.setattr(
+        execution_workspace,
+        "remove_run_workspace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup blocked")),
+    )
+    try:
+        result = repository_executor.execute_repository_plan(
+            plan,
+            runner=launcher_aware_runner(returncode=1, publish_valid_marker=True),
+            clock_ns=monotonic_clock(),
+        )
+    finally:
+        if created:
+            observation = original_remove(created[0], repository_root=plan.root)
+            assert observation is None
+
+    check = result.checks[0]
+    assert check.error is not None
+    assert check.error.code == "cleanup_failed"
+    assert check.start is not None
+    assert check.processes[0].returncode == 1
+    assert check.execution_environment == "repository"
+    assert check.analysis_python_authority is not None
+
+
+def test_final_repository_verification_runs_whenever_baseline_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ruff")
+    baseline = RepositoryStateSnapshot(None, (), ())
+    unavailable = RepositoryEnvironmentObservation(
+        manager_version=None,
+        path=None,
+        python_selection=plan.repository_python,
+        python=None,
+        lock_path=plan.root / "uv.lock",
+        lock_status="unverified",
+        mutation_protection="unobserved",
+        dependencies=(missing_dependency("ruff"),),
+        processes=(),
+        error=EnvironmentFailureObservation(
+            "repository_environment_failed",
+            "preparation failed",
+            None,
+        ),
+    )
+    safe = SafeRepositoryPreparation(
+        baseline,
+        RepositoryPreparation(None, unavailable),
+    )
+    called = False
+
+    def verify(*args: object, **kwargs: object) -> RepositoryVerificationResult:
+        nonlocal called
+        called = True
+        return RepositoryVerificationResult((), "protected_files", None)
+
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    monkeypatch.setattr(repository_executor, "verify_repository_state", verify)
+    tool = ToolEnvironmentObservation(
+        "test",
+        PythonObservation("cpython", (3, 13, 15), Path("/tool/python")),
+    )
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        tool_environment=tool,
+        runner=RecordingRunner(),
+        clock_ns=monotonic_clock(),
+    )
+
+    assert called
+    assert result.tool_environment is tool
+    assert result.repository_environment.mutation_protection == "protected_files"
+    assert result.checks[0].error is not None
+    assert result.checks[0].error.code == "repository_environment_unavailable"
