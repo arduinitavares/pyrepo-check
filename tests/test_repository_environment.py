@@ -172,6 +172,162 @@ def test_absolute_external_storage_override_is_accepted(
     assert validate_uv_storage_boundaries(root.resolve(), environment) is None
 
 
+def test_no_cache_validates_effective_temporary_storage_and_ignores_cache_dir(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    sentinel = root / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    environment = _external_storage_environment(tmp_path)
+    environment.update(
+        {
+            "UV_NO_CACHE": "1",
+            "UV_CACHE_DIR": str(root / "ineffective-cache"),
+            "TMPDIR": str(root / "temporary-cache-parent"),
+        }
+    )
+
+    failure = validate_uv_storage_boundaries(root.resolve(), environment)
+
+    assert failure is not None
+    assert failure.code == "unsafe_repository_environment"
+    assert "temporary" in failure.message.lower()
+    assert sentinel.read_bytes() == b"unchanged"
+    assert not (root / "ineffective-cache").exists()
+    assert not (root / "temporary-cache-parent").exists()
+
+
+def test_no_cache_accepts_external_temporary_storage_despite_unsafe_cache_override(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    environment = _external_storage_environment(tmp_path)
+    environment.update(
+        {
+            "UV_NO_CACHE": "true",
+            "UV_CACHE_DIR": str(root / "ineffective-cache"),
+            "TMPDIR": str(tmp_path / "external-temporary-cache-parent"),
+        }
+    )
+
+    assert validate_uv_storage_boundaries(root.resolve(), environment) is None
+
+
+def test_project_config_cache_inside_repository_stops_before_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    (tmp_path / "uv.toml").write_text('cache-dir = ".uv-write-cache"\n', encoding="utf-8")
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    _apply_external_storage_environment(monkeypatch, tmp_path.parent)
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("UV_NO_CACHE", raising=False)
+    runner = RecordingRunner()
+
+    preparation = prepare_repository_environment(
+        focused_plan(tmp_path, "ty"),
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert len(runner.calls) == 0
+    assert preparation.prepared is None
+    assert preparation.observation.error is not None
+    assert preparation.observation.error.code == "unsafe_repository_environment"
+    assert "configuration cache" in preparation.observation.error.message.lower()
+    assert sentinel.read_bytes() == b"unchanged"
+    assert not (tmp_path / ".uv-write-cache").exists()
+
+
+def test_project_config_no_cache_validates_temporary_storage_before_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    (tmp_path / "uv.toml").write_text(
+        f'no-cache = true\ncache-dir = "{tmp_path.parent / "ineffective-cache"}"\n',
+        encoding="utf-8",
+    )
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    _apply_external_storage_environment(monkeypatch, tmp_path.parent)
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("UV_NO_CACHE", raising=False)
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "temporary-cache-parent"))
+    runner = RecordingRunner()
+
+    preparation = prepare_repository_environment(
+        focused_plan(tmp_path, "ty"),
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert len(runner.calls) == 0
+    assert preparation.prepared is None
+    assert preparation.observation.error is not None
+    assert preparation.observation.error.code == "unsafe_repository_environment"
+    assert "temporary" in preparation.observation.error.message.lower()
+    assert sentinel.read_bytes() == b"unchanged"
+    assert not (tmp_path / "temporary-cache-parent").exists()
+
+
+def test_user_config_cache_inside_repository_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config_home = tmp_path / "config"
+    (config_home / "uv").mkdir(parents=True)
+    (config_home / "uv/uv.toml").write_text(
+        f'cache-dir = "{root / "user-cache"}"\n',
+        encoding="utf-8",
+    )
+    environment = _external_storage_environment(tmp_path)
+    environment.pop("UV_CACHE_DIR")
+    environment["XDG_CONFIG_HOME"] = str(config_home)
+
+    failure = validate_uv_storage_boundaries(root.resolve(), environment)
+
+    assert failure is not None
+    assert failure.code == "unsafe_repository_environment"
+    assert "configuration cache" in failure.message.lower()
+    assert not (root / "user-cache").exists()
+
+
+def test_explicit_cache_dir_overrides_unsafe_configuration_cache(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config_home = tmp_path / "config"
+    (config_home / "uv").mkdir(parents=True)
+    (config_home / "uv/uv.toml").write_text(
+        f'cache-dir = "{root / "ineffective-user-cache"}"\n',
+        encoding="utf-8",
+    )
+    environment = _external_storage_environment(tmp_path)
+    environment["XDG_CONFIG_HOME"] = str(config_home)
+
+    assert validate_uv_storage_boundaries(root.resolve(), environment) is None
+
+
+def test_configuration_no_cache_cannot_be_disabled_by_false_environment_value(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "uv.toml").write_text("no-cache = true\n", encoding="utf-8")
+    environment = _external_storage_environment(tmp_path)
+    environment.update({"UV_NO_CACHE": "0", "TMPDIR": str(root / "temporary-cache")})
+
+    failure = validate_uv_storage_boundaries(root.resolve(), environment)
+
+    assert failure is not None
+    assert failure.code == "unsafe_repository_environment"
+    assert "temporary" in failure.message.lower()
+    assert not (root / "temporary-cache").exists()
+
+
 @pytest.mark.parametrize(
     ("base_variable", "unsafe_value"),
     (
@@ -400,7 +556,11 @@ def test_existing_macos_legacy_uv_storage_alias_is_rejected(
     root = tmp_path / "project"
     root.mkdir()
     home = tmp_path / "home"
-    legacy_parent = home / "Library/Application Support"
+    legacy_parent = (
+        home / "Library/Caches"
+        if storage_kind == "cache"
+        else home / "Library/Application Support"
+    )
     legacy_parent.mkdir(parents=True)
     (legacy_parent / "uv").symlink_to(root, target_is_directory=True)
     environment = _external_storage_environment(tmp_path)
@@ -564,6 +724,8 @@ def test_locked_probe_process_failure_keeps_lock_unverified(
 
     assert len(runner.calls) == 2
     assert preparation.prepared is None
+    assert preparation.observation.path is None
+    assert preparation.observation.python is None
     assert preparation.observation.lock_status == "unverified"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "repository_environment_failed"
@@ -595,8 +757,167 @@ def test_malformed_probe_evidence_is_rejected(
     )
 
     assert preparation.prepared is None
+    assert preparation.observation.path is None
+    assert preparation.observation.python is None
+    assert preparation.observation.lock_status == "unverified"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "environment_evidence_invalid"
+
+
+def test_probe_evidence_at_exact_capture_limit_is_accepted(tmp_path: Path) -> None:
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(tmp_path, "ty")
+    document = environment_probe_bytes(
+        version=(3, 12, 1),
+        executable=plan.root / ".venv/bin/python",
+        environment_root=plan.root / ".venv",
+    )
+    probe_output = document + b" " * (65_536 - len(document))
+    assert len(probe_output) == 65_536
+    runner = RecordingRunner(stdout=(b"uv 0.10.12\n", probe_output))
+
+    preparation = prepare_repository_environment(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert preparation.prepared is not None
+    assert preparation.observation.lock_status == "current"
+
+
+def test_probe_nesting_above_eight_is_rejected_as_malformed(tmp_path: Path) -> None:
+    write_minimal_uv_project(tmp_path)
+    probe_output = b"[" * 9 + b"0" + b"]" * 9
+    runner = RecordingRunner(stdout=(b"uv 0.10.12\n", probe_output))
+
+    preparation = prepare_repository_environment(
+        focused_plan(tmp_path, "ty"),
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert preparation.prepared is None
+    assert preparation.observation.path is None
+    assert preparation.observation.python is None
+    assert preparation.observation.lock_status == "unverified"
+    assert preparation.observation.error is not None
+    assert preparation.observation.error.code == "environment_evidence_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    (
+        ("schema_version", True),
+        ("implementation", 1),
+        ("version", [3, 12, True]),
+        ("version", [3, 12, 1.0]),
+        ("executable", True),
+        ("environment_root", 1),
+    ),
+)
+def test_probe_exact_wrong_field_types_are_rejected_as_malformed(
+    tmp_path: Path,
+    field: str,
+    wrong_value: object,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(tmp_path, "ty")
+    document = json.loads(
+        environment_probe_bytes(
+            version=(3, 12, 1),
+            executable=plan.root / ".venv/bin/python",
+            environment_root=plan.root / ".venv",
+        )
+    )
+    document[field] = wrong_value
+    runner = RecordingRunner(
+        stdout=(b"uv 0.10.12\n", json.dumps(document, separators=(",", ":")).encode())
+    )
+
+    preparation = prepare_repository_environment(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert preparation.prepared is None
+    assert preparation.observation.path is None
+    assert preparation.observation.python is None
+    assert preparation.observation.lock_status == "unverified"
+    assert preparation.observation.error is not None
+    assert preparation.observation.error.code == "environment_evidence_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "reported_path"),
+    (
+        ("executable", "relative/bin/python"),
+        ("environment_root", "relative/.venv"),
+        ("executable", str(Path(os.sep, "tmp", "..", "tmp", "bin/python"))),
+        ("environment_root", str(Path(os.sep, "tmp", "..", "tmp", ".venv"))),
+    ),
+)
+def test_relative_or_non_normalized_probe_paths_are_malformed(
+    tmp_path: Path,
+    field: str,
+    reported_path: str,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(tmp_path, "ty")
+    document = json.loads(
+        environment_probe_bytes(
+            version=(3, 12, 1),
+            executable=plan.root / ".venv/bin/python",
+            environment_root=plan.root / ".venv",
+        )
+    )
+    document[field] = reported_path
+    runner = RecordingRunner(
+        stdout=(b"uv 0.10.12\n", json.dumps(document, separators=(",", ":")).encode())
+    )
+
+    preparation = prepare_repository_environment(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert preparation.prepared is None
+    assert preparation.observation.path is None
+    assert preparation.observation.python is None
+    assert preparation.observation.lock_status == "unverified"
+    assert preparation.observation.error is not None
+    assert preparation.observation.error.code == "environment_evidence_invalid"
+
+
+@pytest.mark.parametrize("minor", (10, 11))
+def test_cpython_310_and_311_probe_evidence_is_accepted(
+    tmp_path: Path,
+    minor: int,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(tmp_path, "ty")
+    runner = RecordingRunner(
+        stdout=(
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, minor, 0),
+                executable=plan.root / ".venv/bin/python",
+                environment_root=plan.root / ".venv",
+            ),
+        )
+    )
+
+    preparation = prepare_repository_environment(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert preparation.prepared is not None
+    assert preparation.prepared.python.version == (3, minor, 0)
+    assert preparation.observation.lock_status == "current"
 
 
 @pytest.mark.parametrize(
@@ -633,6 +954,11 @@ def test_unsupported_repository_python_is_rejected(
     )
 
     assert preparation.prepared is None
+    assert preparation.observation.path == plan.root / ".venv"
+    assert preparation.observation.python is not None
+    assert preparation.observation.python.implementation == implementation
+    assert preparation.observation.python.version == version
+    assert preparation.observation.lock_status == "current"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "repository_python_unsupported"
 
@@ -683,6 +1009,10 @@ def test_repository_environment_path_contradictions_are_rejected(
     )
 
     assert preparation.prepared is None
+    assert preparation.observation.path == roots[environment_root_kind]
+    assert preparation.observation.python is not None
+    assert preparation.observation.python.executable == executables[executable_kind]
+    assert preparation.observation.lock_status == "current"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == expected_code
 
@@ -713,6 +1043,9 @@ def test_symlinked_venv_is_unsafe(tmp_path: Path) -> None:
     )
 
     assert preparation.prepared is None
+    assert preparation.observation.path == plan.root / ".venv"
+    assert preparation.observation.python is not None
+    assert preparation.observation.lock_status == "current"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "unsafe_repository_environment"
 
@@ -770,6 +1103,10 @@ def test_explicit_python_request_contradiction_is_invalid_evidence(tmp_path: Pat
     )
 
     assert preparation.prepared is None
+    assert preparation.observation.path == plan.root / ".venv"
+    assert preparation.observation.python is not None
+    assert preparation.observation.python.version == (3, 12, 12)
+    assert preparation.observation.lock_status == "current"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "environment_evidence_invalid"
 
@@ -803,6 +1140,14 @@ def _external_storage_environment(tmp_path: Path) -> dict[str, str]:
         "UV_PYTHON_CACHE_DIR": str(external / "python-cache"),
         "UV_PYTHON_BIN_DIR": str(external / "bin"),
     }
+
+
+def _apply_external_storage_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name, value in _external_storage_environment(tmp_path).items():
+        monkeypatch.setenv(name, value)
 
 
 def _remove_overrides_using_base(

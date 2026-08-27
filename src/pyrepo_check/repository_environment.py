@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
 import stat
 import sys
+import tomllib
 from types import MappingProxyType
 from typing import cast
 
-from pyrepo_check.artifact_safety import load_bounded_json
+from pyrepo_check.artifact_safety import load_bounded_json, read_regular_file
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     EnvironmentFailureObservation,
@@ -88,11 +90,13 @@ _UV_VERSION_PATTERN = re.compile(
     r"^uv ([0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?: \([^\r\n]*\))?\r?\n?$"
 )
 _STORAGE_OVERRIDES = (
-    "UV_CACHE_DIR",
     "UV_PYTHON_INSTALL_DIR",
     "UV_PYTHON_CACHE_DIR",
     "UV_PYTHON_BIN_DIR",
 )
+_UV_CONFIG_LIMIT_BYTES = 1024 * 1024
+_BOOLISH_TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
+_BOOLISH_FALSE = frozenset({"0", "false", "f", "no", "n", "off"})
 _PROBE_KEYS = frozenset(
     {
         "schema_version",
@@ -102,6 +106,18 @@ _PROBE_KEYS = frozenset(
         "environment_root",
     }
 )
+
+
+@dataclass(frozen=True)
+class _UvCacheConfiguration:
+    no_cache: bool | None = None
+    cache_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class _ParsedEnvironmentProbe:
+    python: PythonObservation
+    environment_root: Path
 
 
 def sanitized_repository_environment(
@@ -135,11 +151,10 @@ def validate_uv_storage_boundaries(
         if variable in child_environment:
             destinations.append((variable, child_environment[variable]))
 
-    if "UV_CACHE_DIR" not in child_environment:
-        derived = _cache_destination(root, child_environment)
-        if isinstance(derived, EnvironmentFailureObservation):
-            return derived
-        destinations.append(derived)
+    cache_destination = _effective_cache_destination(root, child_environment)
+    if isinstance(cache_destination, EnvironmentFailureObservation):
+        return cache_destination
+    destinations.append(cache_destination)
     if "UV_PYTHON_INSTALL_DIR" not in child_environment:
         derived = _python_install_destination(root, child_environment)
         if isinstance(derived, EnvironmentFailureObservation):
@@ -293,7 +308,7 @@ def prepare_repository_environment(
             processes=processes,
         )
 
-    python, probe_error = _parse_environment_probe(plan, probe_process)
+    probe, probe_error = _parse_environment_probe(probe_process)
     if probe_error is not None:
         return _failed_preparation(
             plan,
@@ -302,14 +317,25 @@ def prepare_repository_environment(
             error=probe_error,
             processes=processes,
         )
-    if python is None:
+    if probe is None:
         raise RuntimeError("environment probe parser returned no result")
+    semantic_error = _validate_environment_probe(plan, probe)
+    if semantic_error is not None:
+        return _failed_preparation(
+            plan,
+            lock_status="current",
+            manager_version=manager_version,
+            path=probe.environment_root,
+            python=probe.python,
+            error=semantic_error,
+            processes=processes,
+        )
 
-    environment_path = _normalized_absolute(plan.root / ".venv")
+    environment_path = probe.environment_root
     prepared = PreparedRepositoryEnvironment(
         root=plan.root,
         path=environment_path,
-        python=python,
+        python=probe.python,
         python_selection=plan.repository_python,
         manager_version=manager_version,
         child_environment=child_environment,
@@ -320,7 +346,7 @@ def prepare_repository_environment(
             manager_version=manager_version,
             path=environment_path,
             python_selection=plan.repository_python,
-            python=python,
+            python=probe.python,
             lock_path=expected_lock,
             lock_status="current",
             mutation_protection="unobserved",
@@ -344,11 +370,239 @@ def locked_repository_prefix(
     )
 
 
+def _effective_cache_destination(
+    root: Path,
+    environment: Mapping[str, str],
+) -> tuple[str, str] | EnvironmentFailureObservation:
+    configuration = _discover_uv_cache_configuration(root, environment)
+    if isinstance(configuration, EnvironmentFailureObservation):
+        return configuration
+
+    no_cache = configuration.no_cache is True
+    if "UV_NO_CACHE" in environment:
+        parsed_no_cache = _parse_boolish(environment["UV_NO_CACHE"])
+        if parsed_no_cache is None:
+            return _unsafe_storage_failure(
+                "UV_NO_CACHE", "does not contain a supported Boolean value"
+            )
+        no_cache = no_cache or parsed_no_cache
+    if no_cache:
+        return _temporary_cache_destination(environment)
+
+    if "UV_CACHE_DIR" in environment:
+        return ("UV_CACHE_DIR", environment["UV_CACHE_DIR"])
+    if configuration.cache_dir is not None:
+        configured = Path(configuration.cache_dir)
+        if not configured.is_absolute():
+            configured = root / configured
+        return ("uv configuration cache", str(configured))
+    return _cache_destination(root, environment)
+
+
+def _temporary_cache_destination(
+    environment: Mapping[str, str],
+) -> tuple[str, str] | EnvironmentFailureObservation:
+    if os.name == "nt":
+        for name in ("TMP", "TEMP", "USERPROFILE"):
+            if name in environment:
+                value = environment[name]
+                invalid = _validate_absolute_base(name, value)
+                return invalid or (f"uv temporary cache from {name}", value)
+        return _unsafe_storage_failure(
+            "uv temporary cache", "has no documented absolute base"
+        )
+    if "TMPDIR" in environment:
+        value = environment["TMPDIR"]
+        invalid = _validate_absolute_base("TMPDIR", value)
+        return invalid or ("uv temporary cache from TMPDIR", value)
+    return ("uv temporary cache fallback", str(Path(os.sep, "tmp")))
+
+
+def _discover_uv_cache_configuration(
+    root: Path,
+    environment: Mapping[str, str],
+) -> _UvCacheConfiguration | EnvironmentFailureObservation:
+    project = _discover_project_uv_configuration(root)
+    if isinstance(project, EnvironmentFailureObservation):
+        return project
+    user_path = _user_uv_configuration_path(environment)
+    if isinstance(user_path, EnvironmentFailureObservation):
+        return user_path
+    user = _read_optional_uv_configuration(
+        user_path,
+        table_path=(),
+        authority="user uv configuration",
+    )
+    if isinstance(user, EnvironmentFailureObservation):
+        return user
+    system = _discover_system_uv_configuration(environment)
+    if isinstance(system, EnvironmentFailureObservation):
+        return system
+    return _combine_uv_cache_configurations(project, user, system)
+
+
+def _discover_project_uv_configuration(
+    root: Path,
+) -> _UvCacheConfiguration | EnvironmentFailureObservation:
+    for directory in (root, *root.parents):
+        uv_toml = directory / "uv.toml"
+        if _lexically_exists(uv_toml):
+            parsed = _read_optional_uv_configuration(
+                uv_toml,
+                table_path=(),
+                authority="project uv configuration",
+            )
+            if parsed is None:
+                raise RuntimeError("existing uv.toml was not parsed")
+            return parsed
+
+        pyproject = directory / "pyproject.toml"
+        if not _lexically_exists(pyproject):
+            continue
+        parsed = _read_optional_uv_configuration(
+            pyproject,
+            table_path=("tool", "uv"),
+            authority="project uv configuration",
+        )
+        if isinstance(parsed, EnvironmentFailureObservation):
+            return parsed
+        if parsed is not None:
+            return parsed
+    return _UvCacheConfiguration()
+
+
+def _user_uv_configuration_path(
+    environment: Mapping[str, str],
+) -> Path | EnvironmentFailureObservation | None:
+    if os.name == "nt":
+        base_name = "APPDATA"
+        base = environment.get("APPDATA")
+    else:
+        base_name = "XDG_CONFIG_HOME"
+        base = environment.get("XDG_CONFIG_HOME")
+        if base is None and "HOME" in environment:
+            base_name = "HOME"
+            base = str(Path(environment["HOME"]) / ".config")
+    if base is None:
+        return None
+    invalid = _validate_absolute_base(base_name, base)
+    if invalid is not None:
+        return invalid
+    return Path(base) / "uv/uv.toml"
+
+
+def _discover_system_uv_configuration(
+    environment: Mapping[str, str],
+) -> _UvCacheConfiguration | EnvironmentFailureObservation | None:
+    if os.name == "nt":
+        program_data = environment.get("PROGRAMDATA")
+        if program_data is not None:
+            invalid = _validate_absolute_base("PROGRAMDATA", program_data)
+            if invalid is not None:
+                return invalid
+        candidates = () if program_data is None else (Path(program_data) / "uv/uv.toml",)
+    else:
+        raw_directories = environment.get("XDG_CONFIG_DIRS", "/etc/xdg")
+        directories = tuple(
+            directory for directory in raw_directories.split(os.pathsep) if directory
+        )
+        for directory in directories:
+            invalid = _validate_absolute_base("XDG_CONFIG_DIRS", directory)
+            if invalid is not None:
+                return invalid
+        candidates = tuple(
+            Path(directory) / "uv/uv.toml"
+            for directory in directories
+        ) + (Path("/etc/uv/uv.toml"),)
+    for candidate in candidates:
+        parsed = _read_optional_uv_configuration(
+            candidate,
+            table_path=(),
+            authority="system uv configuration",
+        )
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _read_optional_uv_configuration(
+    path: Path | None,
+    *,
+    table_path: tuple[str, ...],
+    authority: str,
+) -> _UvCacheConfiguration | EnvironmentFailureObservation | None:
+    if path is None or not _lexically_exists(path):
+        return None
+    if not path.is_absolute():
+        return _unsafe_storage_failure(authority, "path is not absolute")
+    try:
+        content = read_regular_file(path, max_bytes=_UV_CONFIG_LIMIT_BYTES)
+        document = tomllib.loads(content.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        return _unsafe_storage_failure(
+            authority,
+            f"cannot be safely interpreted ({type(error).__name__})",
+        )
+
+    table: object = document
+    for name in table_path:
+        if not isinstance(table, dict) or name not in table:
+            return None
+        table = table[name]
+    if not isinstance(table, dict):
+        return _unsafe_storage_failure(authority, "cache settings table is invalid")
+    values = cast(dict[str, object], table)
+    no_cache = values.get("no-cache")
+    cache_dir = values.get("cache-dir")
+    if no_cache is not None and type(no_cache) is not bool:
+        return _unsafe_storage_failure(authority, "no-cache setting is not Boolean")
+    if cache_dir is not None and not isinstance(cache_dir, str):
+        return _unsafe_storage_failure(authority, "cache-dir setting is not a string")
+    return _UvCacheConfiguration(
+        no_cache=no_cache,
+        cache_dir=cache_dir,
+    )
+
+
+def _combine_uv_cache_configurations(
+    *configurations: _UvCacheConfiguration | None,
+) -> _UvCacheConfiguration:
+    no_cache: bool | None = None
+    cache_dir: str | None = None
+    for configuration in configurations:
+        if configuration is None:
+            continue
+        if no_cache is None:
+            no_cache = configuration.no_cache
+        if cache_dir is None:
+            cache_dir = configuration.cache_dir
+    return _UvCacheConfiguration(no_cache=no_cache, cache_dir=cache_dir)
+
+
+def _parse_boolish(value: str) -> bool | None:
+    normalized = value.strip().lower()
+    if normalized in _BOOLISH_TRUE:
+        return True
+    if normalized in _BOOLISH_FALSE:
+        return False
+    return None
+
+
+def _lexically_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _cache_destination(
     root: Path,
     environment: Mapping[str, str],
 ) -> tuple[str, str] | EnvironmentFailureObservation:
-    legacy = _existing_macos_legacy_uv_root(environment)
+    legacy = _existing_macos_legacy_uv_cache(environment)
     if isinstance(legacy, EnvironmentFailureObservation):
         return legacy
     if legacy is not None:
@@ -374,7 +628,7 @@ def _python_install_destination(
     root: Path,
     environment: Mapping[str, str],
 ) -> tuple[str, str] | EnvironmentFailureObservation:
-    legacy = _existing_macos_legacy_uv_root(environment)
+    legacy = _existing_macos_legacy_uv_data_root(environment)
     if isinstance(legacy, EnvironmentFailureObservation):
         return legacy
     if legacy is not None:
@@ -439,7 +693,20 @@ def _validate_absolute_base(
     return None
 
 
-def _existing_macos_legacy_uv_root(
+def _existing_macos_legacy_uv_cache(
+    environment: Mapping[str, str],
+) -> Path | EnvironmentFailureObservation | None:
+    if sys.platform != "darwin" or "HOME" not in environment:
+        return None
+    home = environment["HOME"]
+    invalid = _validate_absolute_base("HOME", home)
+    if invalid is not None:
+        return invalid
+    legacy_cache = Path(home) / "Library/Caches/uv"
+    return legacy_cache if legacy_cache.exists() else None
+
+
+def _existing_macos_legacy_uv_data_root(
     environment: Mapping[str, str],
 ) -> Path | EnvironmentFailureObservation | None:
     if sys.platform != "darwin" or "HOME" not in environment:
@@ -559,9 +826,8 @@ def _parse_uv_version(
 
 
 def _parse_environment_probe(
-    plan: RunPlan,
     process: ExecutedProcess,
-) -> tuple[PythonObservation | None, EnvironmentFailureObservation | None]:
+) -> tuple[_ParsedEnvironmentProbe | None, EnvironmentFailureObservation | None]:
     content = _complete_stdout(process)
     if content is None:
         return None, _invalid_evidence(
@@ -609,32 +875,52 @@ def _parse_environment_probe(
             "Repository Environment path evidence contains an invalid character."
         )
 
-    version = tuple(cast(list[int], version_value))
-    if implementation != "cpython" or not (
-        version[0] == 3 and 10 <= version[1] <= 13 and version[2] >= 0
-    ):
-        return None, EnvironmentFailureObservation(
-            code="repository_python_unsupported",
-            message="Repository Python must be CPython 3.10 through 3.13.",
-            hint="Select a supported Repository Python and update uv.lock explicitly.",
-        )
-    contradiction = _explicit_python_contradiction(plan, version)
-    if contradiction is not None:
-        return None, contradiction
-
     executable = _normalized_reported_path(executable_value)
     environment_root = _normalized_reported_path(environment_root_value)
     if executable is None or environment_root is None:
         return None, _invalid_evidence(
             "Repository Environment paths are not normalized absolute paths."
         )
+    version_parts = cast(list[int], version_value)
+    return (
+        _ParsedEnvironmentProbe(
+            python=PythonObservation(
+                implementation=implementation,
+                version=(version_parts[0], version_parts[1], version_parts[2]),
+                executable=executable,
+            ),
+            environment_root=environment_root,
+        ),
+        None,
+    )
+
+
+def _validate_environment_probe(
+    plan: RunPlan,
+    probe: _ParsedEnvironmentProbe,
+) -> EnvironmentFailureObservation | None:
+    python = probe.python
+    version = python.version
+    if python.implementation != "cpython" or not (
+        version[0] == 3 and 10 <= version[1] <= 13 and version[2] >= 0
+    ):
+        return EnvironmentFailureObservation(
+            code="repository_python_unsupported",
+            message="Repository Python must be CPython 3.10 through 3.13.",
+            hint="Select a supported Repository Python and update uv.lock explicitly.",
+        )
+    contradiction = _explicit_python_contradiction(plan, version)
+    if contradiction is not None:
+        return contradiction
+
     expected_root = _normalized_absolute(plan.root / ".venv")
+    environment_root = probe.environment_root
     if environment_root != expected_root:
         if expected_root in environment_root.parents:
-            return None, _invalid_evidence(
+            return _invalid_evidence(
                 "Repository Environment root is nested beneath the required .venv."
             )
-        return None, EnvironmentFailureObservation(
+        return EnvironmentFailureObservation(
             code="unsafe_repository_environment",
             message="Repository Environment root is outside the project .venv.",
             hint="Use the real non-symlink .venv at the selected repository root.",
@@ -642,29 +928,23 @@ def _parse_environment_probe(
     try:
         environment_status = expected_root.lstat()
     except OSError:
-        return None, EnvironmentFailureObservation(
+        return EnvironmentFailureObservation(
             code="unsafe_repository_environment",
             message="Repository Environment .venv cannot be safely inspected.",
             hint="Create a real non-symlink .venv through locked uv preparation.",
         )
     if not stat.S_ISDIR(environment_status.st_mode):
-        return None, EnvironmentFailureObservation(
+        return EnvironmentFailureObservation(
             code="unsafe_repository_environment",
             message="Repository Environment .venv is not a real non-symlink directory.",
             hint="Replace .venv with a real directory, then retry.",
         )
+    executable = python.executable
     if executable == expected_root or expected_root not in executable.parents:
-        return None, _invalid_evidence(
+        return _invalid_evidence(
             "Repository Python executable is not lexically contained in .venv."
         )
-    return (
-        PythonObservation(
-            implementation=implementation,
-            version=(version[0], version[1], version[2]),
-            executable=executable,
-        ),
-        None,
-    )
+    return None
 
 
 def _explicit_python_contradiction(
@@ -711,15 +991,17 @@ def _failed_preparation(
     lock_status: LockStatus,
     error: EnvironmentFailureObservation,
     manager_version: str | None = None,
+    path: Path | None = None,
+    python: PythonObservation | None = None,
     processes: tuple[ExecutedProcess, ...] = (),
 ) -> RepositoryPreparation:
     return RepositoryPreparation(
         prepared=None,
         observation=RepositoryEnvironmentObservation(
             manager_version=manager_version,
-            path=None,
+            path=path,
             python_selection=plan.repository_python,
-            python=None,
+            python=python,
             lock_path=_normalized_absolute(plan.root / "uv.lock"),
             lock_status=lock_status,
             mutation_protection="unobserved",
