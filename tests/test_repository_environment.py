@@ -1718,17 +1718,68 @@ def test_standalone_dependency_probe_rejects_blank_direct_url_before_import(
     assert not imported.exists()
 
 
-def test_standalone_dependency_probe_accepts_valid_remote_direct_url(
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://exa%mple.invalid/tool.whl",
+        "https://example.invalid/%ZZ/tool.whl",
+        "1https://example.invalid/tool.whl",
+        "https:///tool.whl",
+        "https://-example.invalid/tool.whl",
+        "https://example.invalid:99999/tool.whl",
+    ),
+    ids=(
+        "malformed-host-escape",
+        "malformed-path-escape",
+        "invalid-scheme",
+        "missing-host",
+        "invalid-domain",
+        "invalid-port",
+    ),
+)
+def test_standalone_dependency_probe_rejects_malformed_direct_url_before_import(
     tmp_path: Path,
+    url: str,
 ) -> None:
     project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
     imported = project / "imported"
     _write_raw_direct_url_distribution(
         site_packages,
         imported,
-        (
-            '{"url":"https://example.invalid/tool.whl",'
-            '"archive_info":{"hash":"sha256=abc"}}'
+        json.dumps({"url": url}, separators=(",", ":")),
+    )
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert "direct URL metadata is invalid" in payload["diagnostic"]
+    assert not imported.exists()
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://example.invalid/tool.whl",
+        "https://example.invalid/tool%20name.whl",
+        "git+https://example.invalid/repository.git@abcdef",
+        "https://[2001:db8::1]/tool.whl",
+    ),
+    ids=("https", "escaped-path", "vcs-https", "ipv6"),
+)
+def test_standalone_dependency_probe_accepts_valid_remote_direct_url(
+    tmp_path: Path,
+    url: str,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    imported = project / "imported"
+    _write_raw_direct_url_distribution(
+        site_packages,
+        imported,
+        json.dumps(
+            {"url": url, "archive_info": {"hash": "sha256=abc"}},
+            separators=(",", ":"),
         ),
     )
 

@@ -49,13 +49,14 @@ print(json.dumps(record, separators=(",", ":")))
 DEPENDENCY_PROBE_SOURCE = r'''import importlib
 import importlib.metadata
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 
 distribution_name, module_name, environment_root_text = sys.argv[1:]
 
@@ -96,6 +97,75 @@ def unique_json_object(pairs):
             raise ValueError("duplicate JSON object member")
         value[name] = member
     return value
+
+
+def valid_percent_escapes(value):
+    index = 0
+    while index < len(value):
+        if value[index] != "%":
+            index += 1
+            continue
+        if index + 2 >= len(value) or not all(
+            character in "0123456789abcdefABCDEF" for character in value[index + 1:index + 3]
+        ):
+            return False
+        index += 3
+    return True
+
+
+def valid_domain_name(value):
+    if not value or len(value) > 253:
+        return False
+    labels = value[:-1].split(".") if value.endswith(".") else value.split(".")
+    if not labels:
+        return False
+    for label in labels:
+        if (
+            not label
+            or len(label) > 63
+            or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is None
+        ):
+            return False
+    return True
+
+
+def valid_remote_authority(parsed_url):
+    if parsed_url.netloc.count("@") > 1:
+        return False
+    authority = parsed_url.netloc.rsplit("@", 1)[-1]
+    hostname = parsed_url.hostname
+    if not authority or hostname is None:
+        return False
+    try:
+        decoded_hostname = unquote_to_bytes(hostname).decode("ascii")
+        _ = parsed_url.port
+    except (UnicodeError, ValueError):
+        return False
+    bracketed = authority.startswith("[")
+    if bracketed:
+        closing_bracket = authority.find("]")
+        if closing_bracket < 0:
+            return False
+        port_text = authority[closing_bracket + 1:]
+        if port_text and (not port_text.startswith(":") or not port_text[1:].isdigit()):
+            return False
+    else:
+        if authority.count(":") > 1:
+            return False
+        port_text = authority.rsplit(":", 1)[1] if ":" in authority else ""
+        if ":" in authority and not port_text.isdigit():
+            return False
+    try:
+        address = ipaddress.ip_address(decoded_hostname)
+    except ValueError:
+        if ":" in decoded_hostname or all(
+            character in "0123456789." for character in decoded_hostname
+        ):
+            return False
+        return not bracketed and valid_domain_name(decoded_hostname)
+    if address.version == 6:
+        return bracketed
+    return not bracketed
 
 
 try:
@@ -167,21 +237,23 @@ if direct_url_text is not None:
     if not url or url != url.strip() or any(character.isspace() for character in url):
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
+    allowed_url_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'()*+,;=%"
+    if any(character not in allowed_url_characters for character in url) or not valid_percent_escapes(url):
+        emit("unusable", version, origin, "direct URL metadata is invalid")
+        raise SystemExit(0)
     try:
         parsed_url = urlsplit(url)
-        hostname = parsed_url.hostname
-        parsed_url.port
     except ValueError:
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
     scheme = parsed_url.scheme.lower()
-    if not scheme:
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed_url.scheme) is None:
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
     if editable is True or scheme == "file" or scheme.endswith("+file"):
         emit("unusable", version, origin, "dependency is not an ordinary distribution")
         raise SystemExit(0)
-    if not parsed_url.netloc or hostname is None:
+    if not valid_remote_authority(parsed_url):
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
 
