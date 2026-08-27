@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import stat
 import sys
@@ -492,6 +492,10 @@ def _user_uv_configuration_path(
     return Path(base) / "uv/uv.toml"
 
 
+def _windows_system_config_path(system_drive: str) -> PureWindowsPath:
+    return PureWindowsPath(f"{system_drive}\\") / "ProgramData/uv/uv.toml"
+
+
 def _discover_system_uv_configuration(
     environment: Mapping[str, str],
 ) -> _UvCacheConfiguration | EnvironmentFailureObservation | None:
@@ -500,11 +504,10 @@ def _discover_system_uv_configuration(
         if system_drive is None:
             candidates = ()
         else:
-            system_root = Path(f"{system_drive}{os.sep}")
-            invalid = _validate_absolute_base("SYSTEMDRIVE", str(system_root))
-            if invalid is not None:
-                return invalid
-            candidates = (system_root / "ProgramData/uv/uv.toml",)
+            candidate = _windows_system_config_path(system_drive)
+            if not candidate.is_absolute():
+                return _unsafe_storage_failure("SYSTEMDRIVE", "is not absolute")
+            candidates = (Path(candidate),)
     else:
         raw_directories = environment.get("XDG_CONFIG_DIRS", "/etc/xdg")
         directories = tuple(

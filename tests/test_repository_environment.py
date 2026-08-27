@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import sys
 from types import MappingProxyType
@@ -329,6 +329,14 @@ def test_configuration_no_cache_cannot_be_disabled_by_false_environment_value(
     assert not (root / "temporary-cache").exists()
 
 
+def test_windows_system_config_authority_is_absolute_from_drive_designator() -> None:
+    candidate = repository_environment._windows_system_config_path("C:")
+
+    assert isinstance(candidate, PureWindowsPath)
+    assert candidate.is_absolute()
+    assert candidate == PureWindowsPath("C:/ProgramData/uv/uv.toml")
+
+
 def test_windows_systemdrive_config_cache_stops_before_process_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -349,6 +357,12 @@ def test_windows_systemdrive_config_cache_stops_before_process_without_mutation(
     monkeypatch.setenv("SYSTEMDRIVE", str(system_drive))
     monkeypatch.setenv("PROGRAMDATA", str(tmp_path.parent / "ineffective-program-data"))
     monkeypatch.setattr(repository_environment, "_WINDOWS", True, raising=False)
+    monkeypatch.setattr(
+        repository_environment,
+        "_windows_system_config_path",
+        lambda _system_drive: config_directory / "uv.toml",
+        raising=False,
+    )
     runner = RecordingRunner()
 
     preparation = prepare_repository_environment(
