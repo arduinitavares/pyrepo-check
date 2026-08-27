@@ -2064,6 +2064,23 @@ def test_serialize_json_returns_exact_utf8_planning_error_bytes() -> None:
     assert b"\\u00e9" not in expected
 
 
+def test_internal_schema_v2_does_not_cut_over_the_public_serializer() -> None:
+    report = build_planning_error_report("unknown_check", "Unknown check(s): mypy")
+
+    payload = reporting.json.loads(serialize_json(report))
+
+    assert list(payload) == [
+        "schema_version",
+        "kind",
+        "overall_status",
+        "complete",
+        "error",
+    ]
+    assert payload["schema_version"] == 1
+    assert "tool_environment" not in payload
+    assert "repository_environment" not in payload
+
+
 def test_serialize_json_projects_exact_run_members_in_normative_order(tmp_path: Path) -> None:
     ruff = planned_check(tmp_path, "ruff")
     root = str(tmp_path.resolve()).encode("utf-8")

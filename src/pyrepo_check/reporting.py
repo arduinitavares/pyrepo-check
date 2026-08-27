@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -41,29 +42,29 @@ from pyrepo_check.pytest_evidence import (
     SpecialTestOutcome,
     build_pytest_result,
 )
-
-
-ReportKind = Literal["planning_error", "run"]
-OverallStatus = Literal["passed", "failed", "error"]
-CheckStatus = Literal["passed", "failed", "error"]
-PlannedCoverageScope = Literal["not_requested", "unavailable", "partial", "complete"]
-ProcessRole = Literal["primary", "pytest_preflight", "coverage_preflight", "coverage_json"]
-ProcessOutcome = Literal["exited", "signaled", "spawn_failed"]
-CheckErrorCode = Literal[
-    "spawn_failed",
-    "terminated_by_signal",
-    "pytest_preflight_failed",
-    "pytest_evidence_error",
-    "coverage_preflight_failed",
-    "missing_primary_process",
-    "cleanup_failed",
-]
-AdvisoryCode = Literal[
-    "coverage_not_configured",
-    "coverage_threshold_not_applied",
-    "missing_test_reason",
-    "output_truncated",
-]
+from pyrepo_check.reporting_schema import (
+    Advisory,
+    AdvisoryCode as AdvisoryCode,
+    AgentReportV2,
+    CapturedText,
+    CheckErrorCode,
+    CheckResultV2,
+    CheckStatus,
+    DependencyEvidence,
+    OverallStatus,
+    PlanningErrorReportV2,
+    PlannedCoverageScope,
+    ProcessOutcome,
+    ProcessResult,
+    ProcessRole,
+    ReportKind as ReportKind,
+    RepositoryEnvironmentEvidence,
+    ReportingError,
+    RunReportV2,
+    Selection,
+    validate_report_structure_v2,
+)
+from pyrepo_check.repository_environment import SUPPORTED_DEPENDENCIES
 
 
 _CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -188,10 +189,6 @@ _COVERAGE_COMPLETE_ROLES: tuple[ProcessRole, ...] = (*_COVERAGE_PRIMARY_ROLES, "
 _COVERAGE_PREJSON_ARTIFACT_ERROR_CODES = frozenset(("data_missing", "unexpected_parallel_data"))
 
 
-class ReportingError(RuntimeError):
-    """Raised when execution observations cannot form a valid report."""
-
-
 @dataclass(frozen=True)
 class PlanningError:
     code: PlanningErrorCode
@@ -209,28 +206,6 @@ class PlanningErrorReportV1:
 
 
 @dataclass(frozen=True)
-class CapturedText:
-    captured: bool
-    text: str
-    truncated: bool
-    omitted_bytes: int
-
-
-@dataclass(frozen=True)
-class ProcessResult:
-    role: ProcessRole
-    argv: tuple[str, ...]
-    cwd: str
-    outcome: ProcessOutcome
-    exit_code: int | None
-    signal: int | None
-    duration_ms: int
-    stdout: CapturedText
-    stderr: CapturedText
-    error_message: str | None
-
-
-@dataclass(frozen=True)
 class CheckError:
     code: CheckErrorCode
     message: str
@@ -242,23 +217,6 @@ class CheckResult:
     status: CheckStatus
     processes: tuple[ProcessResult, ...]
     error: CheckError | None
-
-
-@dataclass(frozen=True)
-class Selection:
-    checks: tuple[CheckName, ...]
-    targets: tuple[str, ...]
-    test_shortcut: str | None
-    pytest_args: tuple[str, ...] | None
-    planned_test_scope: PlannedTestScope
-    planned_coverage_scope: PlannedCoverageScope
-
-
-@dataclass(frozen=True)
-class Advisory:
-    code: AdvisoryCode
-    message: str
-    hint: str | None
 
 
 @dataclass(frozen=True)
@@ -277,6 +235,365 @@ class RunReportV1:
 
 
 AgentReportV1 = PlanningErrorReportV1 | RunReportV1
+
+
+def validate_report_v2(report: AgentReportV2) -> None:
+    validate_report_structure_v2(report)
+    if isinstance(report, PlanningErrorReportV2):
+        return
+    _validate_run_report_v2(report)
+
+
+def _validate_run_report_v2(report: RunReportV2) -> None:
+    pytest_selected = _validate_selection(report.selection)
+    if report.mode == "focused" and report.selection.planned_coverage_scope == "unavailable":
+        _invalid("focused runs cannot have unavailable planned coverage")
+    if (
+        report.mode == "strict_aggregate"
+        and report.selection.planned_coverage_scope == "not_requested"
+    ):
+        _invalid("strict aggregate runs cannot omit planned coverage")
+    emitted_names = tuple(check.name for check in report.checks)
+    if report.selection.checks != emitted_names:
+        _invalid("selection checks must exactly match emitted checks")
+
+    if pytest_selected != (report.pytest is not None):
+        _invalid("pytest must be present exactly when pytest is selected")
+    if report.pytest is not None:
+        _validate_pytest_result(report.pytest, report.selection)
+    coverage_expected = report.selection.planned_coverage_scope in {"partial", "complete"}
+    if coverage_expected != (report.coverage is not None):
+        _invalid("coverage nullability contradicts planned coverage scope")
+    if report.coverage is not None:
+        try:
+            validate_coverage_result(report.coverage)
+        except ValueError as error:
+            _invalid(f"invalid coverage result: {error}")
+        if report.pytest is None:
+            _invalid("coverage requires a pytest result")
+
+    environment = report.repository_environment
+    _validate_environment_process_order_v2(environment.processes)
+    _validate_environment_state_v2(environment)
+    expected_dependencies = _expected_dependency_names_v2(report.selection)
+    observed_dependencies = tuple(item.name for item in environment.dependencies)
+    if observed_dependencies != expected_dependencies:
+        _invalid("dependencies must use first-required order without duplicates")
+    for dependency in environment.dependencies:
+        _validate_dependency_evidence_v2(dependency, environment_error=environment.error is not None)
+
+    dependencies = {dependency.name: dependency for dependency in environment.dependencies}
+    for check in report.checks:
+        dependency = dependencies[_dependency_for_check_v2(check.name)]
+        _validate_check_result_v2(check, environment, dependency)
+
+    expected_complete = _run_complete_v2(report)
+    expected_status: OverallStatus
+    if not expected_complete:
+        expected_status = "error"
+    elif (
+        any(check.status == "failed" for check in report.checks)
+        or (report.pytest is not None and report.pytest.status == "failed")
+        or (report.coverage is not None and report.coverage.status == "failed")
+    ):
+        expected_status = "failed"
+    else:
+        expected_status = "passed"
+    if report.complete is not expected_complete:
+        _invalid("complete is inconsistent with v2 evidence")
+    if report.overall_status != expected_status:
+        _invalid("overall_status violates v2 evidence precedence")
+
+
+def _validate_environment_process_order_v2(
+    processes: tuple[ProcessResult, ...],
+) -> None:
+    phase = "safety"
+    trailing_safety = False
+    for index, process in enumerate(processes):
+        role = process.role
+        if role == "repository_safety":
+            if phase == "safety":
+                continue
+            if phase in {"uv", "environment"} and index == len(processes) - 1 and not trailing_safety:
+                trailing_safety = True
+                continue
+            _invalid("repository safety processes use an invalid order")
+        if role == "uv_version":
+            if phase != "safety":
+                _invalid("uv version process uses an invalid order")
+            phase = "uv"
+            continue
+        if role == "environment_probe":
+            if phase != "uv":
+                _invalid("environment probe must follow uv version")
+            phase = "environment"
+            continue
+        _invalid("repository environment contains a non-environment process role")
+
+
+def _validate_environment_state_v2(
+    environment: RepositoryEnvironmentEvidence,
+) -> None:
+    uv_process = next((item for item in environment.processes if item.role == "uv_version"), None)
+    probe = next(
+        (item for item in environment.processes if item.role == "environment_probe"), None
+    )
+    if environment.manager_version is not None and not _successful_process(uv_process):
+        _invalid("manager version requires a successful uv version process")
+    observed = environment.path is not None and environment.python is not None
+    if (environment.path is None) != (environment.python is None):
+        _invalid("repository path and Python must be observed together")
+    if observed and not _successful_process(probe):
+        _invalid("observed repository environment requires a successful probe")
+    if environment.lock.status == "current":
+        if not observed or not _successful_process(probe):
+            _invalid("current lock requires successful environment evidence")
+    elif environment.lock.status == "missing":
+        if (
+            observed
+            or probe is not None
+            or environment.error is None
+            or environment.error.code != "repository_lock_missing"
+        ):
+            _invalid("missing lock evidence contradicts repository environment state")
+    if environment.error is None:
+        if (
+            environment.lock.status != "current"
+            or not observed
+            or environment.manager_version is None
+        ):
+            _invalid("successful repository environment requires current observed evidence")
+    elif environment.lock.status == "current" and environment.error.code == "repository_lock_missing":
+        _invalid("current lock cannot report repository_lock_missing")
+    if environment.mutation_protection == "tracked_files" and (
+        not environment.processes
+        or environment.processes[-1].role != "repository_safety"
+        or not _successful_process(environment.processes[-1])
+    ):
+        _invalid("mutation protection requires a successful final safety process")
+
+
+def _expected_dependency_names_v2(selection: Selection) -> tuple[str, ...]:
+    names: list[str] = []
+    for check in selection.checks:
+        name = _dependency_for_check_v2(check)
+        if name not in names:
+            names.append(name)
+    if selection.planned_coverage_scope in {"partial", "complete"}:
+        if "pytest" not in names:
+            _invalid("Coverage dependency requires selected pytest")
+        names.append("coverage")
+    return tuple(names)
+
+
+def _dependency_for_check_v2(
+    check: CheckName,
+) -> Literal["ruff", "ty", "bandit", "pytest"]:
+    if check in {"ruff", "annotations", "annotations-fix"}:
+        return "ruff"
+    return check
+
+
+def _validate_dependency_evidence_v2(
+    dependency: DependencyEvidence,
+    *,
+    environment_error: bool,
+) -> None:
+    expected_module = dependency.name
+    if dependency.module != expected_module:
+        _invalid("dependency module must match dependency name")
+    supported = SUPPORTED_DEPENDENCIES[dependency.name]
+    minimum = ".".join(str(part) for part in supported.minimum)
+    maximum = ".".join(str(part) for part in supported.maximum)
+    if dependency.required != f">={minimum},<{maximum}":
+        _invalid("dependency required range does not match the supported contract")
+    process = dependency.process
+    if process is not None and process.role != "dependency_probe":
+        _invalid("dependency process role must be dependency_probe")
+    if dependency.status == "available":
+        if (
+            dependency.version is None
+            or dependency.origin is None
+            or not _successful_process(process)
+            or dependency.error is not None
+        ):
+            _invalid("available dependency evidence is incomplete")
+        return
+    if dependency.status == "unobserved":
+        if dependency.version is not None or dependency.origin is not None:
+            _invalid("unobserved dependency cannot claim version or origin")
+        if process is None:
+            if dependency.error is not None or not environment_error:
+                _invalid("not-attempted dependency requires an environment error")
+        elif dependency.error is None or dependency.error.code != "check_dependency_unusable":
+            _invalid("attempted unobserved dependency requires unusable evidence error")
+        return
+    expected_error = {
+        "missing": "check_dependency_missing",
+        "incompatible": "check_dependency_incompatible",
+        "shadowed": "check_dependency_shadowed",
+        "unusable": "check_dependency_unusable",
+    }[dependency.status]
+    if not _successful_process(process):
+        _invalid("typed dependency status requires a successful probe")
+    if dependency.error is None or dependency.error.code != expected_error:
+        _invalid("dependency status contradicts its typed error")
+    if dependency.status == "incompatible" and dependency.version is None:
+        _invalid("incompatible dependency requires a known version")
+    if dependency.status == "shadowed" and dependency.origin is None:
+        _invalid("shadowed dependency requires a conflicting origin")
+
+
+def _validate_check_result_v2(
+    check: CheckResultV2,
+    environment: RepositoryEnvironmentEvidence,
+    dependency: DependencyEvidence,
+) -> None:
+    roles = tuple(process.role for process in check.processes)
+    allowed_roles = (
+        {(), ("primary",), ("primary", "coverage_json")}
+        if check.name == "pytest"
+        else {(), ("primary",)}
+    )
+    if roles not in allowed_roles:
+        _invalid("check processes use an invalid attempted-command order")
+    primary = check.processes[0] if check.processes else None
+    start = check.start_evidence
+    if (start is not None) != (check.execution_environment == "repository"):
+        _invalid("repository execution attribution must match start evidence")
+    if start is not None:
+        if primary is None:
+            _invalid("start evidence requires a primary process")
+        primary = cast(ProcessResult, primary)
+        expected_module = _dependency_for_check_v2(check.name)
+        if start.check != check.name or start.module != expected_module:
+            _invalid("start evidence does not match the Check invocation")
+        if environment.python is None or start.python != environment.python:
+            _invalid("start evidence Python does not match Repository Python")
+        if start.arguments_sha256 != _process_argument_digest_v2(
+            primary,
+            check=check.name,
+            module=expected_module,
+        ):
+            _invalid("start evidence argument digest does not match the primary process")
+
+    if primary is not None and primary.outcome == "spawn_failed":
+        if start is not None or check.execution_environment is not None:
+            _invalid("spawn failure cannot claim repository dispatch")
+        if check.error is None or check.error.code != "spawn_failed":
+            _invalid("spawn failure requires spawn_failed Check error")
+    if primary is not None and primary.outcome == "signaled":
+        if start is not None:
+            if check.error is None or check.error.code != "terminated_by_signal":
+                _invalid("signaled primary contradicts Check error")
+        elif check.error is None or check.error.code != "check_start_evidence_invalid":
+            _invalid("unattributed signal requires invalid start evidence")
+
+    if check.status in {"passed", "failed"}:
+        if (
+            primary is None
+            or primary.outcome != "exited"
+            or start is None
+            or check.execution_environment != "repository"
+            or check.error is not None
+        ):
+            _invalid("completed Check requires exited attributed primary evidence")
+        primary = cast(ProcessResult, primary)
+        if check.status == "passed" and primary.exit_code != 0:
+            _invalid("passed Check requires primary exit zero")
+        if check.status == "failed" and (primary.exit_code is None or primary.exit_code <= 0):
+            _invalid("failed Check requires a positive primary exit")
+    elif check.error is None:
+        _invalid("error Check requires a typed error")
+
+    if environment.error is not None:
+        if (
+            check.error is None
+            or check.error.code != "repository_environment_unavailable"
+            or check.processes
+            or start is not None
+            or check.execution_environment is not None
+            or check.analysis_python_authority is not None
+        ):
+            _invalid("environment failure requires synthesized unavailable Checks")
+    elif dependency.status != "available":
+        if (
+            check.error is None
+            or dependency.error is None
+            or check.error.code != dependency.error.code
+            or check.processes
+            or start is not None
+            or check.execution_environment is not None
+            or check.analysis_python_authority is not None
+        ):
+            _invalid("dependency failure requires a matching synthesized Check")
+
+    expected_authority = (
+        check.name in {"ruff", "annotations", "annotations-fix", "ty"}
+        and start is not None
+        and primary is not None
+        and primary.outcome == "exited"
+        and primary.exit_code in {0, 1}
+    )
+    if expected_authority != (check.analysis_python_authority is not None):
+        _invalid("analysis Python authority contradicts static primary evidence")
+
+
+def _process_argument_digest_v2(
+    process: ProcessResult,
+    *,
+    check: CheckName,
+    module: str,
+) -> str:
+    try:
+        separator = process.argv.index("--")
+    except ValueError:
+        _invalid("attributed primary command requires an argument separator")
+        raise AssertionError("unreachable")
+    header = process.argv[:separator]
+    if _launcher_option_v2(header, "--check") != check:
+        _invalid("primary launcher Check does not match start evidence")
+    if _launcher_option_v2(header, "--module") != module:
+        _invalid("primary launcher module does not match start evidence")
+    arguments = process.argv[separator + 1 :]
+    digest = hashlib.sha256()
+    for argument in arguments:
+        encoded = argument.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _launcher_option_v2(header: tuple[str, ...], option: str) -> str:
+    positions = tuple(index for index, argument in enumerate(header) if argument == option)
+    if len(positions) != 1 or positions[0] + 1 >= len(header):
+        _invalid(f"primary launcher requires one {option} option")
+    return header[positions[0] + 1]
+
+
+def _successful_process(process: ProcessResult | None) -> bool:
+    return (
+        process is not None
+        and process.outcome == "exited"
+        and process.exit_code == 0
+    )
+
+
+def _run_complete_v2(report: RunReportV2) -> bool:
+    environment = report.repository_environment
+    return (
+        environment.error is None
+        and environment.lock.status == "current"
+        and all(dependency.status == "available" for dependency in environment.dependencies)
+        and all(
+            dependency.process is not None and _successful_process(dependency.process)
+            for dependency in environment.dependencies
+        )
+        and all(check.status != "error" for check in report.checks)
+        and (report.pytest is None or report.pytest.complete)
+        and (report.coverage is None or report.coverage.evidence_complete)
+    )
 
 
 def build_planning_error_report(
