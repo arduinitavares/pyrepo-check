@@ -15,9 +15,11 @@ from typing import Callable, Never, TypeVar, cast
 import pytest
 
 from pyrepo_check.check_launcher import stage_check_launcher
+from pyrepo_check.coverage_evidence import build_coverage_result
 from pyrepo_check.execution import (
     CapturedBytes,
     DependencyObservation,
+    ExecutedCheck,
     ExecutionResult,
     PreparedRepositoryEnvironment,
     ProcessRunner,
@@ -34,7 +36,11 @@ from pyrepo_check.planning import (
 import pyrepo_check.execution_workspace as execution_workspace
 import pyrepo_check.pytest_execution as pytest_execution
 from pyrepo_check.pytest_execution import execute_pytest
-from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
+from pyrepo_check.pytest_evidence import (
+    PytestValidationFailure,
+    build_pytest_result,
+    validate_pytest_execution,
+)
 from pyrepo_check.reporting import build_run_report, validate_report_v1
 import tests.support as test_support
 from tests.support import (
@@ -62,6 +68,8 @@ class PreparedPytestRunner:
         returncodes: tuple[int, ...] = (),
         raise_on_call: int | None = None,
         exception: Exception | None = None,
+        pytest_version: str = "8.4.2",
+        coverage_version: str = "7.15.2",
     ) -> None:
         self._runner = launcher_aware_runner(
             returncodes=returncodes,
@@ -69,6 +77,8 @@ class PreparedPytestRunner:
             raise_on_call=raise_on_call,
             exception=exception,
         )
+        self.pytest_version = pytest_version
+        self.coverage_version = coverage_version
         self.calls = self._runner.calls
 
     def __call__(
@@ -95,7 +105,24 @@ class PreparedPytestRunner:
                 completed_process.returncode,
             )
             test_support._publish_coverage_artifact(logical)  # noqa: SLF001
+            self._replace_artifact_versions(logical, env)
         return completed_process
+
+    def _replace_artifact_versions(
+        self,
+        command: tuple[str, ...],
+        environment: dict[str, str] | None,
+    ) -> None:
+        if "pytest" in command and environment is not None:
+            artifact_path = Path(environment["PYREPO_CHECK_PYTEST_JSON"])
+            document = json.loads(artifact_path.read_text(encoding="utf-8"))
+            document["pytest_version"] = self.pytest_version
+            artifact_path.write_text(json.dumps(document), encoding="utf-8")
+        if "coverage" in command and "json" in command:
+            output_path = Path(command[command.index("-o") + 1])
+            document = json.loads(output_path.read_text(encoding="utf-8"))
+            document["meta"]["version"] = self.coverage_version
+            output_path.write_text(json.dumps(document), encoding="utf-8")
 
     @staticmethod
     def _logical_module_command(command: tuple[str, ...]) -> tuple[str, ...] | None:
@@ -547,6 +574,38 @@ def run_prepared_pytest_fixture(
         )
 
 
+def prepared_executed_check(
+    prepared: PreparedRepositoryEnvironment,
+    result: pytest_execution.PreparedPytestExecution,
+    *,
+    coverage_requested: bool,
+) -> tuple[RunPlan, ExecutedCheck]:
+    coverage = (
+        CoverageExecutionPlan(
+            config_path=prepared.root / "pyproject.toml",
+            fail_under=None,
+        )
+        if coverage_requested
+        else None
+    )
+    pytest_plan = PytestExecutionPlan(pytest_args=("tests",), coverage=coverage)
+    check = CheckInvocation(
+        name="pytest",
+        arguments=pytest_plan.pytest_args,
+        pytest=pytest_plan,
+    )
+    plan = replace(
+        pytest_run_plan(prepared.root, check),
+        planned_coverage_scope="partial" if coverage_requested else "not_requested",
+    )
+    return plan, ExecutedCheck(
+        planned=check,
+        processes=result.processes,
+        pytest=result.pytest,
+        coverage=result.coverage,
+    )
+
+
 def test_pytest_uses_prepared_repository_python_and_no_controller_pythonpath(
     tmp_path: Path,
 ) -> None:
@@ -743,6 +802,143 @@ def test_coverage_primary_spawn_failure_discards_start_and_skips_json_helper(
     assert result.coverage is not None
     assert result.coverage.artifact.state == "data_missing"
     assert not [process for process in result.processes if process.role == "coverage_json"]
+
+
+@pytest.mark.parametrize("returncode", (2, 120))
+def test_prepared_plain_pytest_rejects_reserved_launcher_exit(
+    tmp_path: Path,
+    returncode: int,
+) -> None:
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=None,
+        runner=PreparedPytestRunner(returncodes=(returncode,)),
+    )
+
+    assert [process.returncode for process in result.processes] == [returncode]
+    assert result.start is not None
+    assert result.error is not None
+    assert result.error.code == "check_execution_failed"
+
+
+@pytest.mark.parametrize("returncode", (2, 120))
+def test_prepared_instrumented_pytest_rejects_reserved_launcher_exit_without_helper(
+    tmp_path: Path,
+    returncode: int,
+) -> None:
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=PreparedPytestRunner(returncodes=(returncode,)),
+    )
+
+    assert [process.returncode for process in result.processes] == [returncode]
+    assert result.start is not None
+    assert result.error is not None
+    assert result.error.code == "check_execution_failed"
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "data_missing"
+
+
+def test_prepared_pytest_exit_five_remains_completed(tmp_path: Path) -> None:
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=None,
+        runner=PreparedPytestRunner(returncodes=(5,)),
+    )
+
+    assert [process.returncode for process in result.processes] == [5]
+    assert result.start is not None
+    assert result.error is None
+
+
+def test_prepared_four_component_dependency_versions_remain_exact(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "example.py").write_text("value = 1\n", encoding="utf-8")
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2.0"),
+        coverage_dependency=available_dependency("coverage", "7.15.2.0"),
+        coverage_requested=True,
+        runner=PreparedPytestRunner(
+            pytest_version="8.4.2.0",
+            coverage_version="7.15.2.0",
+        ),
+    )
+    plan, check = prepared_executed_check(prepared, result, coverage_requested=True)
+
+    pytest_result = build_pytest_result(
+        plan,
+        check,
+        dependency_version="8.4.2.0",
+    )
+    coverage_result = build_coverage_result(
+        prepared.root,
+        plan,
+        pytest_result,
+        result.coverage,
+        dependency_version="7.15.2.0",
+    )
+
+    assert pytest_result.pytest_version == "8.4.2.0"
+    assert pytest_result.error is None
+    assert coverage_result is not None
+    assert coverage_result.coverage_version == "7.15.2.0"
+    assert coverage_result.error is None
+
+
+@pytest.mark.parametrize(
+    ("pytest_artifact_version", "coverage_artifact_version", "expected_error"),
+    (
+        ("8.4.2", "7.15.2.0", "pytest"),
+        ("8.4.2.0", "7.15.2", "coverage"),
+    ),
+)
+def test_prepared_four_component_dependency_version_mismatch_is_rejected(
+    tmp_path: Path,
+    pytest_artifact_version: str,
+    coverage_artifact_version: str,
+    expected_error: str,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2.0"),
+        coverage_dependency=available_dependency("coverage", "7.15.2.0"),
+        coverage_requested=True,
+        runner=PreparedPytestRunner(
+            pytest_version=pytest_artifact_version,
+            coverage_version=coverage_artifact_version,
+        ),
+    )
+    plan, check = prepared_executed_check(prepared, result, coverage_requested=True)
+    pytest_result = build_pytest_result(
+        plan,
+        check,
+        dependency_version="8.4.2.0",
+    )
+
+    if expected_error == "pytest":
+        assert pytest_result.error is not None
+        assert pytest_result.error.code == "artifact_invalid"
+        return
+    coverage_result = build_coverage_result(
+        prepared.root,
+        plan,
+        pytest_result,
+        result.coverage,
+        dependency_version="7.15.2.0",
+    )
+    assert coverage_result is not None
+    assert coverage_result.error is not None
+    assert coverage_result.error.code == "artifact_invalid"
 
 
 def preflight_document(

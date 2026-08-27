@@ -65,7 +65,11 @@ from pyrepo_check.coverage_execution import (
 from pyrepo_check.execution_workspace import VerifiedRunWorkspace
 from pyrepo_check.planning import CheckInvocation, CoverageExecutionPlan, OutputFormat, RunPlan
 from pyrepo_check.pytest_evidence import build_pytest_result
-from pyrepo_check.repository_environment import locked_repository_prefix
+from pyrepo_check.repository_environment import (
+    SUPPORTED_DEPENDENCIES,
+    dependency_version_supported,
+    locked_repository_prefix,
+)
 
 
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -358,7 +362,11 @@ def _prepared_pytest_preflight(
 ) -> PytestPreflightObservation:
     diagnostic = dependency.error.message if dependency.error is not None else None
     version = _dependency_numeric_version(dependency.version)
-    if dependency.status == "available" and version is not None:
+    if dependency.status == "available" and dependency_version_supported(
+        SUPPORTED_DEPENDENCIES["pytest"], dependency.version
+    ):
+        if version is None:
+            raise AssertionError("supported pytest dependency has no legacy version transport")
         return PytestPreflightObservation(
             "supported",
             PytestPreflightRecord(prepared.python.version, True, version),
@@ -394,7 +402,11 @@ def _prepared_coverage_observation(
     if dependency is None:
         return invalid_coverage_observation("coverage dependency evidence is unavailable")
     diagnostic = dependency.error.message if dependency.error is not None else None
-    if dependency.status == "available" and dependency.version is not None:
+    if dependency.status == "available" and dependency_version_supported(
+        SUPPORTED_DEPENDENCIES["coverage"], dependency.version
+    ):
+        if dependency.version is None:
+            raise AssertionError("supported coverage dependency has no version")
         preflight = CoveragePreflightObservation(
             "supported",
             CoveragePreflightRecord(prepared.python.version, True, dependency.version),
@@ -428,10 +440,10 @@ def _dependency_numeric_version(version: str | None) -> tuple[int, int, int] | N
     if version is None:
         return None
     try:
-        parts = tuple(int(part) for part in version.split("."))
+        parts = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return None
-    if not 1 <= len(parts) <= 3 or any(part < 0 for part in parts):
+    if not parts or any(part < 0 for part in parts):
         return None
     return cast(tuple[int, int, int], (*parts, *(0 for _ in range(3 - len(parts)))))
 
@@ -538,6 +550,16 @@ def _run_prepared_primary(
             CheckExecutionFailure(
                 "terminated_by_signal",
                 f"Check process terminated by signal {-process.returncode}.",
+                None,
+            ),
+        )
+    if process.returncode not in {0, 1, 5}:
+        return (
+            process,
+            start,
+            CheckExecutionFailure(
+                "check_execution_failed",
+                f"Check process exited with reserved error status {process.returncode}.",
                 None,
             ),
         )

@@ -611,6 +611,95 @@ def test_missing_coverage_does_not_suppress_a_later_independent_check(
     ]
 
 
+@pytest.mark.parametrize("returncode", (2, 120))
+def test_prepared_pytest_launcher_failure_does_not_suppress_later_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "pytest", "ty")
+    pytest_invocation, ty_invocation = plan.checks
+    assert pytest_invocation.pytest is not None
+    pytest_invocation = replace(
+        pytest_invocation,
+        pytest=replace(
+            pytest_invocation.pytest,
+            coverage=CoverageExecutionPlan(
+                config_path=tmp_path / "pyproject.toml",
+                fail_under=None,
+            ),
+        ),
+    )
+    plan = replace(
+        plan,
+        checks=(pytest_invocation, ty_invocation),
+        planned_coverage_scope="complete",
+    )
+    safe = _safe_preparation(
+        plan,
+        dependencies=(
+            available_dependency("pytest", "8.4.2"),
+            available_dependency("ty", "0.0.35"),
+            available_dependency("coverage", "7.15.2"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    marker_runner = launcher_aware_runner(
+        returncodes=(returncode, 0),
+        publish_valid_marker=True,
+    )
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        completed = marker_runner(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        if "--module" in command:
+            module_index = command.index("--module")
+            separator_index = command.index("--", module_index + 2)
+            logical = (
+                "python",
+                "-m",
+                command[module_index + 1],
+                *command[separator_index + 1 :],
+            )
+            if "pytest" in logical:
+                test_support._publish_pytest_artifact(  # noqa: SLF001
+                    logical,
+                    env,
+                    completed.returncode,
+                )
+                test_support._publish_coverage_artifact(logical)  # noqa: SLF001
+        return completed
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    pytest_check, ty_check = result.checks
+    assert pytest_check.start is not None
+    assert pytest_check.error is not None
+    assert pytest_check.error.code == "check_execution_failed"
+    assert [process.role for process in pytest_check.processes] == ["primary"]
+    assert pytest_check.coverage is not None
+    assert pytest_check.coverage.artifact.state == "data_missing"
+    assert ty_check.start is not None
+    assert ty_check.error is None
+    assert len(marker_runner.calls) == 2
+
+
 def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

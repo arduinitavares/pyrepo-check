@@ -24,6 +24,7 @@ from pyrepo_check.coverage_evidence import (
     FileStatementCoverage,
     build_coverage_result,
     coverage_gate_policy,
+    is_stable_coverage_version,
     is_supported_coverage_version,
     validate_coverage_result,
     validate_coverage_json,
@@ -61,6 +62,23 @@ CoveragePreflightErrorClassification = Literal[
     "spawn_failed",
     "terminated_by_signal",
 ]
+
+
+@pytest.mark.parametrize(
+    ("version", "stable", "supported"),
+    (
+        ("7.15.2.0", True, True),
+        ("7.15.2rc1", False, False),
+        ("7.15.a.0", False, False),
+    ),
+)
+def test_coverage_version_grammar_matches_authoritative_dependency_versions(
+    version: str,
+    stable: bool,
+    supported: bool,
+) -> None:
+    assert is_stable_coverage_version(version) is stable
+    assert is_supported_coverage_version(version) is supported
 
 
 def _plan(

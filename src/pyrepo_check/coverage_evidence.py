@@ -9,6 +9,10 @@ import re
 from typing import TYPE_CHECKING, Literal, cast
 
 from pyrepo_check.artifact_safety import load_bounded_json
+from pyrepo_check.repository_environment import (
+    SUPPORTED_DEPENDENCIES,
+    dependency_version_supported,
+)
 
 if TYPE_CHECKING:
     from pyrepo_check.coverage_execution import CoverageExecutionObservation
@@ -43,9 +47,7 @@ CoverageErrorCode = Literal[
 ]
 
 
-_STABLE_COVERAGE_VERSION = re.compile(
-    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?$"
-)
+_STABLE_COVERAGE_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:/")
 
 
@@ -364,16 +366,9 @@ def is_stable_coverage_version(value: object) -> bool:
 
 def is_supported_coverage_version(value: object) -> bool:
     """Return whether a stable Coverage.py version is in the supported range."""
-    if not isinstance(value, str):
-        return False
-    match = _STABLE_COVERAGE_VERSION.fullmatch(value)
-    if match is None:
-        return False
-    try:
-        major, minor, patch = (int(piece or "0") for piece in match.groups())
-    except ValueError:
-        return False
-    return (7, 15, 0) <= (major, minor, patch) < (8, 0, 0)
+    return isinstance(value, str) and dependency_version_supported(
+        SUPPORTED_DEPENDENCIES["coverage"], value
+    )
 
 
 def validate_coverage_json(
