@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 
+import pyrepo_check.execution_workspace as execution_workspace
 import pyrepo_check.pytest_execution as pytest_execution
 import pyrepo_check.reporting as reporting
 from pyrepo_check.execution import (
@@ -3497,8 +3498,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
             raise PermissionError("temporary directory denied")
 
         monkeypatch.setattr(
-            pytest_execution,
-            "_create_run_directory",
+            execution_workspace,
+            "create_run_workspace",
             fail_run_directory,
         )
     elif boundary == "plugin-copy":

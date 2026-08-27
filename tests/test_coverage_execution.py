@@ -1269,9 +1269,13 @@ def test_unsupported_coverage_preflight_prevents_a_primary_fallback(tmp_path: Pa
 def test_workspace_capability_failure_attempts_no_preflight_and_retains_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from pyrepo_check import pytest_execution
+    from pyrepo_check import execution_workspace
 
-    monkeypatch.setattr(pytest_execution, "_platform_capability_error", lambda: "unsupported")
+    monkeypatch.setattr(
+        execution_workspace,
+        "_platform_capability_error",
+        lambda: "unsupported",
+    )
     calls: list[tuple[str, ...]] = []
 
     def runner(*args: object, **kwargs: object) -> CompletedProcess[tuple[str, ...]]:

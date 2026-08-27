@@ -21,6 +21,7 @@ from pyrepo_check.planning import (
     PytestExecutionPlan,
     RunPlan,
 )
+import pyrepo_check.execution_workspace as execution_workspace
 import pyrepo_check.pytest_execution as pytest_execution
 from pyrepo_check.pytest_execution import execute_pytest
 from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
@@ -71,31 +72,31 @@ def test_stage_two_resource_limits_are_exact() -> None:
 
 
 def test_cleanup_resource_limits_are_exact() -> None:
-    assert pytest_execution._MAX_CLEANUP_ENTRIES == 4096
-    assert pytest_execution._MAX_CLEANUP_DEPTH == 64
-    assert pytest_execution._MAX_CLEANUP_DURATION_NS == 5_000_000_000
+    assert execution_workspace._MAX_CLEANUP_ENTRIES == 4096
+    assert execution_workspace._MAX_CLEANUP_DEPTH == 64
+    assert execution_workspace._MAX_CLEANUP_DURATION_NS == 5_000_000_000
 
 
 def test_cleanup_budget_accepts_exact_boundaries_and_rejects_one_over() -> None:
     clock_values = iter((5_000_000_000, 5_000_000_001))
-    budget = pytest_execution._CleanupBudget(started_ns=0, clock_ns=lambda: next(clock_values))
+    budget = execution_workspace._CleanupBudget(started_ns=0, clock_ns=lambda: next(clock_values))
 
     for _ in range(4096):
         budget.observe_entry(depth=64)
     budget.check_deadline()
 
-    with pytest.raises(pytest_execution._CleanupFailure) as entry_error:
+    with pytest.raises(execution_workspace._CleanupFailure) as entry_error:
         budget.observe_entry(depth=0)
     assert entry_error.value.kind == "budget_exceeded"
     assert entry_error.value.message == "cleanup entry limit exceeded (4096)"
 
-    fresh_budget = pytest_execution._CleanupBudget(started_ns=0, clock_ns=lambda: 0)
-    with pytest.raises(pytest_execution._CleanupFailure) as depth_error:
+    fresh_budget = execution_workspace._CleanupBudget(started_ns=0, clock_ns=lambda: 0)
+    with pytest.raises(execution_workspace._CleanupFailure) as depth_error:
         fresh_budget.observe_entry(depth=65)
     assert depth_error.value.kind == "budget_exceeded"
     assert depth_error.value.message == "cleanup depth limit exceeded (64)"
 
-    with pytest.raises(pytest_execution._CleanupFailure) as deadline_error:
+    with pytest.raises(execution_workspace._CleanupFailure) as deadline_error:
         budget.check_deadline()
     assert deadline_error.value.kind == "budget_exceeded"
     assert deadline_error.value.message == "cleanup duration limit exceeded (5000000000 ns)"
@@ -194,7 +195,7 @@ def test_descriptor_relative_writer_snapshot_closes_inventory_descriptor(
 
     original_open = os.open
     inventory_descriptors: list[int] = []
-    run_descriptor = original_open(tmp_path, pytest_execution._secure_directory_open_flags())
+    run_descriptor = original_open(tmp_path, execution_workspace._secure_directory_open_flags())
 
     def capture_open(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
@@ -314,8 +315,8 @@ def test_missing_platform_capability_fails_before_temp_or_spawn(
         raise AssertionError("process must not spawn")
 
     monkeypatch.setattr(
-        pytest_execution,
-        "_create_run_directory",
+        execution_workspace,
+        "create_run_workspace",
         forbid_temp,
     )
 
@@ -350,10 +351,10 @@ def test_missing_descriptor_operation_fails_before_temp_or_spawn(
     monkeypatch: pytest.MonkeyPatch,
     capability: str,
 ) -> None:
-    monkeypatch.setattr(pytest_execution, capability, False)
+    monkeypatch.setattr(execution_workspace, capability, False)
     monkeypatch.setattr(
-        pytest_execution,
-        "_create_run_directory",
+        execution_workspace,
+        "create_run_workspace",
         lambda _root: (_ for _ in ()).throw(
             AssertionError("temporary directory must not be created")
         ),
@@ -478,17 +479,25 @@ def completed(
 def safe_run_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     run_directory = Path(tempfile.mkdtemp(prefix="pyrepo-check-test-"))
     assert not run_directory.is_relative_to(tmp_path)
-    created_run_directory = pytest_execution._RunDirectory(
+    created_run_directory = execution_workspace.RunWorkspace(
         run_directory,
-        pytest_execution._directory_identity(run_directory),
-        pytest_execution._directory_identity(run_directory.parent),
+        execution_workspace._directory_identity(run_directory),
+        execution_workspace._directory_identity(run_directory.parent),
     )
     monkeypatch.setattr(
-        pytest_execution,
-        "_create_run_directory",
+        execution_workspace,
+        "create_run_workspace",
         lambda _consumer_root: created_run_directory,
     )
     return run_directory
+
+
+def _cleanup_record(run_directory: Path) -> execution_workspace.RunWorkspace:
+    return execution_workspace.RunWorkspace(
+        run_directory,
+        execution_workspace._directory_identity(run_directory),
+        execution_workspace._directory_identity(run_directory.parent),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1218,15 +1227,15 @@ def test_cleanup_failure_is_observed_without_losing_snapshot(
     run_directory = safe_run_directory(tmp_path, monkeypatch)
 
     def failing_cleanup(
-        run_directory: pytest_execution._RunDirectory,
+        run_directory: execution_workspace.RunWorkspace,
         *,
-        consumer_root: Path,
+        repository_root: Path,
         clock_ns: Callable[[], int],
     ) -> None:
-        del run_directory, consumer_root, clock_ns
+        del run_directory, repository_root, clock_ns
         raise PermissionError("cleanup denied")
 
-    monkeypatch.setattr(pytest_execution, "_remove_run_directory", failing_cleanup)
+    monkeypatch.setattr(execution_workspace, "remove_run_workspace", failing_cleanup)
 
     def runner(
         command: tuple[str, ...],
@@ -1255,1093 +1264,6 @@ def test_cleanup_failure_is_observed_without_losing_snapshot(
     assert observation.pytest.artifact.content == b"artifact"
     assert observation.pytest.cleanup_error == "PermissionError: cleanup denied"
 
-
-def _cleanup_record(run_directory: Path) -> pytest_execution._RunDirectory:
-    return pytest_execution._RunDirectory(
-        run_directory,
-        pytest_execution._directory_identity(run_directory),
-        pytest_execution._directory_identity(run_directory.parent),
-    )
-
-
-def test_cleanup_validation_stops_after_4097_lazy_entries_without_deletion(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    sentinel = run_directory / "sentinel"
-    sentinel.write_text("keep")
-    sentinel_status = os.stat(sentinel)
-    pulls = 0
-    unlink_calls: list[str] = []
-    original_stat = pytest_execution.os.stat
-
-    class FakeEntry:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-    class LazyInventory:
-        def __enter__(self) -> LazyInventory:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def __iter__(self) -> LazyInventory:
-            return self
-
-        def __next__(self) -> FakeEntry:
-            nonlocal pulls
-            pulls += 1
-            if pulls > 100_000:
-                raise AssertionError("cleanup materialized or over-pulled lazy inventory")
-            return FakeEntry(f"entry-{pulls}")
-
-        def close(self) -> None:
-            return None
-
-    def fake_stat(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
-        if dir_fd is not None and os.fsdecode(path).startswith("entry-"):
-            assert follow_symlinks is False
-            return sentinel_status
-        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
-
-    def forbid_unlink(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        del dir_fd
-        unlink_calls.append(os.fsdecode(path))
-        raise AssertionError("validation overflow must not delete entries")
-
-    monkeypatch.setattr(pytest_execution.os, "scandir", lambda _fd: LazyInventory())
-    monkeypatch.setattr(pytest_execution.os, "stat", fake_stat)
-    monkeypatch.setattr(pytest_execution.os, "unlink", forbid_unlink)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "budget_exceeded"
-    assert pulls == 4097
-    assert unlink_calls == []
-    assert run_directory.exists() and sentinel.exists()
-    assert observation.retained_path == run_directory
-
-
-def test_cleanup_rejects_unvalidated_directory_injected_between_passes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    victim = tmp_path / "victim"
-    victim.mkdir()
-    sentinel = victim / "sentinel"
-    sentinel.write_text("keep")
-    injected_sentinel = run_directory / "victim" / sentinel.name
-    victim_identity = pytest_execution._directory_identity(victim)
-    original_walk = pytest_execution._walk_cleanup_tree
-    original_scandir = pytest_execution.os.scandir
-    traversed_victim = False
-    injected = False
-
-    def track_scandir(descriptor: int) -> pytest_execution._ScandirIterator:
-        nonlocal traversed_victim
-        if pytest_execution._status_identity(os.fstat(descriptor)) == victim_identity:
-            traversed_victim = True
-        return cast(pytest_execution._ScandirIterator, original_scandir(descriptor))
-
-    def inject_after_validation(
-        parent_descriptor: int,
-        root_name: str,
-        root_identity: tuple[int, int],
-        *,
-        budget: pytest_execution._CleanupBudget,
-        delete: bool,
-        manifest: pytest_execution._CleanupManifest | None = None,
-    ) -> pytest_execution._CleanupManifest:
-        nonlocal injected
-        result = original_walk(
-            parent_descriptor,
-            root_name,
-            root_identity,
-            budget=budget,
-            delete=delete,
-            manifest=manifest,
-        )
-        if not delete and not injected:
-            victim.rename(run_directory / "victim")
-            injected = True
-        return result
-
-    monkeypatch.setattr(pytest_execution.os, "scandir", track_scandir)
-    monkeypatch.setattr(pytest_execution, "_walk_cleanup_tree", inject_after_validation)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert injected
-    assert injected_sentinel.exists(), "cleanup deleted an entry absent from its validation pass"
-    assert not traversed_victim
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.retained_path == run_directory
-
-
-def test_cleanup_rejects_leaf_substituted_between_validation_and_deletion(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    leaf = run_directory / "leaf"
-    leaf.write_text("validated")
-    displaced = tmp_path / "displaced-leaf"
-    original_walk = pytest_execution._walk_cleanup_tree
-    substituted = False
-
-    def substitute_after_validation(
-        parent_descriptor: int,
-        root_name: str,
-        root_identity: tuple[int, int],
-        *,
-        budget: pytest_execution._CleanupBudget,
-        delete: bool,
-        manifest: pytest_execution._CleanupManifest | None = None,
-    ) -> pytest_execution._CleanupManifest:
-        nonlocal substituted
-        result = original_walk(
-            parent_descriptor,
-            root_name,
-            root_identity,
-            budget=budget,
-            delete=delete,
-            manifest=manifest,
-        )
-        if not delete and not substituted:
-            leaf.rename(displaced)
-            leaf.write_text("replacement")
-            substituted = True
-        return result
-
-    monkeypatch.setattr(pytest_execution, "_walk_cleanup_tree", substitute_after_validation)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert substituted
-    assert leaf.exists(), "cleanup unlinked a substituted leaf"
-    assert leaf.read_text() == "replacement"
-    assert displaced.read_text() == "validated"
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.retained_path == run_directory
-
-
-@pytest.mark.parametrize("leaf_type", ("regular", "symlink", "fifo"))
-def test_cleanup_quarantines_leaf_replaced_immediately_before_rename(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    leaf_type: str,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    outside_sentinel = outside / "sentinel"
-    outside_sentinel.write_text("keep")
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    leaf = run_directory / "leaf"
-    displaced = tmp_path / "displaced-leaf"
-
-    def create_leaf(path: Path, *, replacement: bool) -> None:
-        if leaf_type == "regular":
-            path.write_text("replacement" if replacement else "validated")
-        elif leaf_type == "symlink":
-            path.symlink_to(outside_sentinel if replacement else outside)
-        else:
-            _MKFIFO(path)
-
-    create_leaf(leaf, replacement=False)
-    original_rename = pytest_execution.os.rename
-    original_unlink = pytest_execution.os.unlink
-    quarantine_destination: tuple[str, int] | None = None
-    quarantine_unlinks: list[tuple[str, int | None]] = []
-    swapped = False
-
-    def swap_before_quarantine_rename(
-        source: str | bytes | os.PathLike[str],
-        destination: str | bytes | os.PathLike[str],
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        nonlocal quarantine_destination, swapped
-        if os.fsdecode(source) == leaf.name and src_dir_fd is not None:
-            assert dst_dir_fd is not None
-            quarantine_destination = (os.fsdecode(destination), dst_dir_fd)
-            leaf.rename(displaced)
-            create_leaf(leaf, replacement=True)
-            swapped = True
-        original_rename(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
-
-    def track_unlink(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        quarantine_unlinks.append((os.fsdecode(path), dir_fd))
-        original_unlink(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rename", swap_before_quarantine_rename)
-    monkeypatch.setattr(pytest_execution.os, "unlink", track_unlink)
-
-    def cleanup() -> pytest_execution._CleanupObservation | None:
-        return pytest_execution._remove_run_directory(
-            _cleanup_record(run_directory),
-            consumer_root=consumer_root,
-        )
-    observation = (
-        _run_fifo_call_with_watchdog(cleanup, leaf)
-        if leaf_type == "fifo"
-        else cleanup()
-    )
-
-    assert swapped
-    assert quarantine_destination is not None
-    quarantine_name, quarantine_descriptor = quarantine_destination
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.retained_run_path == run_directory
-    assert observation.retained_quarantine_path is not None
-    quarantined_leaf = observation.retained_quarantine_path / quarantine_name
-    assert quarantined_leaf.exists() or quarantined_leaf.is_symlink()
-    assert displaced.exists() or displaced.is_symlink()
-    assert not any(
-        name == quarantine_name and descriptor == quarantine_descriptor
-        for name, descriptor in quarantine_unlinks
-    )
-    assert outside_sentinel.read_text() == "keep"
-
-
-def test_cleanup_deadline_after_quarantine_rename_retains_entry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "leaf").write_text("validated")
-    original_rename = pytest_execution.os.rename
-    renamed = False
-
-    def track_rename(
-        source: str | bytes | os.PathLike[str],
-        destination: str | bytes | os.PathLike[str],
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        nonlocal renamed
-        original_rename(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
-        renamed = True
-
-    monkeypatch.setattr(pytest_execution.os, "rename", track_rename)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-        clock_ns=lambda: 5_000_000_001 if renamed else 0,
-    )
-
-    assert observation is not None
-    assert observation.kind == "budget_exceeded"
-    assert observation.retained_quarantine_path is not None
-    assert tuple(observation.retained_quarantine_path.iterdir())
-
-
-def test_successful_leaf_cleanup_unlinks_only_from_quarantine_and_removes_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    outside_sentinel = outside / "sentinel"
-    outside_sentinel.write_text("keep")
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "regular").write_text("delete")
-    (run_directory / "symlink").symlink_to(outside_sentinel)
-    _MKFIFO(run_directory / "fifo")
-    original_mkdir = pytest_execution.os.mkdir
-    original_rename = pytest_execution.os.rename
-    original_unlink = pytest_execution.os.unlink
-    quarantine_name: str | None = None
-    quarantine_moves: dict[str, int] = {}
-    quarantine_unlinks: list[tuple[str, int | None]] = []
-
-    def track_mkdir(
-        path: str | bytes | os.PathLike[str],
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal quarantine_name
-        name = os.fsdecode(path)
-        if name.startswith(".pyrepo-check-quarantine-"):
-            quarantine_name = name
-            assert mode == 0o700
-            assert dir_fd is not None
-        original_mkdir(path, mode, dir_fd=dir_fd)
-
-    def track_rename(
-        source: str | bytes | os.PathLike[str],
-        destination: str | bytes | os.PathLike[str],
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        assert os.fsdecode(source) in {"regular", "symlink", "fifo"}
-        assert src_dir_fd is not None and dst_dir_fd is not None
-        quarantine_status = os.fstat(dst_dir_fd)
-        assert quarantine_status.st_dev == os.stat(run_directory.parent).st_dev
-        assert quarantine_status.st_uid == pytest_execution._effective_uid()
-        assert stat.S_IMODE(quarantine_status.st_mode) == 0o700
-        assert not os.get_inheritable(dst_dir_fd)
-        quarantine_moves[os.fsdecode(destination)] = dst_dir_fd
-        original_rename(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
-
-    def track_unlink(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        name = os.fsdecode(path)
-        quarantine_unlinks.append((name, dir_fd))
-        assert quarantine_moves.get(name) == dir_fd
-        original_unlink(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "mkdir", track_mkdir)
-    monkeypatch.setattr(pytest_execution.os, "rename", track_rename)
-    monkeypatch.setattr(pytest_execution.os, "unlink", track_unlink)
-
-    observation = _run_fifo_call_with_watchdog(
-        lambda: pytest_execution._remove_run_directory(
-            _cleanup_record(run_directory),
-            consumer_root=consumer_root,
-        ),
-        run_directory / "fifo",
-    )
-
-    assert observation is None
-    assert len(quarantine_moves) == 3
-    assert len(quarantine_unlinks) == 3
-    assert quarantine_name is not None
-    assert not (tmp_path / quarantine_name).exists()
-    assert not run_directory.exists()
-    assert outside_sentinel.read_text() == "keep"
-
-
-def test_quarantine_open_identity_failure_retains_truthful_empty_quarantine(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "leaf").write_text("keep")
-    original_open = pytest_execution.os.open
-    original_fstat = pytest_execution.os.fstat
-    quarantine_descriptors: set[int] = set()
-
-    def track_open(
-        path: str | bytes | os.PathLike[str],
-        flags: int,
-        *args: int,
-        **kwargs: int | None,
-    ) -> int:
-        descriptor = original_open(path, flags, *args, **kwargs)
-        if os.fsdecode(path).startswith(".pyrepo-check-quarantine-"):
-            quarantine_descriptors.add(descriptor)
-        return descriptor
-
-    def replace_quarantine_identity(descriptor: int) -> os.stat_result:
-        file_status = original_fstat(descriptor)
-        if descriptor not in quarantine_descriptors:
-            return file_status
-        values = list(file_status)
-        values[1] = file_status.st_ino + 1
-        return os.stat_result(values)
-
-    monkeypatch.setattr(pytest_execution.os, "open", track_open)
-    monkeypatch.setattr(pytest_execution.os, "fstat", replace_quarantine_identity)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.retained_run_path == run_directory
-    assert observation.retained_quarantine_path is not None
-    assert observation.retained_quarantine_path.parent == tmp_path
-    assert observation.retained_quarantine_path.is_dir()
-    assert not tuple(observation.retained_quarantine_path.iterdir())
-    assert (run_directory / "leaf").read_text() == "keep"
-    observation.retained_quarantine_path.rmdir()
-
-
-def test_quarantine_removal_error_reports_verified_retained_quarantine_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "leaf").write_text("delete")
-    original_rmdir = pytest_execution.os.rmdir
-    quarantine_rmdir_calls = 0
-
-    def deny_quarantine_rmdir(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal quarantine_rmdir_calls
-        if os.fsdecode(path).startswith(".pyrepo-check-quarantine-"):
-            quarantine_rmdir_calls += 1
-            raise PermissionError("quarantine removal denied")
-        original_rmdir(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rmdir", deny_quarantine_rmdir)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "io_failed"
-    assert observation.retained_run_path is None
-    assert observation.retained_quarantine_path is not None
-    assert quarantine_rmdir_calls == 1
-    assert observation.retained_quarantine_path.is_dir()
-    assert not tuple(observation.retained_quarantine_path.iterdir())
-    original_rmdir(observation.retained_quarantine_path)
-
-
-def test_quarantine_name_replacement_fails_closed_without_stale_path_claim(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "leaf").write_text("delete")
-    original_rmdir = pytest_execution.os.rmdir
-    displaced_quarantine: Path | None = None
-
-    def swap_quarantine_during_rmdir(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal displaced_quarantine
-        name = os.fsdecode(path)
-        if name.startswith(".pyrepo-check-quarantine-"):
-            live_quarantine = tmp_path / name
-            displaced_quarantine = tmp_path / f"displaced-{name}"
-            live_quarantine.rename(displaced_quarantine)
-            live_quarantine.mkdir(mode=0o700)
-        original_rmdir(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_quarantine_during_rmdir)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.retained_run_path is None
-    assert observation.retained_quarantine_path is None
-    assert displaced_quarantine is not None and displaced_quarantine.is_dir()
-    displaced_quarantine.rmdir()
-
-
-def test_cleanup_rejects_validated_entry_missing_during_deletion(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    leaf = run_directory / "leaf"
-    leaf.write_text("validated")
-    displaced = tmp_path / "displaced-leaf"
-    original_walk = pytest_execution._walk_cleanup_tree
-    removed = False
-
-    def remove_after_validation(
-        parent_descriptor: int,
-        root_name: str,
-        root_identity: tuple[int, int],
-        *,
-        budget: pytest_execution._CleanupBudget,
-        delete: bool,
-        manifest: pytest_execution._CleanupManifest | None = None,
-    ) -> pytest_execution._CleanupManifest:
-        nonlocal removed
-        result = original_walk(
-            parent_descriptor,
-            root_name,
-            root_identity,
-            budget=budget,
-            delete=delete,
-            manifest=manifest,
-        )
-        if not delete and not removed:
-            leaf.rename(displaced)
-            removed = True
-        return result
-
-    monkeypatch.setattr(pytest_execution, "_walk_cleanup_tree", remove_after_validation)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert removed
-    assert run_directory.exists(), "cleanup removed a root with a missing manifest entry"
-    assert displaced.read_text() == "validated"
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.retained_path == run_directory
-
-
-def test_cleanup_validation_manifest_accepts_exactly_4096_entries(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    sentinel = run_directory / "sentinel"
-    sentinel.write_text("keep")
-    sentinel_status = os.stat(sentinel)
-    original_stat = pytest_execution.os.stat
-    pulls = 0
-
-    class FakeEntry:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-    class ExactInventory:
-        def __iter__(self) -> ExactInventory:
-            return self
-
-        def __next__(self) -> FakeEntry:
-            nonlocal pulls
-            if pulls == 4096:
-                raise StopIteration
-            pulls += 1
-            return FakeEntry(f"entry-{pulls}")
-
-        def close(self) -> None:
-            return None
-
-    def fake_stat(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
-        if dir_fd is not None and os.fsdecode(path).startswith("entry-"):
-            assert follow_symlinks is False
-            return sentinel_status
-        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
-
-    parent_descriptor = pytest_execution._open_verified_parent(
-        _cleanup_record(run_directory)
-    )
-    monkeypatch.setattr(pytest_execution.os, "scandir", lambda _fd: ExactInventory())
-    monkeypatch.setattr(pytest_execution.os, "stat", fake_stat)
-    try:
-        manifest = pytest_execution._walk_cleanup_tree(
-            parent_descriptor,
-            run_directory.name,
-            pytest_execution._directory_identity(run_directory),
-            budget=pytest_execution._CleanupBudget(0, lambda: 0),
-            delete=False,
-        )
-    finally:
-        os.close(parent_descriptor)
-
-    assert pulls == 4096
-    assert manifest is not None
-    assert len(manifest.entries) == 4096
-    manifest_key, manifest_entry = next(iter(manifest.entries.items()))
-    with pytest.raises(TypeError):
-        cast(
-            dict[pytest_execution.CleanupManifestKey, pytest_execution._CleanupManifestEntry],
-            manifest.entries,
-        )[manifest_key] = manifest_entry
-
-
-@pytest.mark.parametrize(("depth", "removed"), ((64, True), (65, False)))
-def test_cleanup_depth_boundary_is_exact(
-    tmp_path: Path,
-    depth: int,
-    removed: bool,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / f"run-{depth}"
-    run_directory.mkdir()
-    nested = run_directory
-    for index in range(depth):
-        nested = nested / f"d{index}"
-        nested.mkdir()
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert (not run_directory.exists()) is removed
-    if removed:
-        assert observation is None
-    else:
-        assert observation is not None
-        assert observation.kind == "budget_exceeded"
-        assert observation.retained_path == run_directory
-
-
-def test_cleanup_unlinks_symlink_without_touching_outside_and_never_uses_rmtree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    sentinel = outside / "sentinel"
-    sentinel.write_text("keep")
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "outside-link").symlink_to(outside, target_is_directory=True)
-
-    monkeypatch.setattr(
-        shutil,
-        "rmtree",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("production cleanup must not call shutil.rmtree")
-        ),
-    )
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is None
-    assert not run_directory.exists()
-    assert sentinel.read_text() == "keep"
-
-
-def test_cleanup_final_root_removal_is_descriptor_relative(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    (run_directory / "leaf").write_text("delete")
-    original_rmdir = pytest_execution.os.rmdir
-    final_calls: list[tuple[str, int | None]] = []
-
-    def track_rmdir(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        name = os.fsdecode(path)
-        if name == run_directory.name:
-            final_calls.append((name, dir_fd))
-            assert dir_fd is not None
-        original_rmdir(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rmdir", track_rmdir)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is None
-    assert len(final_calls) == 1
-    assert final_calls[0][0] == "run"
-    assert final_calls[0][1] is not None
-
-
-def test_cleanup_directory_opens_use_exact_secure_flags(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    child = run_directory / "child"
-    child.mkdir(parents=True)
-    original_open = pytest_execution.os.open
-    directory_open_flags: list[int] = []
-
-    def track_open(
-        path: str | bytes | os.PathLike[str],
-        flags: int,
-        *args: int,
-        **kwargs: int | None,
-    ) -> int:
-        directory_open_flags.append(flags)
-        return original_open(path, flags, *args, **kwargs)
-
-    monkeypatch.setattr(pytest_execution.os, "open", track_open)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    expected = os.O_RDONLY | _OS_DIRECTORY | _OS_NOFOLLOW | _OS_NONBLOCK
-    assert observation is None
-    assert directory_open_flags
-    assert all(flags == expected for flags in directory_open_flags)
-
-
-def test_cleanup_rejects_cross_device_child_and_retains_tree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    child = run_directory / "child"
-    child.mkdir(parents=True)
-    original_open = pytest_execution.os.open
-    original_fstat = pytest_execution.os.fstat
-    child_descriptors: set[int] = set()
-
-    def track_child_open(
-        path: str | bytes | os.PathLike[str],
-        flags: int,
-        *args: int,
-        **kwargs: int | None,
-    ) -> int:
-        descriptor = original_open(path, flags, *args, **kwargs)
-        if os.fsdecode(path) == "child" and kwargs.get("dir_fd") is not None:
-            child_descriptors.add(descriptor)
-        return descriptor
-
-    def cross_device_fstat(descriptor: int) -> os.stat_result:
-        file_status = original_fstat(descriptor)
-        if descriptor not in child_descriptors:
-            return file_status
-        values = list(file_status)
-        values[2] = file_status.st_dev + 1
-        return os.stat_result(values)
-
-    monkeypatch.setattr(pytest_execution.os, "open", track_child_open)
-    monkeypatch.setattr(pytest_execution.os, "fstat", cross_device_fstat)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.message == "cross-device directory rejected: child"
-    assert observation.retained_path == run_directory
-    assert child.exists()
-
-
-def test_cleanup_rejects_child_substitution_between_stat_and_open(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    child = run_directory / "child"
-    child.mkdir(parents=True)
-    displaced = tmp_path / "displaced-child"
-    replacement_sentinel = child / "replacement"
-    original_open = pytest_execution.os.open
-    substituted = False
-
-    def substitute_before_open(
-        path: str | bytes | os.PathLike[str],
-        flags: int,
-        *args: int,
-        **kwargs: int | None,
-    ) -> int:
-        nonlocal substituted
-        if (
-            not substituted
-            and os.fsdecode(path) == "child"
-            and kwargs.get("dir_fd") is not None
-        ):
-            child.rename(displaced)
-            child.mkdir()
-            replacement_sentinel.write_text("keep")
-            substituted = True
-        return original_open(path, flags, *args, **kwargs)
-
-    monkeypatch.setattr(pytest_execution.os, "open", substitute_before_open)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.message == "directory identity mismatch: child"
-    assert observation.retained_path == run_directory
-    assert replacement_sentinel.read_text() == "keep"
-    assert displaced.exists()
-
-
-def test_cleanup_rejects_child_substitution_before_rmdir(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    child = run_directory / "child"
-    child.mkdir(parents=True)
-    displaced = tmp_path / "displaced-child"
-    replacement_sentinel = child / "replacement"
-    original_stat = pytest_execution.os.stat
-    child_stats = 0
-
-    def substitute_on_preremoval_stat(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
-        nonlocal child_stats
-        if os.fsdecode(path) == "child" and dir_fd is not None:
-            child_stats += 1
-            if child_stats == 3:
-                child.rename(displaced)
-                child.mkdir()
-                replacement_sentinel.write_text("keep")
-        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(pytest_execution.os, "stat", substitute_on_preremoval_stat)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert child_stats == 3
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.message == "directory identity mismatch before removal: child"
-    assert observation.retained_path == run_directory
-    assert replacement_sentinel.read_text() == "keep"
-    assert displaced.exists()
-
-
-def test_cleanup_reports_child_swap_during_rmdir_as_unsafe_tree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    child = run_directory / "child"
-    child.mkdir(parents=True)
-    displaced = tmp_path / "displaced-child"
-    original_rmdir = pytest_execution.os.rmdir
-    swapped = False
-
-    def swap_during_rmdir(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal swapped
-        if os.fsdecode(path) == "child" and not swapped:
-            child.rename(displaced)
-            child.mkdir()
-            swapped = True
-        original_rmdir(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_during_rmdir)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert swapped
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.message == "directory remained linked after removal: child"
-    assert displaced.exists()
-
-
-def test_cleanup_reports_root_swap_during_rmdir_as_unsafe_tree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    run_directory.mkdir()
-    displaced = tmp_path / "displaced-run"
-    original_rmdir = pytest_execution.os.rmdir
-    swapped = False
-
-    def swap_during_rmdir(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal swapped
-        if os.fsdecode(path) == run_directory.name and not swapped:
-            run_directory.rename(displaced)
-            run_directory.mkdir()
-            swapped = True
-        original_rmdir(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rmdir", swap_during_rmdir)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert swapped
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert observation.message == f"directory remained linked after removal: {run_directory.name}"
-    assert displaced.exists()
-
-
-def test_parent_rename_prevents_stale_retained_path_claim(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    parent = tmp_path / "parent"
-    run_directory = parent / "run"
-    run_directory.mkdir(parents=True)
-    moved_parent = tmp_path / "moved-parent"
-
-    def rename_parent_then_fail(*_args: object, **_kwargs: object) -> None:
-        parent.rename(moved_parent)
-        raise pytest_execution._CleanupFailure("unsafe_tree", "synthetic cleanup failure")
-
-    monkeypatch.setattr(pytest_execution, "_walk_cleanup_tree", rename_parent_then_fail)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.retained_path is None
-    assert (moved_parent / "run").exists()
-
-
-def test_cleanup_concurrent_growth_reports_enotempty_and_retains_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    consumer_root = tmp_path / "consumer"
-    consumer_root.mkdir()
-    run_directory = tmp_path / "run"
-    child = run_directory / "child"
-    child.mkdir(parents=True)
-    original_rmdir = pytest_execution.os.rmdir
-    grew = False
-
-    def grow_before_child_rmdir(
-        path: str | bytes | os.PathLike[str],
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal grew
-        if os.fsdecode(path) == "child" and not grew:
-            (child / "late").write_text("keep")
-            grew = True
-        original_rmdir(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(pytest_execution.os, "rmdir", grow_before_child_rmdir)
-
-    observation = pytest_execution._remove_run_directory(
-        _cleanup_record(run_directory),
-        consumer_root=consumer_root,
-    )
-
-    assert observation is not None
-    assert observation.kind == "io_failed"
-    assert "Directory not empty" in observation.message
-    assert observation.retained_path == run_directory
-    assert (child / "late").read_text() == "keep"
 
 
 def test_setup_failure_is_typed_not_started_and_the_created_run_directory_is_removed(
@@ -2375,7 +1297,7 @@ def test_plugin_preparation_completes_partial_descriptor_writes(
 ) -> None:
     run_directory = tmp_path / "run"
     run_directory.mkdir()
-    verified = pytest_execution._open_verified_run_directory(
+    verified = execution_workspace.open_verified_workspace(
         _cleanup_record(run_directory)
     )
     original_write = pytest_execution.os.write
@@ -2409,14 +1331,14 @@ def test_verified_run_descriptors_close_on_all_execution_paths(
     setup_failure: bool,
 ) -> None:
     run_directory = safe_run_directory(tmp_path, monkeypatch)
-    original_open_verified = pytest_execution._open_verified_run_directory
+    original_open_verified = execution_workspace.open_verified_workspace
     original_close = pytest_execution.os.close
     verified_descriptors: set[int] = set()
     closed: set[int] = set()
 
     def track_open_verified(
-        record: pytest_execution._RunDirectory,
-    ) -> pytest_execution._VerifiedRunDirectory:
+        record: execution_workspace.RunWorkspace,
+    ) -> execution_workspace.VerifiedRunWorkspace:
         verified = original_open_verified(record)
         verified_descriptors.update(
             {verified.parent_descriptor, verified.descriptor}
@@ -2437,8 +1359,8 @@ def test_verified_run_descriptors_close_on_all_execution_paths(
         raise PermissionError("plugin copy denied")
 
     monkeypatch.setattr(
-        pytest_execution,
-        "_open_verified_run_directory",
+        execution_workspace,
+        "open_verified_workspace",
         track_open_verified,
     )
     monkeypatch.setattr(pytest_execution.os, "close", track_close)
@@ -2477,7 +1399,7 @@ def test_run_swap_after_create_stops_before_preparation_or_runner(
     replacement_sentinel = run_directory / "replacement-sentinel"
     runner_calls: list[tuple[str, ...]] = []
 
-    def create_then_swap(_consumer_root: Path) -> pytest_execution._RunDirectory:
+    def create_then_swap(_consumer_root: Path) -> execution_workspace.RunWorkspace:
         run_directory.rename(displaced)
         run_directory.mkdir()
         replacement_sentinel.write_text("keep")
@@ -2490,7 +1412,7 @@ def test_run_swap_after_create_stops_before_preparation_or_runner(
         runner_calls.append(command)
         return completed(command, 0, stdout=preflight_document())
 
-    monkeypatch.setattr(pytest_execution, "_create_run_directory", create_then_swap)
+    monkeypatch.setattr(execution_workspace, "create_run_workspace", create_then_swap)
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
@@ -2871,7 +1793,7 @@ def test_consumer_tmpdir_is_not_used_for_the_run_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(pytest_execution.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(execution_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
     run_directories: list[Path] = []
 
     def runner(
@@ -2906,7 +1828,7 @@ def test_run_directory_creation_failure_is_typed_not_started(
     def fail_mkdtemp(**_kwargs: object) -> str:
         raise PermissionError("temporary directory denied")
 
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", fail_mkdtemp)
+    monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", fail_mkdtemp)
 
     observation = execute_pytest(pytest_check(tmp_path), output_format="json")
 
@@ -2925,7 +1847,7 @@ def test_parent_identity_failure_precedes_mkdtemp_and_leaves_no_run_directory(
         Path("/tmp").resolve(strict=True),  # nosec B108
         Path("/var/tmp").resolve(strict=True),  # nosec B108
     }
-    original_identity = pytest_execution._directory_identity
+    original_identity = execution_workspace._directory_identity
     original_mkdtemp = tempfile.mkdtemp
     created_directories: list[Path] = []
 
@@ -2944,12 +1866,12 @@ def test_parent_identity_failure_precedes_mkdtemp_and_leaves_no_run_directory(
         created_directories.append(directory)
         return str(directory)
 
-    monkeypatch.setattr(pytest_execution, "_directory_identity", deny_candidate_parent_identity)
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", track_mkdtemp)
+    monkeypatch.setattr(execution_workspace, "_directory_identity", deny_candidate_parent_identity)
+    monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", track_mkdtemp)
 
     try:
         with pytest.raises(PermissionError, match="candidate parent identity denied"):
-            pytest_execution._create_run_directory(Path.cwd())
+            execution_workspace.create_run_workspace(Path.cwd())
     finally:
         for directory in created_directories:
             if directory.exists():
@@ -2988,10 +1910,10 @@ def test_parent_replacement_after_mkdtemp_stops_before_preparation_and_runner(
         return str(replacement)
 
     def track_prepare(
-        verified_run: pytest_execution._VerifiedRunDirectory,
+        verified_run: execution_workspace.VerifiedRunWorkspace,
         plugin_module: str,
     ) -> tuple[Path, Path]:
-        prepared.append(verified_run.run_directory.path)
+        prepared.append(verified_run.workspace.path)
         return original_prepare(verified_run, plugin_module)
 
     def runner(
@@ -3006,8 +1928,8 @@ def test_parent_replacement_after_mkdtemp_stops_before_preparation_and_runner(
         runner_calls.append(command)
         return completed(command, 0, stdout=preflight_document())
 
-    monkeypatch.setattr(pytest_execution.tempfile, "gettempdir", lambda: str(temp_parent))
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", swap_parent_after_creation)
+    monkeypatch.setattr(execution_workspace.tempfile, "gettempdir", lambda: str(temp_parent))
+    monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", swap_parent_after_creation)
     monkeypatch.setattr(pytest_execution, "_prepare_run_directory", track_prepare)
 
     try:
@@ -3039,8 +1961,8 @@ def test_empty_created_cleanup_reports_swap_during_rmdir(
 ) -> None:
     run_directory = tmp_path / "run"
     run_directory.mkdir()
-    identity = pytest_execution._directory_identity(run_directory)
-    parent_identity = pytest_execution._directory_identity(tmp_path)
+    identity = execution_workspace._directory_identity(run_directory)
+    parent_identity = execution_workspace._directory_identity(tmp_path)
     displaced = tmp_path / "displaced-run"
     original_rmdir = pytest_execution.os.rmdir
     swapped = False
@@ -3059,14 +1981,14 @@ def test_empty_created_cleanup_reports_swap_during_rmdir(
 
     monkeypatch.setattr(pytest_execution.os, "rmdir", swap_during_rmdir)
 
-    cleanup_error = pytest_execution._remove_empty_created_run_directory(
+    cleanup_error = execution_workspace._remove_empty_created_run_directory(
         run_directory,
         identity,
         parent_identity,
     )
 
     assert swapped
-    assert isinstance(cleanup_error, pytest_execution._CleanupFailure)
+    assert isinstance(cleanup_error, execution_workspace._CleanupFailure)
     assert cleanup_error.kind == "unsafe_tree"
     assert cleanup_error.message == f"directory remained linked after removal: {run_directory.name}"
     assert displaced.exists()
@@ -3086,12 +2008,12 @@ def test_darwin_getpath_live_identity_mismatch_does_not_prove_unlink(
         return os.fsencode(different_live_target) + b"\0"
 
     monkeypatch.setattr(
-        pytest_execution,
+        execution_workspace,
         "_fcntl",
         SimpleNamespace(fcntl=get_path, F_GETPATH=50),
     )
     try:
-        remains_linked = pytest_execution._opened_directory_remains_linked(descriptor)
+        remains_linked = execution_workspace._opened_directory_remains_linked(descriptor)
     finally:
         os.close(descriptor)
 
@@ -3110,12 +2032,12 @@ def test_darwin_getpath_same_identity_does_not_prove_unlink(
         return os.fsencode(opened) + b"\0"
 
     monkeypatch.setattr(
-        pytest_execution,
+        execution_workspace,
         "_fcntl",
         SimpleNamespace(fcntl=get_path, F_GETPATH=50),
     )
     try:
-        remains_linked = pytest_execution._opened_directory_remains_linked(descriptor)
+        remains_linked = execution_workspace._opened_directory_remains_linked(descriptor)
     finally:
         os.close(descriptor)
 
@@ -3135,12 +2057,12 @@ def test_darwin_getpath_missing_target_proves_unlink(
         return os.fsencode(missing) + b"\0"
 
     monkeypatch.setattr(
-        pytest_execution,
+        execution_workspace,
         "_fcntl",
         SimpleNamespace(fcntl=get_path, F_GETPATH=50),
     )
     try:
-        remains_linked = pytest_execution._opened_directory_remains_linked(descriptor)
+        remains_linked = execution_workspace._opened_directory_remains_linked(descriptor)
     finally:
         os.close(descriptor)
 
@@ -3159,12 +2081,12 @@ def test_darwin_getpath_empty_target_does_not_prove_unlink(
         return b"\0"
 
     monkeypatch.setattr(
-        pytest_execution,
+        execution_workspace,
         "_fcntl",
         SimpleNamespace(fcntl=get_path, F_GETPATH=50),
     )
     try:
-        remains_linked = pytest_execution._opened_directory_remains_linked(descriptor)
+        remains_linked = execution_workspace._opened_directory_remains_linked(descriptor)
     finally:
         os.close(descriptor)
 
@@ -3177,7 +2099,7 @@ def test_rejected_consumer_root_run_directories_are_removed(
 ) -> None:
     created_directories: list[Path] = []
     original_mkdtemp = tempfile.mkdtemp
-    original_is_within = pytest_execution._is_within
+    original_is_within = execution_workspace._is_within
 
     def create_candidate(
         *,
@@ -3192,11 +2114,11 @@ def test_rejected_consumer_root_run_directories_are_removed(
     def reject_created(directory: Path, root: Path) -> bool:
         return directory in created_directories or original_is_within(directory, root)
 
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
-    monkeypatch.setattr(pytest_execution, "_is_within", reject_created)
+    monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(execution_workspace, "_is_within", reject_created)
 
     with pytest.raises(OSError, match="inside consumer root"):
-        pytest_execution._create_run_directory(tmp_path)
+        execution_workspace.create_run_workspace(tmp_path)
 
     assert created_directories
     assert all(not directory.exists() for directory in created_directories)
@@ -3209,7 +2131,7 @@ def test_rejected_run_directory_cleanup_failure_is_reported(
     created_directories: list[Path] = []
     original_mkdtemp = tempfile.mkdtemp
     original_rmdir = pytest_execution.os.rmdir
-    original_is_within = pytest_execution._is_within
+    original_is_within = execution_workspace._is_within
 
     def create_candidate(
         *,
@@ -3233,12 +2155,12 @@ def test_rejected_run_directory_cleanup_failure_is_reported(
             raise PermissionError("run directory cleanup denied")
         original_rmdir(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
-    monkeypatch.setattr(pytest_execution, "_is_within", reject_created)
+    monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(execution_workspace, "_is_within", reject_created)
     monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rmdir)
 
     with pytest.raises(OSError, match="cleanup failed: PermissionError: run directory cleanup denied"):
-        pytest_execution._create_run_directory(tmp_path)
+        execution_workspace.create_run_workspace(tmp_path)
 
     for directory in created_directories:
         original_rmdir(directory)
@@ -3251,7 +2173,7 @@ def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
     created_directories: list[Path] = []
     original_mkdtemp = tempfile.mkdtemp
     original_rmdir = pytest_execution.os.rmdir
-    original_is_within = pytest_execution._is_within
+    original_is_within = execution_workspace._is_within
 
     def create_candidate(
         *,
@@ -3275,8 +2197,8 @@ def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
             raise PermissionError("rejected candidate cleanup denied")
         original_rmdir(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(pytest_execution.tempfile, "mkdtemp", create_candidate)
-    monkeypatch.setattr(pytest_execution, "_is_within", reject_created)
+    monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", create_candidate)
+    monkeypatch.setattr(execution_workspace, "_is_within", reject_created)
     monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rejected_rmdir)
 
     try:
@@ -3284,7 +2206,7 @@ def test_rejected_run_directory_cleanup_failure_stops_before_later_candidate(
             OSError,
             match="cleanup failed: PermissionError: rejected candidate cleanup denied",
         ):
-            pytest_execution._create_run_directory(tmp_path)
+            execution_workspace.create_run_workspace(tmp_path)
     finally:
         for directory in created_directories:
             if directory.exists():
@@ -3299,10 +2221,10 @@ def test_open_verified_parent_closes_descriptor_when_identity_check_fails(
 ) -> None:
     run_directory = tmp_path / "run-directory"
     run_directory.mkdir()
-    record = pytest_execution._RunDirectory(
+    record = execution_workspace.RunWorkspace(
         run_directory,
-        pytest_execution._directory_identity(run_directory),
-        pytest_execution._directory_identity(run_directory.parent),
+        execution_workspace._directory_identity(run_directory),
+        execution_workspace._directory_identity(run_directory.parent),
     )
     opened: list[int] = []
     closed: list[int] = []
@@ -3332,7 +2254,7 @@ def test_open_verified_parent_closes_descriptor_when_identity_check_fails(
 
     try:
         with pytest.raises(PermissionError, match="directory identity denied"):
-            pytest_execution._open_verified_parent(record)
+            execution_workspace._open_verified_parent(record)
     finally:
         for descriptor in opened:
             if descriptor not in closed:
@@ -3387,7 +2309,7 @@ def test_cleanup_does_not_traverse_replacement_after_identity_verification(
     run_directory = safe_run_directory(tmp_path, monkeypatch)
     displaced_directory = tmp_path / "displaced-run-directory"
     replacement_file = run_directory / "replacement"
-    original_walk = pytest_execution._walk_cleanup_tree
+    original_walk = execution_workspace._walk_cleanup_tree
     replaced = False
 
     def replace_after_validation(
@@ -3395,10 +2317,10 @@ def test_cleanup_does_not_traverse_replacement_after_identity_verification(
         root_name: str,
         root_identity: tuple[int, int],
         *,
-        budget: pytest_execution._CleanupBudget,
+        budget: execution_workspace._CleanupBudget,
         delete: bool,
-        manifest: pytest_execution._CleanupManifest | None = None,
-    ) -> pytest_execution._CleanupManifest:
+        manifest: execution_workspace._CleanupManifest | None = None,
+    ) -> execution_workspace._CleanupManifest:
         nonlocal replaced
         result = original_walk(
             parent_descriptor,
@@ -3416,7 +2338,7 @@ def test_cleanup_does_not_traverse_replacement_after_identity_verification(
         return result
 
     monkeypatch.setattr(
-        pytest_execution,
+        execution_workspace,
         "_walk_cleanup_tree",
         replace_after_validation,
     )
