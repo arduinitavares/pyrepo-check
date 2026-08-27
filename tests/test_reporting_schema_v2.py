@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import asdict, fields, replace
-from typing import Any, cast
+from dataclasses import asdict, fields, make_dataclass, replace
+from typing import Any, TypeVar, cast
 
 import pytest
 
 from pyrepo_check.coverage_evidence import (
+    CoverageCounts,
     CoverageError,
     CoverageResult,
     CoverageThreshold,
+    CoverageTotals,
 )
-from pyrepo_check.pytest_evidence import PytestError, PytestResult
+from pyrepo_check.pytest_evidence import (
+    PytestCounts,
+    PytestError,
+    PytestEvidence,
+    PytestResult,
+)
 from pyrepo_check.reporting import ReportingError, validate_report_v2
 from pyrepo_check.reporting_schema import (
     Advisory,
@@ -87,6 +94,261 @@ def coverage_error_result() -> CoverageResult:
         totals=None,
         files=(),
         error=CoverageError("preflight_invalid", "coverage did not run"),
+    )
+
+
+def complete_pytest_result(*, exit_code: int = 0) -> PytestResult:
+    return PytestResult(
+        status="passed" if exit_code == 0 else "failed",
+        complete=True,
+        scope="complete",
+        scope_reasons=(),
+        pytest_version="8.4.2",
+        exit_code=exit_code,
+        evidence=PytestEvidence(
+            effective_args=(),
+            collected=0,
+            deselected=0,
+            counts=PytestCounts(0, 0, 0, 0, 0, 0),
+            collection_errors=(),
+            collection_skips=(),
+            slowest=(),
+            special_outcomes=(),
+        ),
+        error=None,
+    )
+
+
+def complete_coverage_result() -> CoverageResult:
+    return CoverageResult(
+        status="guidance",
+        scope="complete",
+        evidence_complete=True,
+        coverage_version="7.15.0",
+        gate_eligible=False,
+        threshold=CoverageThreshold(
+            configured=False,
+            value=None,
+            evaluated=False,
+            passed=None,
+            skipped_reason="not_configured",
+        ),
+        totals=CoverageTotals(
+            statements=CoverageCounts(0, 0),
+            branches=CoverageCounts(0, 0),
+        ),
+        files=(),
+        error=None,
+    )
+
+
+def pytest_run_report(
+    *,
+    exit_code: int = 0,
+    coverage: str = "not_requested",
+    cleanup_failure: bool = False,
+) -> RunReportV2:
+    report = valid_run_report()
+    environment = report.repository_environment
+    pytest_dependency = replace(
+        environment.dependencies[0],
+        name="pytest",
+        module="pytest",
+        required=">=8,<9",
+        version="8.4.2",
+        origin="/repo/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+    )
+    coverage_dependency: DependencyEvidence | None = None
+    coverage_result: CoverageResult | None = None
+    module = "pytest"
+    processes: tuple[ProcessResult, ...]
+    if coverage in {"available", "helper_failure", "primary_failure"}:
+        module = "coverage"
+        coverage_dependency = replace(
+            pytest_dependency,
+            name="coverage",
+            module="coverage",
+            required=">=7.15,<8",
+            version="7.15.0",
+            origin="/repo/.venv/lib/python3.12/site-packages/coverage/__init__.py",
+        )
+        if coverage == "helper_failure":
+            coverage_result = replace(
+                coverage_error_result(),
+                coverage_version="7.15.0",
+                error=CoverageError("generation_failed", "coverage json failed"),
+            )
+        elif coverage == "primary_failure":
+            coverage_result = replace(
+                coverage_error_result(),
+                coverage_version="7.15.0",
+                error=CoverageError("data_missing", "pytest did not complete"),
+            )
+        else:
+            coverage_result = complete_coverage_result()
+    elif coverage == "missing":
+        coverage_dependency = replace(
+            pytest_dependency,
+            name="coverage",
+            module="coverage",
+            required=">=7.15,<8",
+            status="missing",
+            version=None,
+            origin=None,
+            error=CheckErrorV2(
+                "check_dependency_missing",
+                "coverage is missing",
+                "Install coverage.",
+            ),
+        )
+        coverage_result = coverage_error_result()
+        coverage_result = replace(
+            coverage_result,
+            error=CoverageError("module_unavailable", "coverage is missing"),
+        )
+    primary = process_result(
+        "primary",
+        argv=(
+            "uv",
+            "run",
+            "--locked",
+            "python",
+            "/repo/.pyrepo-check/check-launcher.py",
+            "--evidence",
+            "/repo/.pyrepo-check/start.json",
+            "--check",
+            "pytest",
+            "--module",
+            module,
+            "--",
+        ),
+        exit_code=exit_code,
+    )
+    processes = (primary,)
+    if coverage in {"available", "helper_failure"}:
+        processes = (
+            *processes,
+            process_result(
+                "coverage_json",
+                exit_code=3 if coverage == "helper_failure" else 0,
+            ),
+        )
+    check_error = (
+        CheckErrorV2("cleanup_failed", "workspace cleanup failed", "Inspect workspace.")
+        if cleanup_failure
+        else CheckErrorV2(
+            "check_execution_failed",
+            "pytest launcher returned a reserved exit.",
+            None,
+        )
+        if coverage == "primary_failure"
+        else None
+    )
+    check = CheckResultV2(
+        name="pytest",
+        status=(
+            "error"
+            if cleanup_failure or coverage == "primary_failure"
+            else "passed"
+            if exit_code == 0
+            else "failed"
+        ),
+        execution_environment="repository",
+        analysis_python_authority=None,
+        start_evidence=CheckStartEvidence(
+            schema_version=1,
+            check="pytest",
+            module=cast(Any, module),
+            arguments_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            python=repository_python(),
+        ),
+        processes=processes,
+        error=check_error,
+    )
+    dependencies = (pytest_dependency,)
+    if coverage_dependency is not None:
+        dependencies = (*dependencies, coverage_dependency)
+    complete = not cleanup_failure and coverage not in {
+        "missing",
+        "helper_failure",
+        "primary_failure",
+    }
+    overall_status = (
+        "error"
+        if not complete
+        else "failed"
+        if exit_code != 0
+        else "passed"
+    )
+    return replace(
+        report,
+        overall_status=overall_status,
+        complete=complete,
+        selection=Selection(
+            checks=("pytest",),
+            targets=(),
+            test_shortcut=None,
+            pytest_args=(),
+            planned_test_scope="complete",
+            planned_coverage_scope=(
+                "complete"
+                if coverage
+                in {"available", "missing", "helper_failure", "primary_failure"}
+                else "not_requested"
+            ),
+        ),
+        repository_environment=replace(environment, dependencies=dependencies),
+        checks=(check,),
+        pytest=(
+            PytestResult(
+                status="error",
+                complete=False,
+                scope="partial",
+                scope_reasons=("incomplete_session",),
+                pytest_version="8.4.2",
+                exit_code=exit_code,
+                evidence=complete_pytest_result().evidence,
+                error=PytestError("interrupted", "pytest was interrupted"),
+            )
+            if coverage == "primary_failure"
+            else complete_pytest_result(exit_code=exit_code)
+        ),
+        coverage=coverage_result,
+    )
+
+
+def pytest_workspace_failure_report() -> RunReportV2:
+    report = pytest_run_report(coverage="available")
+    check = report.checks[0]
+    return replace(
+        report,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                check,
+                status="error",
+                execution_environment=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    "cleanup_failed",
+                    "pytest workspace setup failed",
+                    None,
+                ),
+            ),
+        ),
+        pytest=PytestResult(
+            status="error",
+            complete=False,
+            scope="partial",
+            scope_reasons=("incomplete_session",),
+            pytest_version=None,
+            exit_code=None,
+            evidence=None,
+            error=PytestError("not_started", "pytest workspace setup failed"),
+        ),
+        coverage=coverage_error_result(),
     )
 
 
@@ -282,7 +544,19 @@ def valid_run_report() -> RunReportV2:
             process_result("repository_safety"),
             process_result("uv_version"),
             process_result("environment_probe"),
-            process_result("repository_safety"),
+            process_result(
+                "repository_safety",
+                argv=(
+                    "git",
+                    "-C",
+                    "/repo",
+                    "ls-files",
+                    "--stage",
+                    "-z",
+                    "--",
+                    ".",
+                ),
+            ),
         ),
         error=None,
     )
@@ -1085,6 +1359,198 @@ def test_schema_v2_selection_order_local_nullability_is_exact() -> None:
         with pytest.raises(ReportingError):
             validate_report_structure_v2(replace(report, selection=malformed_selection))
 
+
+_ModelT = TypeVar("_ModelT")
+
+
+def extended_dataclass(value: _ModelT) -> _ModelT:
+    model = type(value)
+    extended = make_dataclass(
+        f"Extended{model.__name__}",
+        (("unexpected", str),),
+        bases=(model,),
+        frozen=True,
+    )
+    return cast(
+        _ModelT,
+        extended(
+            *(getattr(value, field.name) for field in fields(cast(Any, value))),
+            "unexpected",
+        ),
+    )
+
+
+def test_schema_v2_rejects_subclasses_for_every_schema_owned_model() -> None:
+    report = valid_run_report()
+    environment = report.repository_environment
+    dependency = environment.dependencies[0]
+    check = report.checks[0]
+    start = cast(CheckStartEvidence, check.start_evidence)
+    authority = cast(AnalysisPythonAuthorityEvidence, check.analysis_python_authority)
+    process = check.processes[0]
+    advisory = Advisory("output_truncated", "truncated", None)
+    environment_error = EnvironmentError("repository_state_changed", "changed", None)
+    check_error = CheckErrorV2("check_execution_failed", "failed", None)
+    mutations = (
+        replace(report, tool_environment=extended_dataclass(report.tool_environment)),
+        replace(
+            report,
+            tool_environment=replace(
+                report.tool_environment,
+                python=extended_dataclass(report.tool_environment.python),
+            ),
+        ),
+        replace(
+            report,
+            repository_environment=extended_dataclass(environment),
+        ),
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                python_selection=extended_dataclass(environment.python_selection),
+            ),
+        ),
+        replace(
+            report,
+            repository_environment=replace(environment, lock=extended_dataclass(environment.lock)),
+        ),
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                dependencies=(extended_dataclass(dependency),),
+            ),
+        ),
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                dependencies=(
+                    replace(dependency, error=extended_dataclass(check_error)),
+                ),
+            ),
+        ),
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                processes=(extended_dataclass(environment.processes[0]), *environment.processes[1:]),
+            ),
+        ),
+        replace(
+            report,
+            checks=(replace(check, processes=(replace(process, stdout=extended_dataclass(process.stdout)),)),),
+        ),
+        replace(report, selection=extended_dataclass(report.selection)),
+        replace(report, checks=(extended_dataclass(check),)),
+        replace(
+            report,
+            checks=(replace(check, start_evidence=extended_dataclass(start)),),
+        ),
+        replace(
+            report,
+            checks=(replace(check, analysis_python_authority=extended_dataclass(authority)),),
+        ),
+        replace(report, advisories=(extended_dataclass(advisory),)),
+        extended_dataclass(report),
+        replace(
+            report,
+            repository_environment=replace(
+                environment, error=extended_dataclass(environment_error)
+            ),
+        ),
+    )
+    for malformed in mutations:
+        with pytest.raises(ReportingError):
+            validate_report_structure_v2(malformed)
+
+    planning = PlanningErrorReportV2(
+        2,
+        "planning_error",
+        "error",
+        False,
+        tool_environment_evidence(),
+        None,
+        PlanningErrorV2("unknown_check", "unknown", None),
+    )
+    for malformed in (
+        extended_dataclass(planning),
+        replace(planning, error=extended_dataclass(planning.error)),
+    ):
+        with pytest.raises(ReportingError):
+            validate_report_structure_v2(malformed)
+
+
+def test_schema_v2_rejects_relative_and_lexically_non_normal_paths() -> None:
+    report = valid_run_report()
+    environment = report.repository_environment
+    check = report.checks[0]
+    start = cast(CheckStartEvidence, check.start_evidence)
+    process = check.processes[0]
+    malformed = (
+        replace(report, project_root="repo"),
+        replace(report, project_root="/repo/../repo"),
+        replace(
+            report,
+            tool_environment=replace(
+                report.tool_environment,
+                python=replace(report.tool_environment.python, executable="tool/python"),
+            ),
+        ),
+        replace(
+            report,
+            tool_environment=replace(
+                report.tool_environment,
+                python=replace(
+                    report.tool_environment.python,
+                    executable="/tool/../tool/bin/python",
+                ),
+            ),
+        ),
+        replace(
+            report,
+            repository_environment=replace(environment, path="repo/.venv"),
+        ),
+        replace(
+            report,
+            repository_environment=replace(environment, path="/repo/./.venv"),
+        ),
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                python=replace(repository_python(), executable="repo/.venv/bin/python"),
+            ),
+        ),
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                lock=replace(environment.lock, path="/repo/../repo/uv.lock"),
+            ),
+        ),
+        replace(
+            report,
+            checks=(
+                replace(
+                    check,
+                    start_evidence=replace(
+                        start,
+                        python=replace(start.python, executable="/repo/.venv/../bin/python"),
+                    ),
+                ),
+            ),
+        ),
+        replace(
+            report,
+            checks=(replace(check, processes=(replace(process, cwd="/repo/../repo"),)),),
+        ),
+    )
+    for invalid in malformed:
+        with pytest.raises(ReportingError):
+            validate_report_structure_v2(invalid)
+
     pytest_selection = Selection(
         checks=("pytest",),
         targets=("tests",),
@@ -1183,7 +1649,19 @@ def test_schema_v2_accepts_final_safety_after_uv_failure() -> None:
         processes=(
             process_result("repository_safety"),
             uv_failure,
-            process_result("repository_safety"),
+            process_result(
+                "repository_safety",
+                argv=(
+                    "git",
+                    "-C",
+                    "/repo",
+                    "ls-files",
+                    "--stage",
+                    "-z",
+                    "--",
+                    ".",
+                ),
+            ),
         ),
         error=EnvironmentError(
             code="uv_unavailable",
@@ -1193,6 +1671,443 @@ def test_schema_v2_accepts_final_safety_after_uv_failure() -> None:
     )
 
     validate_report_v2(replace(report, repository_environment=failed_environment))
+
+
+def test_schema_v2_repository_integrity_state_families_are_exact() -> None:
+    tracked = valid_run_report()
+    validate_report_v2(tracked)
+
+    protected = replace(
+        tracked,
+        repository_environment=replace(
+            tracked.repository_environment,
+            mutation_protection="protected_files",
+            processes=tracked.repository_environment.processes[:-1],
+        ),
+    )
+    validate_report_v2(protected)
+
+    environment = tracked.repository_environment
+    post_run = replace(
+        tracked,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            environment,
+            error=EnvironmentError(
+                "repository_state_changed",
+                "Repository state changed after Check execution.",
+                "Restore the repository state, then retry.",
+            ),
+        ),
+    )
+    validate_report_v2(post_run)
+
+    pre_execution = replace(
+        tracked,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            environment,
+            error=EnvironmentError(
+                "environment_evidence_invalid",
+                "Repository Environment evidence is incomplete.",
+                "Inspect the preparation evidence.",
+            ),
+        ),
+        checks=(
+            CheckResultV2(
+                name="ruff",
+                status="error",
+                execution_environment=None,
+                analysis_python_authority=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    "repository_environment_unavailable",
+                    "Repository Environment is unavailable.",
+                    None,
+                ),
+            ),
+        ),
+    )
+    validate_report_v2(pre_execution)
+
+    malformed = (
+        replace(
+            tracked,
+            repository_environment=replace(environment, mutation_protection="unobserved"),
+        ),
+        replace(
+            tracked,
+            repository_environment=replace(
+                environment,
+                processes=(
+                    *environment.processes[:-1],
+                    replace(environment.processes[-1], argv=("git", "status")),
+                ),
+            ),
+        ),
+        replace(post_run, checks=pre_execution.checks),
+        replace(pre_execution, checks=tracked.checks),
+    )
+    for invalid in malformed:
+        with pytest.raises(ReportingError):
+            validate_report_v2(invalid)
+
+
+def test_schema_v2_accepts_exact_ordinary_check_outcome_families() -> None:
+    passed = valid_run_report()
+    check = passed.checks[0]
+    primary = check.processes[0]
+
+    failed = replace(
+        passed,
+        overall_status="failed",
+        checks=(replace(check, status="failed", processes=(replace(primary, exit_code=1),)),),
+    )
+    execution_error = replace(
+        passed,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                check,
+                status="error",
+                analysis_python_authority=None,
+                processes=(replace(primary, exit_code=2),),
+                error=CheckErrorV2(
+                    "check_execution_failed",
+                    "ruff exited before producing completed findings.",
+                    None,
+                ),
+            ),
+        ),
+    )
+    missing_start = replace(
+        passed,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                check,
+                status="error",
+                execution_environment=None,
+                analysis_python_authority=None,
+                start_evidence=None,
+                error=CheckErrorV2(
+                    "check_start_evidence_invalid",
+                    "ruff start evidence was not observed.",
+                    None,
+                ),
+            ),
+        ),
+    )
+    signaled = replace(
+        missing_start,
+        checks=(
+            replace(
+                missing_start.checks[0],
+                processes=(
+                    replace(
+                        primary,
+                        outcome="signaled",
+                        exit_code=None,
+                        signal=15,
+                        error_message="terminated by signal 15",
+                    ),
+                ),
+            ),
+        ),
+    )
+    spawn_failed = replace(
+        missing_start,
+        checks=(
+            replace(
+                missing_start.checks[0],
+                processes=(
+                    replace(
+                        primary,
+                        outcome="spawn_failed",
+                        exit_code=None,
+                        error_message="could not spawn uv",
+                    ),
+                ),
+                error=CheckErrorV2("spawn_failed", "could not spawn uv", None),
+            ),
+        ),
+    )
+    spawn_cleanup_failed = replace(
+        spawn_failed,
+        checks=(
+            replace(
+                spawn_failed.checks[0],
+                error=CheckErrorV2(
+                    "cleanup_failed",
+                    "spawn and later workspace cleanup both failed",
+                    None,
+                ),
+            ),
+        ),
+    )
+    cleanup_failed = replace(
+        passed,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                check,
+                status="error",
+                error=CheckErrorV2(
+                    "cleanup_failed",
+                    "could not remove launcher evidence",
+                    None,
+                ),
+            ),
+        ),
+    )
+    workspace_setup_failed = replace(
+        passed,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                check,
+                status="error",
+                execution_environment=None,
+                analysis_python_authority=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    "cleanup_failed",
+                    "could not create the isolated Check workspace",
+                    None,
+                ),
+            ),
+        ),
+    )
+    for report in (
+        passed,
+        failed,
+        execution_error,
+        missing_start,
+        signaled,
+        spawn_failed,
+        spawn_cleanup_failed,
+        cleanup_failed,
+        workspace_setup_failed,
+    ):
+        validate_report_v2(report)
+
+
+def test_schema_v2_rejects_ordinary_check_single_contradictions() -> None:
+    passed = valid_run_report()
+    check = passed.checks[0]
+    primary = check.processes[0]
+    malformed = (
+        replace(
+            passed,
+            overall_status="failed",
+            checks=(replace(check, status="failed", processes=(replace(primary, exit_code=2),)),),
+        ),
+        replace(
+            passed,
+            overall_status="error",
+            complete=False,
+            checks=(
+                replace(
+                    check,
+                    status="error",
+                    execution_environment=None,
+                    analysis_python_authority=None,
+                    start_evidence=None,
+                    processes=(replace(primary, exit_code=2),),
+                    error=CheckErrorV2(
+                        "check_execution_failed",
+                        "ruff failed without trusted start evidence.",
+                        None,
+                    ),
+                ),
+            ),
+        ),
+        replace(
+            passed,
+            overall_status="error",
+            complete=False,
+            checks=(
+                replace(
+                    check,
+                    status="error",
+                    analysis_python_authority=None,
+                    processes=(replace(primary, exit_code=1),),
+                    error=CheckErrorV2("check_execution_failed", "ruff failed", None),
+                ),
+            ),
+        ),
+        replace(
+            passed,
+            overall_status="error",
+            complete=False,
+            checks=(
+                replace(
+                    check,
+                    status="error",
+                    execution_environment=None,
+                    analysis_python_authority=None,
+                    start_evidence=None,
+                    processes=(),
+                    error=CheckErrorV2(
+                        "check_execution_failed",
+                        "no primary process exists",
+                        None,
+                    ),
+                ),
+            ),
+        ),
+    )
+    for report in malformed:
+        with pytest.raises(ReportingError):
+            validate_report_v2(report)
+
+
+def test_schema_v2_accepts_exact_pytest_coverage_producer_families() -> None:
+    reports = (
+        pytest_run_report(),
+        pytest_run_report(exit_code=5),
+        pytest_run_report(coverage="available"),
+        pytest_run_report(coverage="missing"),
+        pytest_run_report(coverage="helper_failure"),
+        pytest_run_report(exit_code=2, coverage="primary_failure"),
+        pytest_run_report(cleanup_failure=True),
+        pytest_workspace_failure_report(),
+    )
+    for report in reports:
+        validate_report_v2(report)
+
+
+def test_schema_v2_rejects_pytest_coverage_single_contradictions() -> None:
+    instrumented = pytest_run_report(coverage="available")
+    check = instrumented.checks[0]
+    start = cast(CheckStartEvidence, check.start_evidence)
+    pytest_result = cast(PytestResult, instrumented.pytest)
+    coverage_result = cast(CoverageResult, instrumented.coverage)
+    coverage_dependency = instrumented.repository_environment.dependencies[1]
+
+    missing_coverage = pytest_run_report(coverage="missing")
+    missing_check = missing_coverage.checks[0]
+    missing_start = cast(CheckStartEvidence, missing_check.start_evidence)
+
+    helper_failure = pytest_run_report(coverage="helper_failure")
+    helper_check = helper_failure.checks[0]
+
+    primary_failure = pytest_run_report(exit_code=2, coverage="primary_failure")
+    primary_check = primary_failure.checks[0]
+
+    workspace_failure = pytest_workspace_failure_report()
+    workspace_pytest = cast(PytestResult, workspace_failure.pytest)
+
+    exit_five = pytest_run_report(exit_code=5)
+    exit_five_check = exit_five.checks[0]
+    exit_five_result = cast(PytestResult, exit_five.pytest)
+
+    malformed = (
+        replace(instrumented, checks=(replace(check, start_evidence=replace(start, module="pytest")),)),
+        replace(
+            instrumented,
+            checks=(
+                replace(
+                    check,
+                    processes=(
+                        replace(
+                            check.processes[0],
+                            argv=tuple(
+                                "pytest" if argument == "coverage" else argument
+                                for argument in check.processes[0].argv
+                            ),
+                        ),
+                        check.processes[1],
+                    ),
+                ),
+            ),
+        ),
+        replace(
+            instrumented,
+            checks=(replace(check, status="failed"),),
+            pytest=replace(pytest_result, status="failed"),
+            overall_status="failed",
+        ),
+        replace(instrumented, pytest=replace(pytest_result, pytest_version="8.4.1")),
+        replace(instrumented, coverage=replace(coverage_result, coverage_version="7.15.1")),
+        replace(
+            instrumented,
+            coverage=replace(coverage_result, status="passed", gate_eligible=True),
+        ),
+        replace(
+            instrumented,
+            repository_environment=replace(
+                instrumented.repository_environment,
+                dependencies=(
+                    instrumented.repository_environment.dependencies[0],
+                    replace(coverage_dependency, version="7.15.1"),
+                ),
+            ),
+        ),
+        replace(instrumented, checks=(replace(check, processes=(check.processes[0],)),)),
+        replace(
+            instrumented,
+            checks=(
+                replace(
+                    check,
+                    processes=(
+                        check.processes[0],
+                        replace(check.processes[1], exit_code=2),
+                    ),
+                ),
+            ),
+        ),
+        replace(exit_five, checks=(replace(exit_five_check, status="passed"),)),
+        replace(exit_five, pytest=replace(exit_five_result, exit_code=1)),
+        replace(
+            missing_coverage,
+            checks=(
+                replace(
+                    missing_check,
+                    start_evidence=replace(missing_start, module="coverage"),
+                ),
+            ),
+        ),
+        replace(
+            helper_failure,
+            checks=(
+                replace(
+                    helper_check,
+                    processes=(
+                        helper_check.processes[0],
+                        replace(helper_check.processes[1], exit_code=0),
+                    ),
+                ),
+            ),
+        ),
+        replace(
+            primary_failure,
+            checks=(
+                replace(
+                    primary_check,
+                    processes=(*primary_check.processes, process_result("coverage_json")),
+                ),
+            ),
+        ),
+        replace(
+            workspace_failure,
+            pytest=replace(
+                workspace_pytest,
+                error=PytestError("preflight_invalid", "wrong setup failure"),
+            ),
+        ),
+    )
+    for report in malformed:
+        with pytest.raises(ReportingError):
+            validate_report_v2(report)
 
 
 def test_schema_v2_rejects_repository_attribution_without_start() -> None:
@@ -1476,6 +2391,70 @@ def dependency_failure_report(status: str) -> RunReportV2:
     )
 
 
+def pytest_dependency_failure_report(status: str) -> RunReportV2:
+    report = pytest_run_report()
+    dependency = report.repository_environment.dependencies[0]
+    check_code = {
+        "missing": "check_dependency_missing",
+        "incompatible": "check_dependency_incompatible",
+        "shadowed": "check_dependency_shadowed",
+        "unusable": "check_dependency_unusable",
+        "unobserved": "check_dependency_unusable",
+    }[status]
+    nested_code = {
+        "missing": "module_unavailable",
+        "incompatible": "unsupported_version",
+        "shadowed": "preflight_invalid",
+        "unusable": "preflight_invalid",
+        "unobserved": "preflight_invalid",
+    }[status]
+    version = "7.4.0" if status == "incompatible" else "8.4.2" if status == "shadowed" else None
+    origin = (
+        "/outside/repo/site-packages/pytest/__init__.py"
+        if status == "shadowed"
+        else dependency.origin
+        if status == "incompatible"
+        else None
+    )
+    error = CheckErrorV2(cast(Any, check_code), f"pytest is {status}", "Repair pytest.")
+    failed_dependency = replace(
+        dependency,
+        status=cast(Any, status),
+        version=version,
+        origin=origin,
+        error=error,
+    )
+    failed_check = replace(
+        report.checks[0],
+        status="error",
+        execution_environment=None,
+        start_evidence=None,
+        processes=(),
+        error=error,
+    )
+    nested = PytestResult(
+        status="error",
+        complete=False,
+        scope="partial",
+        scope_reasons=("incomplete_session",),
+        pytest_version=version if status == "incompatible" else None,
+        exit_code=None,
+        evidence=None,
+        error=PytestError(cast(Any, nested_code), f"pytest is {status}"),
+    )
+    return replace(
+        report,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            report.repository_environment,
+            dependencies=(failed_dependency,),
+        ),
+        checks=(failed_check,),
+        pytest=nested,
+    )
+
+
 def test_schema_v2_rejects_dependency_status_evidence_mutations() -> None:
     valid = valid_run_report()
     available = valid.repository_environment.dependencies[0]
@@ -1519,6 +2498,57 @@ def test_schema_v2_rejects_dependency_status_evidence_mutations() -> None:
                         ),
                     )
                 )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ("missing", "incompatible", "shadowed", "unusable", "unobserved"),
+)
+def test_schema_v2_correlates_pytest_dependency_failure_evidence(status: str) -> None:
+    report = pytest_dependency_failure_report(status)
+    validate_report_v2(report)
+    result = cast(PytestResult, report.pytest)
+    check = report.checks[0]
+    wrong_nested_code = (
+        "preflight_invalid"
+        if result.error is not None and result.error.code != "preflight_invalid"
+        else "module_unavailable"
+    )
+    mutations = (
+        replace(
+            report,
+            pytest=replace(
+                result,
+                error=PytestError(cast(Any, wrong_nested_code), "wrong dependency state"),
+            ),
+        ),
+        replace(
+            report,
+            pytest=replace(
+                result,
+                pytest_version=None if result.pytest_version is not None else "8.4.2",
+            ),
+        ),
+        replace(
+            report,
+            checks=(
+                replace(
+                    check,
+                    error=CheckErrorV2(
+                        "check_dependency_missing"
+                        if check.error is not None
+                        and check.error.code == "check_dependency_unusable"
+                        else "check_dependency_unusable",
+                        "wrong dependency state",
+                        None,
+                    ),
+                ),
+            ),
+        ),
+    )
+    for malformed in mutations:
+        with pytest.raises(ReportingError):
+            validate_report_v2(malformed)
 
 
 def test_schema_v2_rejects_pytest_and_coverage_selection_nullability_mutations() -> None:
@@ -1580,5 +2610,37 @@ def test_schema_v2_rejects_complete_overall_status_and_error_relation_mutations(
         ),
     )
     for malformed in malformed_error_reports:
+        with pytest.raises(ReportingError):
+            validate_report_v2(malformed)
+
+
+def test_schema_v2_requires_exact_evidence_derived_advisories() -> None:
+    report = valid_run_report()
+    check = report.checks[0]
+    process = check.processes[0]
+    truncated = replace(
+        process,
+        stdout=CapturedText(True, "tail", True, 1),
+    )
+    expected = Advisory(
+        code="output_truncated",
+        message=(
+            "ruff process 1 (primary) stdout omitted 1 byte(s); "
+            "only the final 65536 bytes are included."
+        ),
+        hint=None,
+    )
+    projected = replace(
+        report,
+        checks=(replace(check, processes=(truncated,)),),
+        advisories=(expected,),
+    )
+    validate_report_v2(projected)
+
+    for malformed in (
+        replace(projected, advisories=()),
+        replace(report, advisories=(expected,)),
+        replace(projected, advisories=(replace(expected, message="invented"),)),
+    ):
         with pytest.raises(ReportingError):
             validate_report_v2(malformed)

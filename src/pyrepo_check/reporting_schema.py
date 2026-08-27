@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
-from typing import Literal
+from typing import Literal, cast
 
 from pyrepo_check.coverage_evidence import CoverageResult
 from pyrepo_check.planning import CheckName, PlannedTestScope, PlanningErrorCode, RunMode
@@ -345,14 +346,14 @@ AgentReportV2 = PlanningErrorReportV2 | RunReportV2
 def validate_report_structure_v2(report: AgentReportV2) -> None:
     """Validate schema-v2 model structure without execution dependencies."""
     try:
-        if not isinstance(report, (PlanningErrorReportV2, RunReportV2)):
+        if type(report) not in {PlanningErrorReportV2, RunReportV2}:
             _invalid("unsupported producer model")
         if type(report.schema_version) is not int or report.schema_version != 2:
             _invalid("schema_version must be 2")
-        if isinstance(report, PlanningErrorReportV2):
+        if type(report) is PlanningErrorReportV2:
             _validate_planning_report(report)
             return
-        _validate_run_report(report)
+        _validate_run_report(cast(RunReportV2, report))
     except (AttributeError, TypeError) as error:
         _invalid(f"malformed report model: {error}")
 
@@ -366,10 +367,10 @@ def _validate_planning_report(report: PlanningErrorReportV2) -> None:
         _invalid("planning report complete must be false")
     if report.repository_environment is not None:
         _invalid("planning report repository_environment must be null")
-    if not isinstance(report.tool_environment, ToolEnvironmentEvidence):
+    if type(report.tool_environment) is not ToolEnvironmentEvidence:
         _invalid("tool_environment must be ToolEnvironmentEvidence")
     _validate_tool_environment(report.tool_environment)
-    if not isinstance(report.error, PlanningErrorV2):
+    if type(report.error) is not PlanningErrorV2:
         _invalid("planning report error must be PlanningErrorV2")
     _validate_planning_error(report.error)
 
@@ -377,18 +378,17 @@ def _validate_planning_report(report: PlanningErrorReportV2) -> None:
 def _validate_run_report(report: RunReportV2) -> None:
     if report.kind != "run":
         _invalid("run report kind must be run")
-    if not isinstance(report.project_root, str) or not Path(report.project_root).is_absolute():
-        _invalid("project_root must be an absolute string")
+    _validate_absolute_normal_path(report.project_root, "project_root")
     if report.mode not in _RUN_MODES:
         _invalid("unknown run mode")
     if report.overall_status not in _STATUSES:
         _invalid("unknown overall status")
     if type(report.complete) is not bool:
         _invalid("run complete must be boolean")
-    if not isinstance(report.tool_environment, ToolEnvironmentEvidence):
+    if type(report.tool_environment) is not ToolEnvironmentEvidence:
         _invalid("tool_environment must be ToolEnvironmentEvidence")
     _validate_tool_environment(report.tool_environment)
-    if not isinstance(report.repository_environment, RepositoryEnvironmentEvidence):
+    if type(report.repository_environment) is not RepositoryEnvironmentEvidence:
         _invalid("repository_environment must be RepositoryEnvironmentEvidence")
     _validate_repository_environment(report.repository_environment)
     _validate_selection(report.selection)
@@ -396,9 +396,9 @@ def _validate_run_report(report: RunReportV2) -> None:
         _invalid("checks must be a tuple")
     for check in report.checks:
         _validate_check(check)
-    if report.pytest is not None and not isinstance(report.pytest, PytestResult):
+    if report.pytest is not None and type(report.pytest) is not PytestResult:
         _invalid("pytest must be null or PytestResult")
-    if report.coverage is not None and not isinstance(report.coverage, CoverageResult):
+    if report.coverage is not None and type(report.coverage) is not CoverageResult:
         _invalid("coverage must be null or CoverageResult")
     if not isinstance(report.advisories, tuple):
         _invalid("advisories must be a tuple")
@@ -415,7 +415,7 @@ def _validate_tool_environment(environment: ToolEnvironmentEvidence) -> None:
     if not isinstance(environment.pyrepo_check_version, str):
         _invalid("pyrepo_check_version must be a string")
     python = environment.python
-    if not isinstance(python, PythonEvidence):
+    if type(python) is not PythonEvidence:
         _invalid("tool environment python must be PythonEvidence")
     _validate_python(python)
 
@@ -429,8 +429,7 @@ def _validate_python(python: PythonEvidence) -> None:
         or any(type(part) is not int or part < 0 for part in python.version)
     ):
         _invalid("Python version must be three non-negative integers")
-    if not isinstance(python.executable, str):
-        _invalid("Python executable must be a string")
+    _validate_absolute_normal_path(python.executable, "Python executable")
 
 
 def _validate_planning_error(error: PlanningErrorV2) -> None:
@@ -444,10 +443,10 @@ def _validate_repository_environment(environment: RepositoryEnvironmentEvidence)
         _invalid("repository environment manager must be uv")
     _validate_optional_string(environment.manager_version, "manager_version")
     _validate_optional_string(environment.path, "repository environment path")
-    if environment.path is not None and not Path(environment.path).is_absolute():
-        _invalid("repository environment path must be absolute")
+    if environment.path is not None:
+        _validate_absolute_normal_path(environment.path, "repository environment path")
     selection = environment.python_selection
-    if not isinstance(selection, RepositoryPythonSelectionEvidence):
+    if type(selection) is not RepositoryPythonSelectionEvidence:
         _invalid("python_selection must be RepositoryPythonSelectionEvidence")
     if selection.kind not in {"default", "explicit"}:
         _invalid("unknown repository Python selection kind")
@@ -457,13 +456,12 @@ def _validate_repository_environment(environment: RepositoryEnvironmentEvidence)
     elif not isinstance(selection.request, str):
         _invalid("explicit repository Python selection requires a string request")
     if environment.python is not None:
-        if not isinstance(environment.python, PythonEvidence):
+        if type(environment.python) is not PythonEvidence:
             _invalid("repository Python must be null or PythonEvidence")
         _validate_python(environment.python)
-    if not isinstance(environment.lock, LockEvidence):
+    if type(environment.lock) is not LockEvidence:
         _invalid("lock must be LockEvidence")
-    if not isinstance(environment.lock.path, str):
-        _invalid("lock path must be a string")
+    _validate_absolute_normal_path(environment.lock.path, "lock path")
     if environment.lock.status not in {"current", "missing", "unverified"}:
         _invalid("unknown lock status")
     if environment.dependency_selection != "default":
@@ -479,7 +477,7 @@ def _validate_repository_environment(environment: RepositoryEnvironmentEvidence)
     for process in environment.processes:
         _validate_process(process)
     if environment.error is not None:
-        if not isinstance(environment.error, EnvironmentError):
+        if type(environment.error) is not EnvironmentError:
             _invalid("repository environment error must be null or EnvironmentError")
         if environment.error.code not in _ENVIRONMENT_ERROR_CODES:
             _invalid("unknown environment error code")
@@ -491,7 +489,7 @@ def _validate_repository_environment(environment: RepositoryEnvironmentEvidence)
 
 
 def _validate_dependency(dependency: DependencyEvidence) -> None:
-    if not isinstance(dependency, DependencyEvidence):
+    if type(dependency) is not DependencyEvidence:
         _invalid("dependencies must contain DependencyEvidence values")
     if dependency.name not in _DEPENDENCY_NAMES:
         _invalid("unknown dependency name")
@@ -504,7 +502,7 @@ def _validate_dependency(dependency: DependencyEvidence) -> None:
     _validate_optional_string(dependency.version, "dependency version")
     _validate_optional_string(dependency.origin, "dependency origin")
     if dependency.process is not None:
-        if not isinstance(dependency.process, ProcessResult):
+        if type(dependency.process) is not ProcessResult:
             _invalid("dependency process must be null or ProcessResult")
         _validate_process(dependency.process)
     if dependency.error is not None:
@@ -512,7 +510,7 @@ def _validate_dependency(dependency: DependencyEvidence) -> None:
 
 
 def _validate_selection(selection: Selection) -> None:
-    if not isinstance(selection, Selection):
+    if type(selection) is not Selection:
         _invalid("selection must be Selection")
     if not isinstance(selection.checks, tuple) or any(
         name not in _CHECK_NAMES for name in selection.checks
@@ -566,7 +564,7 @@ def _validate_selection(selection: Selection) -> None:
 
 
 def _validate_check(check: CheckResultV2) -> None:
-    if not isinstance(check, CheckResultV2):
+    if type(check) is not CheckResultV2:
         _invalid("checks must contain CheckResultV2 values")
     if check.name not in _CHECK_NAMES:
         _invalid("unknown check name")
@@ -576,7 +574,7 @@ def _validate_check(check: CheckResultV2) -> None:
         _invalid("unknown execution environment")
     if check.analysis_python_authority is not None:
         authority = check.analysis_python_authority
-        if not isinstance(authority, AnalysisPythonAuthorityEvidence):
+        if type(authority) is not AnalysisPythonAuthorityEvidence:
             _invalid("analysis authority must be null or AnalysisPythonAuthorityEvidence")
         if authority.authority != "repository_tool" or authority.pyrepo_check_override is not None:
             _invalid("invalid analysis Python authority")
@@ -591,7 +589,7 @@ def _validate_check(check: CheckResultV2) -> None:
 
 
 def _validate_start_evidence(evidence: CheckStartEvidence) -> None:
-    if not isinstance(evidence, CheckStartEvidence):
+    if type(evidence) is not CheckStartEvidence:
         _invalid("start evidence must be null or CheckStartEvidence")
     if type(evidence.schema_version) is not int or evidence.schema_version != 1:
         _invalid("start evidence schema_version must be 1")
@@ -603,13 +601,13 @@ def _validate_start_evidence(evidence: CheckStartEvidence) -> None:
         evidence.arguments_sha256
     ) is None:
         _invalid("start evidence digest must be 64 lowercase hexadecimal characters")
-    if not isinstance(evidence.python, PythonEvidence):
+    if type(evidence.python) is not PythonEvidence:
         _invalid("start evidence Python must be PythonEvidence")
     _validate_python(evidence.python)
 
 
 def _validate_process(process: ProcessResult) -> None:
-    if not isinstance(process, ProcessResult):
+    if type(process) is not ProcessResult:
         _invalid("process must be ProcessResult")
     if process.role not in _PROCESS_ROLES:
         _invalid("unknown process role")
@@ -617,8 +615,7 @@ def _validate_process(process: ProcessResult) -> None:
         not isinstance(argument, str) for argument in process.argv
     ):
         _invalid("process argv must be a tuple of strings")
-    if not isinstance(process.cwd, str) or not Path(process.cwd).is_absolute():
-        _invalid("process cwd must be an absolute string")
+    _validate_absolute_normal_path(process.cwd, "process cwd")
     if process.outcome not in _PROCESS_OUTCOMES:
         _invalid("unknown process outcome")
     if type(process.duration_ms) is not int or process.duration_ms < 0:
@@ -645,7 +642,7 @@ def _validate_process(process: ProcessResult) -> None:
 
 
 def _validate_captured_text(captured: CapturedText) -> None:
-    if not isinstance(captured, CapturedText):
+    if type(captured) is not CapturedText:
         _invalid("captured stream must be CapturedText")
     if type(captured.captured) is not bool or type(captured.truncated) is not bool:
         _invalid("captured stream flags must be boolean")
@@ -662,7 +659,7 @@ def _validate_captured_text(captured: CapturedText) -> None:
 
 
 def _validate_check_error(error: CheckErrorV2) -> None:
-    if not isinstance(error, CheckErrorV2):
+    if type(error) is not CheckErrorV2:
         _invalid("check error must be CheckErrorV2")
     if error.code not in _CHECK_ERROR_CODES_V2:
         _invalid("unknown check error code")
@@ -670,7 +667,7 @@ def _validate_check_error(error: CheckErrorV2) -> None:
 
 
 def _validate_advisory(advisory: Advisory) -> None:
-    if not isinstance(advisory, Advisory):
+    if type(advisory) is not Advisory:
         _invalid("advisories must contain Advisory values")
     if advisory.code not in _ADVISORY_CODES:
         _invalid("unknown advisory code")
@@ -687,6 +684,17 @@ def _validate_message_hint(message: object, hint: object, field: str) -> None:
 def _validate_optional_string(value: object, field: str) -> None:
     if value is not None and not isinstance(value, str):
         _invalid(f"{field} must be null or a string")
+
+
+def _validate_absolute_normal_path(value: object, field: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or not Path(value).is_absolute()
+        or os.path.abspath(os.path.normpath(value)) != value
+    ):
+        _invalid(f"{field} must be an absolute lexically normalized path string")
 
 
 def _invalid(message: str) -> None:
