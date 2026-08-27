@@ -4,6 +4,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
+import re
 
 from pyrepo_check.config import CoverageConfig, ProjectConfig
 
@@ -28,8 +29,13 @@ PlanningErrorCode = Literal[
     "unknown_test_shortcut",
     "unknown_target",
     "coverage_configuration_required",
+    "unsafe_unlocked_execution",
+    "uv_project_required",
     "internal_planning_error",
 ]
+
+
+_REPOSITORY_PYTHON_PATTERN = re.compile(r"^3\.(?:10|11|12|13)(?:\.(?:0|[1-9][0-9]*))?$")
 
 
 class PlanningFailure(ValueError):
@@ -43,7 +49,6 @@ class PlanningFailure(ValueError):
         super().__init__(message)
         self.code = code
         self.hint = hint
-
 
 
 CHECK_ORDER: tuple[CheckName, ...] = (
@@ -71,16 +76,31 @@ class RunRequest:
     output_format: OutputFormat = "terminal"
     test_shortcut: str | None = None
     coverage_requested: bool = False
+    repository_python: str | None = None
 
 
 @dataclass(frozen=True)
 class PlanningFacts:
     existing_positionals: frozenset[str]
+    pyproject_exists: bool
+
+
+@dataclass(frozen=True)
+class DefaultRepositoryPython:
+    kind: Literal["default"] = "default"
+
+
+@dataclass(frozen=True)
+class ExplicitRepositoryPython:
+    request: str
+    kind: Literal["explicit"] = "explicit"
+
+
+RepositoryPythonSelection = DefaultRepositoryPython | ExplicitRepositoryPython
 
 
 @dataclass(frozen=True)
 class CoverageExecutionPlan:
-    consumer_python: tuple[str, ...]
     config_path: Path
     fail_under: int | float | None
     artifact_protocol: Literal["coverage_v1"] = "coverage_v1"
@@ -88,25 +108,25 @@ class CoverageExecutionPlan:
 
 @dataclass(frozen=True)
 class PytestExecutionPlan:
-    consumer_python: tuple[str, ...]
     pytest_args: tuple[str, ...]
     artifact_protocol: Literal["pytest_v1"] = "pytest_v1"
     coverage: CoverageExecutionPlan | None = None
 
 
 @dataclass(frozen=True)
-class PlannedCheck:
+class CheckInvocation:
     name: CheckName
-    command: tuple[str, ...]
-    cwd: Path
+    arguments: tuple[str, ...]
     pytest: PytestExecutionPlan | None = None
 
 
 @dataclass(frozen=True)
 class RunPlan:
+    root: Path
+    repository_python: RepositoryPythonSelection
     mode: RunMode
     targets: tuple[str, ...]
-    checks: tuple[PlannedCheck, ...]
+    checks: tuple[CheckInvocation, ...]
     output_format: OutputFormat = "terminal"
     test_shortcut: str | None = None
     pytest_args: tuple[str, ...] | None = None
@@ -119,6 +139,19 @@ def plan_run(
     config: ProjectConfig,
     facts: PlanningFacts,
 ) -> RunPlan:
+    if request.no_frozen:
+        raise PlanningFailure(
+            "unsafe_unlocked_execution",
+            "--no-frozen is incompatible with repository-safe execution.",
+            hint="Update uv.lock explicitly, then rerun without --no-frozen.",
+        )
+    if not facts.pyproject_exists:
+        raise PlanningFailure(
+            "uv_project_required",
+            "Repository root must contain pyproject.toml.",
+            hint="Run pyrepo-check from a uv project root or pass --root.",
+        )
+    repository_python = _select_repository_python(request.repository_python)
     requested, targets = _split_positionals(request.positionals)
     shortcut_args = _resolve_test_shortcut(
         request,
@@ -127,9 +160,7 @@ def plan_run(
         targets=targets,
     )
     if targets and not requested and not request.all_selected:
-        missing = tuple(
-            target for target in targets if target not in facts.existing_positionals
-        )
+        missing = tuple(target for target in targets if target not in facts.existing_positionals)
         if missing:
             names = ", ".join(sorted(missing))
             code: PlanningErrorCode = (
@@ -164,9 +195,7 @@ def plan_run(
             "--coverage requires pytest to be selected.",
             hint="Use: pyrepo-check pytest --coverage",
         )
-    coverage_enabled = request.coverage_requested or (
-        strict_all and config.coverage is not None
-    )
+    coverage_enabled = request.coverage_requested or (strict_all and config.coverage is not None)
     if request.coverage_requested and config.coverage is None:
         raise PlanningFailure(
             "coverage_configuration_required",
@@ -176,9 +205,7 @@ def plan_run(
     elif strict_all and config.coverage is None:
         planned_coverage_scope = "unavailable"
     elif coverage_enabled:
-        planned_coverage_scope = (
-            "partial" if targets or shortcut_args is not None else "complete"
-        )
+        planned_coverage_scope = "partial" if targets or shortcut_args is not None else "complete"
     else:
         planned_coverage_scope = "not_requested"
     if coverage_enabled and config.coverage is not None:
@@ -196,6 +223,8 @@ def plan_run(
         planned_pytest_args = ()
         planned_test_scope = "complete"
     return RunPlan(
+        root=config.root,
+        repository_python=repository_python,
         mode="strict_aggregate" if strict_all else "focused",
         targets=targets,
         checks=selected,
@@ -208,8 +237,8 @@ def plan_run(
 
 
 def _attach_coverage_plan(
-    selected: tuple[PlannedCheck, ...], coverage: CoverageConfig
-) -> tuple[PlannedCheck, ...]:
+    selected: tuple[CheckInvocation, ...], coverage: CoverageConfig
+) -> tuple[CheckInvocation, ...]:
     return tuple(
         check
         if check.pytest is None
@@ -218,7 +247,6 @@ def _attach_coverage_plan(
             pytest=replace(
                 check.pytest,
                 coverage=CoverageExecutionPlan(
-                    consumer_python=check.pytest.consumer_python,
                     config_path=coverage.config_path,
                     fail_under=coverage.fail_under,
                 ),
@@ -267,9 +295,7 @@ def _split_positionals(
     positionals: Sequence[str],
 ) -> tuple[tuple[CheckName, ...], tuple[str, ...]]:
     check_names = set(SELECTABLE_CHECK_ORDER)
-    requested = tuple(
-        cast(CheckName, token) for token in positionals if token in check_names
-    )
+    requested = tuple(cast(CheckName, token) for token in positionals if token in check_names)
     targets = tuple(token for token in positionals if token not in check_names)
     return requested, targets
 
@@ -280,32 +306,24 @@ def build_checks(
     targets: Sequence[str] = (),
     strict_all: bool = False,
     pytest_args: Sequence[str] | None = None,
-) -> dict[str, PlannedCheck]:
-    consumer_python = _uv_consumer_python(config)
+) -> dict[str, CheckInvocation]:
     explicit_targets = tuple(targets)
-    effective_pytest_args = (
-        explicit_targets if pytest_args is None else tuple(pytest_args)
-    )
+    effective_pytest_args = explicit_targets if pytest_args is None else tuple(pytest_args)
     strict_targets = (".",) if strict_all and not explicit_targets else ()
     ruff_targets = explicit_targets or strict_targets or config.ruff_targets
     bandit_targets = explicit_targets or strict_targets or config.bandit_targets
     pytest = PytestExecutionPlan(
-        consumer_python=consumer_python,
         pytest_args=effective_pytest_args,
     )
 
     return {
-        "ruff": PlannedCheck(
+        "ruff": CheckInvocation(
             name="ruff",
-            command=(*consumer_python, "-m", "ruff", "check", *ruff_targets),
-            cwd=config.root,
+            arguments=("check", *ruff_targets),
         ),
-        "annotations": PlannedCheck(
+        "annotations": CheckInvocation(
             name="annotations",
-            command=(
-                *consumer_python,
-                "-m",
-                "ruff",
+            arguments=(
                 "check",
                 *ruff_targets,
                 "--select",
@@ -313,14 +331,10 @@ def build_checks(
                 "--output-format",
                 "concise",
             ),
-            cwd=config.root,
         ),
-        "annotations-fix": PlannedCheck(
+        "annotations-fix": CheckInvocation(
             name="annotations-fix",
-            command=(
-                *consumer_python,
-                "-m",
-                "ruff",
+            arguments=(
                 "check",
                 *ruff_targets,
                 "--select",
@@ -328,19 +342,14 @@ def build_checks(
                 "--fix",
                 "--unsafe-fixes",
             ),
-            cwd=config.root,
         ),
-        "ty": PlannedCheck(
+        "ty": CheckInvocation(
             name="ty",
-            command=(*consumer_python, "-m", "ty", "check", *explicit_targets),
-            cwd=config.root,
+            arguments=("check", *explicit_targets),
         ),
-        "bandit": PlannedCheck(
+        "bandit": CheckInvocation(
             name="bandit",
-            command=(
-                *consumer_python,
-                "-m",
-                "bandit",
+            arguments=(
                 "-c",
                 "pyproject.toml",
                 *_bandit_target_args(
@@ -348,23 +357,21 @@ def build_checks(
                     recursive=not explicit_targets,
                 ),
             ),
-            cwd=config.root,
         ),
-        "pytest": PlannedCheck(
+        "pytest": CheckInvocation(
             name="pytest",
-            command=(*pytest.consumer_python, "-m", "pytest", *pytest.pytest_args),
-            cwd=config.root,
+            arguments=pytest.pytest_args,
             pytest=pytest,
         ),
     }
 
 
 def select_checks(
-    checks: Mapping[str, PlannedCheck],
+    checks: Mapping[str, CheckInvocation],
     *,
     requested: Sequence[str],
     all_selected: bool,
-) -> tuple[PlannedCheck, ...]:
+) -> tuple[CheckInvocation, ...]:
     selected_names = select_check_names(
         checks.keys(),
         requested=requested,
@@ -386,8 +393,7 @@ def select_check_names(
     if unknown:
         names = ", ".join(unknown)
         code: PlanningErrorCode = (
-            "unknown_target" if all(_is_path_like(token) for token in unknown)
-            else "unknown_check"
+            "unknown_target" if all(_is_path_like(token) for token in unknown) else "unknown_check"
         )
         hint = (
             "Check the target path or select a check name."
@@ -404,10 +410,16 @@ def _is_path_like(token: str) -> bool:
     return any(marker in token for marker in ("/", "\\", "::")) or "." in Path(token).name
 
 
-def _uv_consumer_python(config: ProjectConfig) -> tuple[str, ...]:
-    if config.frozen:
-        return ("uv", "run", "--frozen", "python")
-    return ("uv", "run", "python")
+def _select_repository_python(request: str | None) -> RepositoryPythonSelection:
+    if request is None:
+        return DefaultRepositoryPython()
+    if _REPOSITORY_PYTHON_PATTERN.fullmatch(request) is None:
+        raise PlanningFailure(
+            "invalid_arguments",
+            f"Unsupported Repository Python request: {request}",
+            hint="Use 3.10 through 3.13, optionally with an exact patch version.",
+        )
+    return ExplicitRepositoryPython(request)
 
 
 def _bandit_target_args(

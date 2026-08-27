@@ -397,11 +397,7 @@ def _secure_directory_open_flags() -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     non_blocking = getattr(os, "O_NONBLOCK", None)
     directory = getattr(os, "O_DIRECTORY", None)
-    if (
-        type(no_follow) is not int
-        or type(non_blocking) is not int
-        or type(directory) is not int
-    ):
+    if type(no_follow) is not int or type(non_blocking) is not int or type(directory) is not int:
         raise _UnsafePathError("safe no-follow directory opening is unavailable")
     return os.O_RDONLY | no_follow | non_blocking | directory
 
@@ -427,20 +423,20 @@ def coverage_environment(
     return environment
 
 
-def coverage_preflight_command(consumer_python: tuple[str, ...]) -> tuple[str, ...]:
-    return (*consumer_python, "-c", COVERAGE_PREFLIGHT_PROBE)
+def coverage_preflight_command(python_prefix: tuple[str, ...]) -> tuple[str, ...]:
+    return (*python_prefix, "-c", COVERAGE_PREFLIGHT_PROBE)
 
 
 def coverage_primary_command(
     *,
-    consumer_python: tuple[str, ...],
+    python_prefix: tuple[str, ...],
     config_path: Path,
     run_directory: Path,
     plugin_module: str,
     pytest_args: tuple[str, ...],
 ) -> tuple[str, ...]:
     return (
-        *consumer_python,
+        *python_prefix,
         "-m",
         "coverage",
         "run",
@@ -456,14 +452,14 @@ def coverage_primary_command(
 
 def coverage_json_command(
     *,
-    consumer_python: tuple[str, ...],
+    python_prefix: tuple[str, ...],
     config_path: Path,
     data_path: Path,
     output_path: Path,
     force_fail_under_zero: bool,
 ) -> tuple[str, ...]:
     command = (
-        *consumer_python,
+        *python_prefix,
         "-m",
         "coverage",
         "json",

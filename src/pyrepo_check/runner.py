@@ -3,16 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.execution import ProcessRunner, execute_plan
+from pyrepo_check.execution import CHECK_MODULES, ProcessRunner, execute_legacy_commands
 from pyrepo_check.planning import (
     CHECK_ORDER as CHECK_ORDER,
     SELECTABLE_CHECK_ORDER as SELECTABLE_CHECK_ORDER,
-    CheckName,
-    PlannedCheck,
-    RunPlan,
     build_checks as build_planned_checks,
     select_check_names,
 )
@@ -36,7 +32,18 @@ def build_checks(
         strict_all=strict_all,
     )
     return {
-        name: Check(name=check.name, command=check.command)
+        name: Check(
+            name=check.name,
+            command=(
+                "uv",
+                "run",
+                "--locked",
+                "python",
+                "-m",
+                CHECK_MODULES[check.name],
+                *check.arguments,
+            ),
+        )
         for name, check in planned.items()
     }
 
@@ -61,13 +68,8 @@ def run_checks(
     cwd: Path,
     runner: ProcessRunner | None = None,
 ) -> int:
-    prepared = tuple(
-        PlannedCheck(
-            name=cast(CheckName, check.name),
-            command=check.command,
-            cwd=cwd,
-        )
-        for check in checks
+    return execute_legacy_commands(
+        tuple(check.command for check in checks),
+        cwd=cwd,
+        runner=runner,
     )
-    plan = RunPlan(mode="focused", targets=(), checks=prepared)
-    return execute_plan(plan, runner=runner).exit_code

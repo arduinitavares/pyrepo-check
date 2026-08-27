@@ -15,9 +15,9 @@ import pytest
 
 from pyrepo_check.execution import CapturedBytes, ExecutionResult, execute_plan
 from pyrepo_check.planning import (
-    CoverageExecutionPlan,
+    DefaultRepositoryPython,
     OutputFormat,
-    PlannedCheck,
+    CheckInvocation,
     PytestExecutionPlan,
     RunPlan,
 )
@@ -140,10 +140,7 @@ def test_writer_marker_rejects_non_finite_ignored_metadata(
     constant: str,
 ) -> None:
     marker = tmp_path / "pytest-writer-one.json"
-    marker.write_text(
-        '{"schema_version":1,"writer_id":"one","pid":1,'
-        f'"ignored":{constant}}}'
-    )
+    marker.write_text(f'{{"schema_version":1,"writer_id":"one","pid":1,"ignored":{constant}}}')
 
     writer_ids, diagnostic = pytest_execution._snapshot_writer_ids(tmp_path)
 
@@ -322,6 +319,7 @@ def test_missing_platform_capability_fails_before_temp_or_spawn(
 
     observation = execute_pytest(
         pytest_check(tmp_path),
+        plan=pytest_run_plan(tmp_path),
         output_format="json",
         runner=forbid_spawn,
     )
@@ -362,6 +360,7 @@ def test_missing_descriptor_operation_fails_before_temp_or_spawn(
 
     observation = execute_pytest(
         pytest_check(tmp_path),
+        plan=pytest_run_plan(tmp_path),
         output_format="json",
         runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("process must not spawn")
@@ -397,7 +396,9 @@ def test_preflight_rejects_a_normalized_omitted_tail_before_json_parse(
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert calls == 1
     assert observation.processes[0].stdout == CapturedBytes(
@@ -408,41 +409,25 @@ def test_preflight_rejects_a_normalized_omitted_tail_before_json_parse(
     assert observation.pytest.preflight.classification == "preflight_invalid"
 
 
-def pytest_check(tmp_path: Path) -> PlannedCheck:
-    pytest = PytestExecutionPlan(
-        consumer_python=("consumer-python",),
-        pytest_args=("tests",),
-    )
-    return PlannedCheck(
+def pytest_check(tmp_path: Path) -> CheckInvocation:
+    pytest = PytestExecutionPlan(pytest_args=("tests",))
+    return CheckInvocation(
         name="pytest",
-        command=(*pytest.consumer_python, "-m", "pytest", *pytest.pytest_args),
-        cwd=tmp_path,
+        arguments=pytest.pytest_args,
         pytest=pytest,
     )
 
 
-def test_planned_coverage_requires_the_authoritative_run_plan(tmp_path: Path) -> None:
-    plain = pytest_check(tmp_path)
-    if plain.pytest is None:
-        raise AssertionError("pytest plan is unavailable")
-    coverage = CoverageExecutionPlan(
-        consumer_python=plain.pytest.consumer_python,
-        config_path=tmp_path / "pyproject.toml",
-        fail_under=80,
+def pytest_run_plan(tmp_path: Path, check: CheckInvocation | None = None) -> RunPlan:
+    invocation = pytest_check(tmp_path) if check is None else check
+    return RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
+        mode="focused",
+        targets=(),
+        checks=(invocation,),
+        output_format="json",
     )
-    check = PlannedCheck(
-        name=plain.name,
-        command=plain.command,
-        cwd=plain.cwd,
-        pytest=PytestExecutionPlan(
-            consumer_python=plain.pytest.consumer_python,
-            pytest_args=plain.pytest.pytest_args,
-            coverage=coverage,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="requires RunPlan"):
-        execute_pytest(check, output_format="json")
 
 
 def preflight_document(
@@ -505,7 +490,12 @@ def _cleanup_record(run_directory: Path) -> execution_workspace.RunWorkspace:
     [
         (preflight_document(), 0, None, "supported"),
         (preflight_document(python_version=[3, 13, 14]), 0, None, "unsupported_python"),
-        (preflight_document(pytest_available=False, pytest_version=None), 0, None, "module_unavailable"),
+        (
+            preflight_document(pytest_available=False, pytest_version=None),
+            0,
+            None,
+            "module_unavailable",
+        ),
         (preflight_document(pytest_version=[7, 4, 4]), 0, None, "unsupported_version"),
         (preflight_document(pytest_version=[9, 0, 0]), 0, None, "unsupported_version"),
         (preflight_document() + b"\\nextra", 0, None, "preflight_invalid"),
@@ -559,7 +549,9 @@ def test_preflight_classification_stops_before_plugin_on_non_supported_result(
             raise error
         return completed(command, returncode, stdout=stdout, stderr=b"")
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.preflight.classification == classification
@@ -590,7 +582,9 @@ def test_supported_preflight_records_typed_version_data(tmp_path: Path) -> None:
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.preflight.classification == "supported"
@@ -617,7 +611,9 @@ def test_preflight_rejects_non_integer_schema_version(
         assert capture_output
         return completed(command, 0, stdout=preflight_document(schema_version=schema_version))
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.preflight.classification == "preflight_invalid"
@@ -642,14 +638,18 @@ def test_preflight_rejects_oversized_stderr(tmp_path: Path) -> None:
             stderr=b"x" * 65_537,
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.preflight.classification == "preflight_invalid"
     assert len(observation.processes) == 1
 
 
-@pytest.mark.parametrize(("output_format", "primary_capture"), [("json", True), ("terminal", False)])
+@pytest.mark.parametrize(
+    ("output_format", "primary_capture"), [("json", True), ("terminal", False)]
+)
 def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -673,7 +673,7 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del check
         calls.append((command, cwd, capture_output, env))
-        if command[1:3] == ("-m", "pytest"):
+        if "pytest" in command:
             assert env is not None
             plugin_name = command[command.index("-p") + 1]
             run_directory = Path(env["PYREPO_CHECK_PYTEST_JSON"]).parent
@@ -685,14 +685,21 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
 
     check = pytest_check(tmp_path)
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(check,), output_format=output_format),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(check,),
+            output_format=output_format,
+        ),
         runner=runner,
     )
 
     plugin_name = calls[1][0][calls[1][0].index("-p") + 1]
     assert [call[0] for call in calls] == [
-        ("consumer-python", "-c", calls[0][0][-1]),
-        ("consumer-python", "-m", "pytest", "-p", plugin_name, "tests"),
+        ("uv", "run", "--locked", "python", "-c", calls[0][0][-1]),
+        ("uv", "run", "--locked", "python", "-m", "pytest", "-p", plugin_name, "tests"),
     ]
     assert [call[1] for call in calls] == [tmp_path, tmp_path]
     assert [call[2] for call in calls] == [True, primary_capture]
@@ -717,7 +724,7 @@ def test_supported_preflight_launches_isolated_primary_from_planner_metadata(
     ]
     assert result.checks[0].pytest is not None
     assert result.checks[0].pytest.preflight.classification == "supported"
-    expected_banner = "\n==> pytest: consumer-python -m pytest tests\n"
+    expected_banner = "\n==> pytest: uv run --locked python -m pytest tests\n"
     assert capsys.readouterr().out == ("" if output_format == "json" else expected_banner)
 
 
@@ -733,13 +740,17 @@ def test_plugin_module_name_is_fresh_for_each_pytest_execution(tmp_path: Path) -
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output, env
-        if command[1:3] == ("-m", "pytest"):
+        if "pytest" in command:
             plugin_names.append(command[command.index("-p") + 1])
             return completed(command, 0, stdout=b"", stderr=b"")
         return completed(command, 0, stdout=preflight_document(), stderr=b"")
 
-    execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
-    execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
+    execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert len(plugin_names) == 2
     assert plugin_names[0] != plugin_names[1]
@@ -767,7 +778,7 @@ def test_duplicate_simulated_primaries_fail_closed_with_multiple_writers(
             capture_output=capture_output,
             env=env,
         )
-        if command[1:3] == ("-m", "pytest"):
+        if "pytest" in command:
             recording_runner(
                 command,
                 cwd=cwd,
@@ -779,6 +790,7 @@ def test_duplicate_simulated_primaries_fail_closed_with_multiple_writers(
 
     observation = execute_pytest(
         pytest_check(tmp_path),
+        plan=pytest_run_plan(tmp_path),
         output_format="json",
         runner=duplicate_primary_runner,
     )
@@ -813,7 +825,13 @@ def test_preflight_runs_without_primary_when_consumer_is_unsupported(tmp_path: P
         )
 
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(pytest_check(tmp_path),)),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(pytest_check(tmp_path),),
+        ),
         runner=runner,
     )
 
@@ -836,7 +854,7 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             artifact_path = Path(env["PYREPO_CHECK_PYTEST_JSON"])
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
             artifact_path.write_bytes(b'{"raw":true}')
@@ -849,11 +867,13 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.state == "snapshot"
@@ -869,33 +889,21 @@ def test_primary_artifact_and_sorted_writer_snapshot_are_retained_before_cleanup
     [
         ({}, (), None),
         (
-            {
-                "pytest-writer-one.json": (
-                    '{"schema_version":1,"writer_id":"one","pid":1}'
-                )
-            },
+            {"pytest-writer-one.json": ('{"schema_version":1,"writer_id":"one","pid":1}')},
             ("one",),
             None,
         ),
         (
             {
-                "pytest-writer-b.json": (
-                    '{"schema_version":1,"writer_id":"b","pid":2}'
-                ),
-                "pytest-writer-a.json": (
-                    '{"schema_version":1,"writer_id":"a","pid":1}'
-                ),
+                "pytest-writer-b.json": ('{"schema_version":1,"writer_id":"b","pid":2}'),
+                "pytest-writer-a.json": ('{"schema_version":1,"writer_id":"a","pid":1}'),
             },
             ("a", "b"),
             "multiple writer markers",
         ),
         ({"pytest-writer-bad.json": "not-json"}, (), "malformed"),
         (
-            {
-                "pytest-writer-one.json": (
-                    '{"schema_version":1,"writer_id":"other","pid":1}'
-                )
-            },
+            {"pytest-writer-one.json": ('{"schema_version":1,"writer_id":"other","pid":1}')},
             (),
             "ID mismatch",
         ),
@@ -920,7 +928,7 @@ def test_writer_inventory_records_only_regular_valid_markers(
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
             for name, payload in marker_payloads.items():
@@ -928,11 +936,13 @@ def test_writer_inventory_records_only_regular_valid_markers(
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.state == "snapshot"
@@ -987,18 +997,20 @@ def test_writer_inventory_rejects_malformed_marker_shapes(
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
             (writer_directory / "pytest-writer-one.json").write_text(payload)
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.writer_ids == ()
@@ -1036,18 +1048,20 @@ def test_artifact_snapshot_handles_missing_signal_and_unsafe_paths(
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest") and make_artifact:
+        if env is not None and "pytest" in command and make_artifact:
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).symlink_to(outside_artifact)
-        if env is not None and command[1:3] == ("-m", "pytest") and spawn:
+        if env is not None and "pytest" in command and spawn:
             raise FileNotFoundError("consumer-python")
         return completed(
             command,
-            0 if command[1] == "-c" else primary_returncode,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            0 if "-c" in command else primary_returncode,
+            stdout=preflight_document() if "-c" in command else b"",
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.state == state
@@ -1084,16 +1098,18 @@ def test_artifact_read_failure_is_observed_and_cleanup_still_runs(
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
             stderr=b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.state == "read_failed"
@@ -1139,16 +1155,18 @@ def test_artifact_snapshot_reads_open_descriptor_when_path_is_replaced(
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         nonlocal artifact_path
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             artifact_path = Path(env["PYREPO_CHECK_PYTEST_JSON"])
             artifact_path.write_bytes(b"captured-content")
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert open_calls
     assert observation.pytest is not None
@@ -1162,9 +1180,7 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
 ) -> None:
     safe_run_directory(tmp_path, monkeypatch)
     replacement = tmp_path / "replacement"
-    replacement.write_text(
-        '{"schema_version":1,"writer_id":"attacker","pid":999}'
-    )
+    replacement.write_text('{"schema_version":1,"writer_id":"attacker","pid":999}')
     open_calls: list[Path] = []
     original_open = pytest_execution.os.open
     marker_path: Path | None = None
@@ -1176,10 +1192,7 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
         **kwargs: int | None,
     ) -> int:
         descriptor = original_open(path, flags, *args, **kwargs)
-        if (
-            kwargs.get("dir_fd") is not None
-            and os.fsdecode(path) == "pytest-writer-safe.json"
-        ):
+        if kwargs.get("dir_fd") is not None and os.fsdecode(path) == "pytest-writer-safe.json":
             assert marker_path is not None
             target = marker_path
             open_calls.append(target)
@@ -1199,20 +1212,20 @@ def test_writer_snapshot_reads_open_descriptor_when_marker_is_replaced(
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         nonlocal marker_path
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
             writer_directory = Path(env["PYREPO_CHECK_PYTEST_WRITER_DIR"])
             marker_path = writer_directory / "pytest-writer-safe.json"
-            marker_path.write_text(
-                '{"schema_version":1,"writer_id":"safe","pid":1}'
-            )
+            marker_path.write_text('{"schema_version":1,"writer_id":"safe","pid":1}')
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert open_calls
     assert observation.pytest is not None
@@ -1246,24 +1259,28 @@ def test_cleanup_failure_is_observed_without_losing_snapshot(
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(b"artifact")
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
             stderr=b"",
         )
 
     try:
-        observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
     finally:
         shutil.rmtree(run_directory, ignore_errors=True)
 
     assert observation.pytest is not None
     assert observation.pytest.artifact.content == b"artifact"
     assert observation.pytest.cleanup_error == "PermissionError: cleanup denied"
-
 
 
 def test_setup_failure_is_typed_not_started_and_the_created_run_directory_is_removed(
@@ -1283,7 +1300,9 @@ def test_setup_failure_is_typed_not_started_and_the_created_run_directory_is_rem
 
     monkeypatch.setattr(pytest_execution, "_copy_plugin_source", fail_copy)
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json")
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json"
+    )
 
     assert observation.processes == ()
     assert observation.pytest is not None
@@ -1297,9 +1316,7 @@ def test_plugin_preparation_completes_partial_descriptor_writes(
 ) -> None:
     run_directory = tmp_path / "run"
     run_directory.mkdir()
-    verified = execution_workspace.open_verified_workspace(
-        _cleanup_record(run_directory)
-    )
+    verified = execution_workspace.open_verified_workspace(_cleanup_record(run_directory))
     original_write = pytest_execution.os.write
 
     def partial_write(descriptor: int, content: bytes) -> int:
@@ -1313,9 +1330,10 @@ def test_plugin_preparation_completes_partial_descriptor_writes(
                 "_pyrepo_check_pytest_partial_write",
             )
         plugin = run_directory / "_pyrepo_check_pytest_partial_write.py"
-        assert plugin.read_bytes() == Path(pytest_execution.__file__).with_name(
-            "_pytest_report_plugin.py"
-        ).read_bytes()
+        assert (
+            plugin.read_bytes()
+            == Path(pytest_execution.__file__).with_name("_pytest_report_plugin.py").read_bytes()
+        )
         assert stat.S_IMODE(plugin.stat().st_mode) == 0o600
         assert writer_directory.is_dir()
         assert stat.S_IMODE(writer_directory.stat().st_mode) == 0o700
@@ -1340,9 +1358,7 @@ def test_verified_run_descriptors_close_on_all_execution_paths(
         record: execution_workspace.RunWorkspace,
     ) -> execution_workspace.VerifiedRunWorkspace:
         verified = original_open_verified(record)
-        verified_descriptors.update(
-            {verified.parent_descriptor, verified.descriptor}
-        )
+        verified_descriptors.update({verified.parent_descriptor, verified.descriptor})
         return verified
 
     def track_close(descriptor: int) -> None:
@@ -1369,6 +1385,7 @@ def test_verified_run_descriptors_close_on_all_execution_paths(
 
     observation = execute_pytest(
         pytest_check(tmp_path),
+        plan=pytest_run_plan(tmp_path),
         output_format="json",
         runner=lambda command, **_kwargs: completed(
             command,
@@ -1416,13 +1433,12 @@ def test_run_swap_after_create_stops_before_preparation_or_runner(
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
         assert replacement_sentinel.read_text() == "keep"
-        assert tuple(path.name for path in run_directory.iterdir()) == (
-            "replacement-sentinel",
-        )
+        assert tuple(path.name for path in run_directory.iterdir()) == ("replacement-sentinel",)
     finally:
         shutil.rmtree(run_directory, ignore_errors=True)
         shutil.rmtree(displaced, ignore_errors=True)
@@ -1468,13 +1484,12 @@ def test_run_swap_during_preparation_stays_fd_bound_and_post_gate_stops_runner(
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
         assert replacement_sentinel.read_text() == "keep"
-        assert tuple(path.name for path in run_directory.iterdir()) == (
-            "replacement-sentinel",
-        )
+        assert tuple(path.name for path in run_directory.iterdir()) == ("replacement-sentinel",)
         assert any(path.name.startswith("_pyrepo_check_pytest_") for path in displaced.iterdir())
         assert (displaced / "writers").is_dir()
     finally:
@@ -1523,6 +1538,7 @@ def test_run_swap_before_preflight_stops_runner(
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
@@ -1564,6 +1580,7 @@ def test_run_swap_after_supported_preflight_retains_real_process_and_stops_prima
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
@@ -1585,6 +1602,8 @@ def test_run_swap_after_supported_preflight_retains_real_process_and_stops_prima
     assert isinstance(validation, PytestValidationFailure)
     assert validation.code == "preflight_invalid"
     plan = RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
         mode="focused",
         targets=("tests",),
         checks=(observation.planned,),
@@ -1622,6 +1641,7 @@ def test_run_swap_after_unsupported_preflight_still_applies_identity_gate(
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
@@ -1666,6 +1686,7 @@ def test_run_swap_inside_primary_retains_processes_without_snapshotting_replacem
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
@@ -1691,6 +1712,8 @@ def test_run_swap_inside_primary_retains_processes_without_snapshotting_replacem
     assert isinstance(validation, PytestValidationFailure)
     assert validation.code == "artifact_invalid"
     plan = RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
         mode="focused",
         targets=("tests",),
         checks=(observation.planned,),
@@ -1751,6 +1774,7 @@ def test_snapshot_uses_held_run_descriptor_after_run_basename_swap(
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=RecordingRunner(publish_pytest_artifact=True),
         )
@@ -1771,6 +1795,8 @@ def test_snapshot_uses_held_run_descriptor_after_run_basename_swap(
     assert "identity mismatch" in observation.pytest.cleanup_error
 
     plan = RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
         mode="focused",
         targets=("tests",),
         checks=(observation.planned,),
@@ -1810,10 +1836,12 @@ def test_consumer_tmpdir_is_not_used_for_the_run_directory(
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
         )
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json", runner=runner
+    )
 
     assert observation.pytest is not None
     assert observation.pytest.preflight.classification == "supported"
@@ -1830,7 +1858,9 @@ def test_run_directory_creation_failure_is_typed_not_started(
 
     monkeypatch.setattr(execution_workspace.tempfile, "mkdtemp", fail_mkdtemp)
 
-    observation = execute_pytest(pytest_check(tmp_path), output_format="json")
+    observation = execute_pytest(
+        pytest_check(tmp_path), plan=pytest_run_plan(tmp_path), output_format="json"
+    )
 
     assert observation.processes == ()
     assert observation.pytest is not None
@@ -1935,6 +1965,7 @@ def test_parent_replacement_after_mkdtemp_stops_before_preparation_and_runner(
     try:
         observation = execute_pytest(
             pytest_check(consumer_root),
+            plan=pytest_run_plan(consumer_root),
             output_format="json",
             runner=runner,
         )
@@ -2159,7 +2190,9 @@ def test_rejected_run_directory_cleanup_failure_is_reported(
     monkeypatch.setattr(execution_workspace, "_is_within", reject_created)
     monkeypatch.setattr(pytest_execution.os, "rmdir", deny_rmdir)
 
-    with pytest.raises(OSError, match="cleanup failed: PermissionError: run directory cleanup denied"):
+    with pytest.raises(
+        OSError, match="cleanup failed: PermissionError: run directory cleanup denied"
+    ):
         execution_workspace.create_run_workspace(tmp_path)
 
     for directory in created_directories:
@@ -2281,18 +2314,23 @@ def test_cleanup_does_not_delete_replaced_run_directory(
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output
-        if env is not None and command[1:3] == ("-m", "pytest"):
+        if env is not None and "pytest" in command:
             shutil.rmtree(run_directory)
             run_directory.mkdir()
             replacement_file.write_text("do not delete")
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
         )
 
     try:
-        observation = execute_pytest(pytest_check(tmp_path), output_format="json", runner=runner)
+        observation = execute_pytest(
+            pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
+            output_format="json",
+            runner=runner,
+        )
         assert replacement_file.exists()
     finally:
         shutil.rmtree(run_directory, ignore_errors=True)
@@ -2355,12 +2393,13 @@ def test_cleanup_does_not_traverse_replacement_after_identity_verification(
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
         )
 
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )
@@ -2421,12 +2460,13 @@ def test_cleanup_preserves_inner_descriptor_relative_deletion_failure(
         return completed(
             command,
             0,
-            stdout=preflight_document() if command[1] == "-c" else b"",
+            stdout=preflight_document() if "-c" in command else b"",
         )
 
     try:
         observation = execute_pytest(
             pytest_check(tmp_path),
+            plan=pytest_run_plan(tmp_path),
             output_format="json",
             runner=runner,
         )

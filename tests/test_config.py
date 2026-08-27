@@ -23,8 +23,7 @@ def _write_test_shortcuts(
         shortcut_toml = shortcuts
     else:
         shortcut_toml = "\n".join(
-            f"{json.dumps(name)} = {json.dumps(args)}"
-            for name, args in shortcuts.items()
+            f"{json.dumps(name)} = {json.dumps(args)}" for name, args in shortcuts.items()
         )
     (root / "pyproject.toml").write_text(
         "[tool.pyrepo-check.test-shortcuts]\n" + shortcut_toml,
@@ -67,9 +66,7 @@ def test_loads_valid_test_shortcut_name_boundaries(tmp_path: Path, name: str) ->
     (tmp_path / "tests").mkdir()
     _write_test_shortcuts(tmp_path, {name: ["tests"]})
 
-    assert load_project_config(tmp_path).test_shortcuts == (
-        ConfigTestShortcut(name, ("tests",)),
-    )
+    assert load_project_config(tmp_path).test_shortcuts == (ConfigTestShortcut(name, ("tests",)),)
 
 
 @pytest.mark.parametrize(
@@ -79,9 +76,7 @@ def test_loads_valid_test_shortcut_name_boundaries(tmp_path: Path, name: str) ->
         ('test-shortcuts = ["tests"]', "[tool.pyrepo-check.test-shortcuts] must be a TOML table"),
     ),
 )
-def test_rejects_non_table_test_shortcuts(
-    tmp_path: Path, shortcut_toml: str, message: str
-) -> None:
+def test_rejects_non_table_test_shortcuts(tmp_path: Path, shortcut_toml: str, message: str) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[tool.pyrepo-check]\n" + shortcut_toml,
         encoding="utf-8",
@@ -129,9 +124,7 @@ def test_accepts_test_shortcut_grammar_shapes(tmp_path: Path, args: tuple[str, .
     (tmp_path / "tests" / "test_one.py").write_text("", encoding="utf-8")
     _write_test_shortcuts(tmp_path, {"unit": list(args)})
 
-    assert load_project_config(tmp_path).test_shortcuts == (
-        ConfigTestShortcut("unit", args),
-    )
+    assert load_project_config(tmp_path).test_shortcuts == (ConfigTestShortcut("unit", args),)
 
 
 @pytest.mark.parametrize(
@@ -150,9 +143,7 @@ def test_accepts_existing_contained_test_targets(tmp_path: Path, target: str) ->
     (tmp_path / "tests" / "test_one.py").write_text("", encoding="utf-8")
     _write_test_shortcuts(tmp_path, {"unit": [target]})
 
-    assert load_project_config(tmp_path).test_shortcuts == (
-        ConfigTestShortcut("unit", (target,)),
-    )
+    assert load_project_config(tmp_path).test_shortcuts == (ConfigTestShortcut("unit", (target,)),)
 
 
 @pytest.mark.parametrize(
@@ -219,9 +210,7 @@ def test_rejects_test_shortcut_symlink_to_outside_project(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("target", ("bad\x00path", "loop"))
-def test_translates_unsafe_test_shortcut_path_inspection(
-    tmp_path: Path, target: str
-) -> None:
+def test_translates_unsafe_test_shortcut_path_inspection(tmp_path: Path, target: str) -> None:
     if target == "loop":
         try:
             (tmp_path / "loop").symlink_to("loop")
@@ -253,7 +242,6 @@ bandit_targets = ["src/pkg"]
         root=tmp_path,
         ruff_targets=("src/pkg", "tests", "scripts"),
         bandit_targets=("src/pkg",),
-        frozen=True,
     )
 
 
@@ -266,7 +254,6 @@ def test_detects_default_targets_without_config(tmp_path: Path) -> None:
 
     assert config.ruff_targets == ("src", "tests", "scripts")
     assert config.bandit_targets == ("src",)
-    assert config.frozen is False
 
 
 def test_falls_back_to_current_directory_when_no_targets_exist(tmp_path: Path) -> None:
@@ -276,12 +263,12 @@ def test_falls_back_to_current_directory_when_no_targets_exist(tmp_path: Path) -
     assert config.bandit_targets == (".",)
 
 
-def test_no_frozen_overrides_uv_lock(tmp_path: Path) -> None:
+def test_loading_configuration_does_not_depend_on_uv_lock(tmp_path: Path) -> None:
     (tmp_path / "uv.lock").write_text("", encoding="utf-8")
 
-    config = load_project_config(tmp_path, no_frozen=True)
+    config = load_project_config(tmp_path)
 
-    assert config.frozen is False
+    assert config.root == tmp_path
 
 
 def test_rejects_non_list_target_config(tmp_path: Path) -> None:
@@ -347,7 +334,7 @@ def test_rejects_partial_or_unrelated_coverage_configuration(
 def test_loads_valid_coverage_source_family(tmp_path: Path, source_key: str) -> None:
     pyproject_path = _write_coverage_config(
         tmp_path,
-        f"[tool.coverage.run]\nbranch = true\n{source_key} = [\"src/package\"]",
+        f'[tool.coverage.run]\nbranch = true\n{source_key} = ["src/package"]',
     )
 
     config = load_project_config(tmp_path)
@@ -411,9 +398,7 @@ def test_loads_finite_numeric_coverage_threshold(
         "parallel = false\nconcurrency = []\npatch = []",
     ),
 )
-def test_loads_inactive_coverage_parallelism_options(
-    tmp_path: Path, run_options: str
-) -> None:
+def test_loads_inactive_coverage_parallelism_options(tmp_path: Path, run_options: str) -> None:
     _write_coverage_config(
         tmp_path,
         "\n".join(
@@ -456,9 +441,7 @@ def test_loads_inactive_coverage_parallelism_options(
         ("patch", '["subprocess", 1]'),
     ),
 )
-def test_rejects_invalid_coverage_parallelism_options(
-    tmp_path: Path, key: str, value: str
-) -> None:
+def test_rejects_invalid_coverage_parallelism_options(tmp_path: Path, key: str, value: str) -> None:
     _write_coverage_config(
         tmp_path,
         "\n".join(
@@ -481,14 +464,14 @@ def test_rejects_invalid_coverage_parallelism_options(
         '[tool.coverage.run]\nsource = ["src/package"]',
         '[tool.coverage.run]\nbranch = false\nsource = ["src/package"]',
         '[tool.coverage.run]\nbranch = "true"\nsource = ["src/package"]',
-        '[tool.coverage.run]\nbranch = true',
-        '[tool.coverage.run]\nbranch = true\nsource = []',
+        "[tool.coverage.run]\nbranch = true",
+        "[tool.coverage.run]\nbranch = true\nsource = []",
         '[tool.coverage.run]\nbranch = true\nsource = [""]',
-        '[tool.coverage.run]\nbranch = true\nsource = [1]',
+        "[tool.coverage.run]\nbranch = true\nsource = [1]",
         '[tool.coverage.run]\nbranch = true\nsource = "src/package"',
-        '[tool.coverage]\nrun = []',
+        "[tool.coverage]\nrun = []",
         '[tool.coverage.run]\nbranch = true\nsource = []\nsource_pkgs = [" "]',
-        '[tool.coverage.run]\nbranch = true\nsource_dirs = [1]',
+        "[tool.coverage.run]\nbranch = true\nsource_dirs = [1]",
         '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\nparallel = true',
         '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\nconcurrency = ["thread"]',
         '[tool.coverage.run]\nbranch = true\nsource = ["src/package"]\npatch = ["subprocess"]',
@@ -501,9 +484,7 @@ def test_rejects_invalid_coverage_parallelism_options(
         '[tool.coverage]\nreport = []\n[tool.coverage.run]\nbranch = true\nsource = ["src/package"]',
     ),
 )
-def test_rejects_invalid_coverage_configuration(
-    tmp_path: Path, coverage_toml: str
-) -> None:
+def test_rejects_invalid_coverage_configuration(tmp_path: Path, coverage_toml: str) -> None:
     _write_coverage_config(tmp_path, coverage_toml)
 
     with pytest.raises(InvalidCoverageConfigError, match="pyproject.toml"):

@@ -22,8 +22,9 @@ from pyrepo_check.execution import (
 from pyrepo_check.planning import (
     CheckName,
     CoverageExecutionPlan,
+    DefaultRepositoryPython,
     OutputFormat,
-    PlannedCheck,
+    CheckInvocation,
     PlannedTestScope,
     RunMode,
     RunPlan,
@@ -83,18 +84,25 @@ from pyrepo_check.reporting import (
 )
 
 
-def planned_check(root: Path, name: CheckName) -> PlannedCheck:
-    pytest_plan = PytestExecutionPlan(("uv", "run", "python"), ()) if name == "pytest" else None
-    return PlannedCheck(
+TEST_ROOT = Path("/")
+
+
+def command_for(check: CheckInvocation) -> tuple[str, ...]:
+    module = "ruff" if check.name in {"annotations", "annotations-fix"} else check.name
+    return ("uv", "run", "--locked", "python", "-m", module, *check.arguments)
+
+
+def planned_check(root: Path, name: CheckName) -> CheckInvocation:
+    pytest_plan = PytestExecutionPlan(()) if name == "pytest" else None
+    return CheckInvocation(
         name=name,
-        command=("uv", "run", "python", "-m", name),
-        cwd=root,
+        arguments=(),
         pytest=pytest_plan,
     )
 
 
 def executed_check(
-    planned: PlannedCheck,
+    planned: CheckInvocation,
     returncode: int | None,
     *,
     duration_ms: int = 7,
@@ -104,8 +112,8 @@ def executed_check(
 ) -> ExecutedCheck:
     primary = ExecutedProcess(
         role="primary",
-        command=planned.command,
-        cwd=planned.cwd,
+        command=command_for(planned),
+        cwd=TEST_ROOT,
         returncode=returncode,
         duration_ms=duration_ms,
         stdout=_captured_bytes(stdout),
@@ -132,7 +140,7 @@ def _captured_bytes(raw: bytes | None) -> CapturedBytes | None:
 
 
 def run_plan(
-    checks: tuple[PlannedCheck, ...],
+    checks: tuple[CheckInvocation, ...],
     *,
     targets: tuple[str, ...] = (),
     mode: RunMode = "focused",
@@ -150,6 +158,8 @@ def run_plan(
             "not_selected" if not pytest_selected else "partial" if targets else "complete"
         )
     return RunPlan(
+        root=TEST_ROOT,
+        repository_python=DefaultRepositoryPython(),
         mode=mode,
         targets=targets,
         checks=checks,
@@ -199,7 +209,7 @@ def coverage_enabled_pytest_check(
     root: Path,
     *,
     fail_under: int | float | None = 90,
-) -> PlannedCheck:
+) -> CheckInvocation:
     check = pytest_planned_check(root)
     assert check.pytest is not None
     return replace(
@@ -207,7 +217,6 @@ def coverage_enabled_pytest_check(
         pytest=replace(
             check.pytest,
             coverage=CoverageExecutionPlan(
-                check.pytest.consumer_python,
                 root / "pyproject.toml",
                 fail_under,
             ),
@@ -216,7 +225,7 @@ def coverage_enabled_pytest_check(
 
 
 def coverage_process(
-    check: PlannedCheck,
+    check: CheckInvocation,
     role: str,
     returncode: int | None = 0,
     *,
@@ -227,7 +236,7 @@ def coverage_process(
     return ExecutedProcess(
         role=cast(Any, role),
         command=("coverage", role),
-        cwd=check.cwd,
+        cwd=TEST_ROOT,
         returncode=returncode,
         duration_ms=1,
         stdout=CapturedBytes(stdout, 0),
@@ -283,8 +292,8 @@ def build_coverage_report(
     source = tmp_path / "src" / "example.py"
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -329,11 +338,11 @@ def build_coverage_report(
     )
 
 
-def coverage_primary_process(check: PlannedCheck) -> ExecutedProcess:
+def coverage_primary_process(check: CheckInvocation) -> ExecutedProcess:
     return ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -561,9 +570,7 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
     source.write_text("one = 1\ntwo = 2\n")
     check = pytest_planned_check(tmp_path)
     assert check.pytest is not None
-    coverage_plan = CoverageExecutionPlan(
-        check.pytest.consumer_python, tmp_path / "pyproject.toml", 70
-    )
+    coverage_plan = CoverageExecutionPlan(tmp_path / "pyproject.toml", 70)
     check = replace(check, pytest=replace(check.pytest, coverage=coverage_plan))
     coverage_json = {
         "meta": {"format": 3, "version": "7.15.2", "branch_coverage": True},
@@ -682,8 +689,7 @@ def test_terminal_and_serialize_project_the_exact_coverage_schema_v1_result(
     assert "coverage: missing branches:" not in terminal
     assert "7->8" not in terminal
     assert (
-        "    coverage details: use --format json for exact missing lines and branches\n"
-        in terminal
+        "    coverage details: use --format json for exact missing lines and branches\n" in terminal
     )
     assert terminal.endswith("    passed: pytest\n")
     payload = reporting.json.loads(serialize_json(report))
@@ -853,7 +859,9 @@ def test_coverage_percentage_reserves_zero_and_hundred_for_exact_values(
     assert reporting._coverage_percentage(covered, missing) == expected
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX permits literal backslashes and drive-like names")
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permits literal backslashes and drive-like names"
+)
 @pytest.mark.parametrize(
     ("raw_path", "path_parts"),
     (
@@ -999,9 +1007,7 @@ def test_coverage_preflight_failure_owns_the_pytest_check_before_primary(tmp_pat
         check,
         pytest=replace(
             check.pytest,
-            coverage=CoverageExecutionPlan(
-                check.pytest.consumer_python, tmp_path / "pyproject.toml", 90
-            ),
+            coverage=CoverageExecutionPlan(tmp_path / "pyproject.toml", 90),
         ),
     )
     pytest_preflight = pytest_preflight_process(check)
@@ -1055,9 +1061,7 @@ def test_pytest_preflight_failure_owns_dual_preflight_failure(tmp_path: Path) ->
     pytest_preflight = replace(
         pytest_preflight_process(check), returncode=1, stderr=CapturedBytes(b"pytest", 0)
     )
-    coverage_preflight = coverage_process(
-        check, "coverage_preflight", 1, stderr=b"coverage"
-    )
+    coverage_preflight = coverage_process(check, "coverage_preflight", 1, stderr=b"coverage")
     pytest_observation = PytestExecutionObservation(
         PytestPreflightObservation("preflight_invalid", None, "pytest probe failed"),
         PytestArtifactObservation("not_attempted", None, (), None),
@@ -1141,9 +1145,7 @@ def test_malformed_zero_exit_coverage_preflight_owns_not_started_pytest_check(
     tmp_path: Path,
 ) -> None:
     check = coverage_enabled_pytest_check(tmp_path)
-    coverage_preflight = coverage_process(
-        check, "coverage_preflight", 0, stderr=b"malformed probe"
-    )
+    coverage_preflight = coverage_process(check, "coverage_preflight", 0, stderr=b"malformed probe")
     coverage_observation = CoverageExecutionObservation(
         CoveragePreflightObservation("preflight_invalid", None, "malformed coverage probe"),
         CoverageArtifactObservation("not_attempted", None, None),
@@ -1181,8 +1183,8 @@ def test_validation_rejects_primary_after_typed_coverage_preflight_failure(
     check = coverage_enabled_pytest_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -1223,9 +1225,7 @@ def test_report_validation_recomputes_coverage_context_and_process_invariants(
     tmp_path: Path,
 ) -> None:
     strict = build_coverage_report(tmp_path / "strict")
-    focused = build_coverage_report(
-        tmp_path / "focused", mode="focused", fail_under=None
-    )
+    focused = build_coverage_report(tmp_path / "focused", mode="focused", fail_under=None)
     direct = build_coverage_report(
         tmp_path / "direct",
         targets=("tests/test_example.py",),
@@ -1579,9 +1579,7 @@ def test_report_validation_requires_typed_coverage_preflight_success(
 def test_report_validation_rejects_eligible_exit_two_generation_failure(
     tmp_path: Path,
 ) -> None:
-    generation_failed = build_coverage_error_stage_report(
-        tmp_path / "strict", "generation-failed"
-    )
+    generation_failed = build_coverage_error_stage_report(tmp_path / "strict", "generation-failed")
     check = generation_failed.checks[0]
     eligible_exit_two = replace(check.processes[-1], exit_code=2)
     strict_invalid = replace(
@@ -1665,8 +1663,8 @@ def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> 
             processes=(
                 ProcessResult(
                     role="primary",
-                    argv=ruff.command,
-                    cwd=str(unresolved_root.resolve()),
+                    argv=command_for(ruff),
+                    cwd=str(TEST_ROOT),
                     outcome="exited",
                     exit_code=0,
                     signal=None,
@@ -1684,8 +1682,8 @@ def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> 
             processes=(
                 ProcessResult(
                     role="primary",
-                    argv=ty.command,
-                    cwd=str(unresolved_root.resolve()),
+                    argv=command_for(ty),
+                    cwd=str(TEST_ROOT),
                     outcome="exited",
                     exit_code=3,
                     signal=None,
@@ -1703,8 +1701,8 @@ def test_builds_exact_run_report_and_preserves_planned_order(tmp_path: Path) -> 
             processes=(
                 ProcessResult(
                     role="primary",
-                    argv=bandit.command,
-                    cwd=str(unresolved_root.resolve()),
+                    argv=command_for(bandit),
+                    cwd=str(TEST_ROOT),
                     outcome="signaled",
                     exit_code=None,
                     signal=9,
@@ -2083,9 +2081,8 @@ def test_serialize_json_projects_exact_run_members_in_normative_order(tmp_path: 
         b'"pytest_args":null,"planned_test_scope":"not_selected",'
         b'"planned_coverage_scope":"not_requested"},"checks":[{"name":"ruff",'
         b'"status":"passed","processes":[{"role":"primary","argv":["uv","run",'
-        b'"python","-m","ruff"],"cwd":"'
-        + root
-        + b'","outcome":"exited","exit_code":0,"signal":null,"duration_ms":7,'
+        b'"--locked","python","-m","ruff"],"cwd":"/","outcome":"exited",'
+        b'"exit_code":0,"signal":null,"duration_ms":7,'
         b'"stdout":{"captured":true,"text":"snowman \xe2\x98\x83","truncated":false,'
         b'"omitted_bytes":0},"stderr":{"captured":true,"text":"","truncated":false,'
         b'"omitted_bytes":0},"error_message":null}],"error":null}],"pytest":null,'
@@ -2252,10 +2249,9 @@ def test_rejects_duplicate_execution_observation(tmp_path: Path) -> None:
 
 def test_rejects_mismatched_planned_execution_observation(tmp_path: Path) -> None:
     ruff = planned_check(tmp_path, "ruff")
-    mismatched = PlannedCheck(
+    mismatched = CheckInvocation(
         name="ruff",
-        command=(*ruff.command, "--diff"),
-        cwd=ruff.cwd,
+        arguments=(*ruff.arguments, "--diff"),
     )
 
     with pytest.raises(ReportingError):
@@ -2285,8 +2281,8 @@ def test_rejects_non_primary_ordinary_process_observation(tmp_path: Path) -> Non
         processes=(
             ExecutedProcess(
                 role="pytest_preflight",
-                command=ruff.command,
-                cwd=ruff.cwd,
+                command=command_for(ruff),
+                cwd=TEST_ROOT,
                 returncode=0,
                 duration_ms=1,
                 stdout=CapturedBytes(b"", 0),
@@ -2371,21 +2367,20 @@ def finalized_pytest_execution_observation(
     )
 
 
-def pytest_planned_check(root: Path) -> PlannedCheck:
-    pytest_plan = PytestExecutionPlan(("uv", "run", "python"), ("tests",))
-    return PlannedCheck(
+def pytest_planned_check(root: Path) -> CheckInvocation:
+    pytest_plan = PytestExecutionPlan(("tests",))
+    return CheckInvocation(
         name="pytest",
-        command=(*pytest_plan.consumer_python, "-m", "pytest", *pytest_plan.pytest_args),
-        cwd=root,
+        arguments=pytest_plan.pytest_args,
         pytest=pytest_plan,
     )
 
 
-def pytest_preflight_process(check: PlannedCheck) -> ExecutedProcess:
+def pytest_preflight_process(check: CheckInvocation) -> ExecutedProcess:
     return ExecutedProcess(
         role="pytest_preflight",
-        command=("uv", "run", "python", "-c", "probe"),
-        cwd=check.cwd,
+        command=("uv", "run", "--locked", "python", "-c", "probe"),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"preflight", 0),
@@ -2404,8 +2399,8 @@ def pytest_report_for_exit(
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=exit_code,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2436,8 +2431,8 @@ def test_pytest_execution_bridge_projects_structured_evidence_and_both_processes
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=7,
         stdout=CapturedBytes(b"primary", 0),
@@ -2464,7 +2459,7 @@ def test_pytest_execution_bridge_projects_structured_evidence_and_both_processes
         "pytest_preflight",
         "primary",
     ]
-    assert report.checks[0].processes[1].argv == check.command
+    assert report.checks[0].processes[1].argv == command_for(check)
 
 
 def test_pytest_execution_bridge_projects_missing_primary_as_not_started(tmp_path: Path) -> None:
@@ -2513,8 +2508,8 @@ def test_pytest_cleanup_error_overrides_check_but_preserves_finalized_result(
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2545,8 +2540,8 @@ def test_terminal_renders_structured_pytest_special_slow_and_sorted_advisories(
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2620,8 +2615,8 @@ def test_validation_rejects_malformed_public_pytest_models(
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2645,8 +2640,8 @@ def test_validation_rejects_malformed_pytest_nested_values_as_reporting_error(
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2685,8 +2680,8 @@ def test_validation_rejects_pytest_primary_exit_mismatch(tmp_path: Path) -> None
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2717,8 +2712,8 @@ def test_validation_rejects_planned_selector_scope_mismatch(tmp_path: Path) -> N
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2752,8 +2747,8 @@ def test_validation_rejects_artifact_scope_reasons_when_evidence_is_null(
     check = pytest_planned_check(tmp_path)
     primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -2807,8 +2802,8 @@ def test_terminal_renders_pytest_incomplete_helper_diagnostic_and_cleanup_failur
     check = pytest_planned_check(tmp_path)
     failed_primary = ExecutedProcess(
         role="primary",
-        command=check.command,
-        cwd=check.cwd,
+        command=command_for(check),
+        cwd=TEST_ROOT,
         returncode=1,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -3022,9 +3017,7 @@ def test_serialize_json_projects_exact_nonempty_pytest_evidence_members(tmp_path
             SlowTest("tests/test_alpha.py::test_skip", 10),
         ),
         special_outcomes=(
-            SpecialTestOutcome(
-                "tests/test_alpha.py::test_skip", "skipped", None, None, False, 10
-            ),
+            SpecialTestOutcome("tests/test_alpha.py::test_skip", "skipped", None, None, False, 10),
             SpecialTestOutcome(
                 "tests/test_beta.py::test_xfail", "xfailed", "expected", None, False, 30
             ),
@@ -3494,6 +3487,7 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
     check = pytest_planned_check(tmp_path)
 
     if boundary == "run-directory":
+
         def fail_run_directory(_consumer_root: Path) -> Path:
             raise PermissionError("temporary directory denied")
 
@@ -3503,6 +3497,7 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
             fail_run_directory,
         )
     elif boundary == "plugin-copy":
+
         def fail_copy(
             _source: Path,
             _destination_name: str,
@@ -3528,6 +3523,7 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
 
         monkeypatch.setattr(pytest_execution.os, "mkdir", fail_writer_directory)
     else:
+
         def fail_environment(
             _run_directory: Path,
             _artifact_path: Path,
@@ -3567,8 +3563,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
         lambda check: (
             ExecutedProcess(
                 role="primary",
-                command=check.command,
-                cwd=check.cwd,
+                command=command_for(check),
+                cwd=TEST_ROOT,
                 returncode=0,
                 duration_ms=1,
                 stdout=CapturedBytes(b"", 0),
@@ -3581,8 +3577,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
             pytest_preflight_process(check),
             ExecutedProcess(
                 role="primary",
-                command=check.command,
-                cwd=check.cwd,
+                command=command_for(check),
+                cwd=TEST_ROOT,
                 returncode=0,
                 duration_ms=1,
                 stdout=CapturedBytes(b"", 0),
@@ -3591,8 +3587,8 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
             ),
             ExecutedProcess(
                 role="primary",
-                command=check.command,
-                cwd=check.cwd,
+                command=command_for(check),
+                cwd=TEST_ROOT,
                 returncode=0,
                 duration_ms=1,
                 stdout=CapturedBytes(b"", 0),
@@ -3605,7 +3601,7 @@ def test_pytest_setup_not_started_projects_schema_valid_json_without_fallback(
 )
 def test_pytest_execution_bridge_rejects_noncanonical_internal_order(
     tmp_path: Path,
-    processes: Callable[[PlannedCheck], tuple[ExecutedProcess, ...]],
+    processes: Callable[[CheckInvocation], tuple[ExecutedProcess, ...]],
 ) -> None:
     check = pytest_planned_check(tmp_path)
     observation = ExecutedCheck(
@@ -3957,7 +3953,7 @@ def make_invalid_report(tmp_path: Path, case: str) -> AgentReportV1:
     spawn_process = spawn_failed.checks[0].processes[0]
 
     def shortcut_report(
-        checks: tuple[PlannedCheck, ...],
+        checks: tuple[CheckInvocation, ...],
         *,
         targets: tuple[str, ...] = (),
         test_shortcut: object = "unit",

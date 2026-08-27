@@ -5,14 +5,12 @@ from pathlib import Path
 import pytest
 
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.execution import ExecutionResult
-from pyrepo_check.planning import PlannedCheck, RunPlan
 from pyrepo_check.runner import Check, build_checks, run_checks, select_checks
 from tests.support import RecordingRunner
 
 
 def test_legacy_runner_names_and_check_shape_are_preserved(tmp_path: Path) -> None:
-    config = ProjectConfig(tmp_path, ("src",), ("src",), frozen=False)
+    config = ProjectConfig(tmp_path, ("src",), ("src",))
 
     assert tuple(inspect.signature(Check).parameters) == ("name", "command")
     assert tuple(field.name for field in dataclasses.fields(Check)) == (
@@ -37,40 +35,27 @@ def test_legacy_select_returns_original_checks_in_canonical_order() -> None:
     assert selected[1] is ty
 
 
-def test_legacy_run_checks_delegates_to_executor(
+def test_legacy_run_checks_preserves_raw_vectors_without_using_run_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     check = Check("ruff", ("uv", "run", "ruff"))
-    expected = ExecutionResult(checks=(), exit_code=7)
-    received: list[RunPlan] = []
+    received: list[tuple[tuple[tuple[str, ...], ...], Path, object]] = []
     injected_runner = RecordingRunner()
 
-    def fake_execute_plan(
-        plan: RunPlan,
+    def fake_execute_legacy_commands(
+        commands: tuple[tuple[str, ...], ...],
         *,
+        cwd: Path,
         runner: object,
-    ) -> ExecutionResult:
-        received.append(plan)
+    ) -> int:
+        received.append((commands, cwd, runner))
         assert runner is injected_runner
-        return expected
+        return 7
 
-    monkeypatch.setattr("pyrepo_check.runner.execute_plan", fake_execute_plan)
+    monkeypatch.setattr("pyrepo_check.runner.execute_legacy_commands", fake_execute_legacy_commands)
 
     result = run_checks((check,), cwd=tmp_path, runner=injected_runner)
 
     assert result == 7
-    assert received == [
-        RunPlan(
-            mode="focused",
-            targets=(),
-            checks=(
-                PlannedCheck(
-                    name="ruff",
-                    command=("uv", "run", "ruff"),
-                    cwd=tmp_path,
-                ),
-            ),
-            output_format="terminal",
-        )
-    ]
+    assert received == [((check.command,), tmp_path, injected_runner)]

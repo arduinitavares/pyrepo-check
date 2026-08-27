@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import queue
@@ -10,7 +10,12 @@ import threading
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from pyrepo_check.planning import PlannedCheck, RunPlan
+from pyrepo_check.planning import (
+    CheckInvocation,
+    CheckName,
+    DefaultRepositoryPython,
+    RunPlan,
+)
 
 if TYPE_CHECKING:
     from pyrepo_check.coverage_execution import CoverageExecutionObservation
@@ -97,7 +102,7 @@ class ExecutedProcess:
 
 @dataclass(frozen=True)
 class ExecutedCheck:
-    planned: PlannedCheck
+    planned: CheckInvocation
     processes: tuple[ExecutedProcess, ...]
     pytest: PytestExecutionObservation | None = None
     coverage: CoverageExecutionObservation | None = None
@@ -107,6 +112,34 @@ class ExecutedCheck:
 class ExecutionResult:
     checks: tuple[ExecutedCheck, ...]
     exit_code: int
+
+
+CHECK_MODULES: Mapping[CheckName, str] = {
+    "ruff": "ruff",
+    "annotations": "ruff",
+    "annotations-fix": "ruff",
+    "ty": "ty",
+    "bandit": "bandit",
+    "pytest": "pytest",
+}
+
+
+def locked_python_command(plan: RunPlan) -> tuple[str, ...]:
+    selector = (
+        ()
+        if isinstance(plan.repository_python, DefaultRepositoryPython)
+        else ("--python", plan.repository_python.request)
+    )
+    return ("uv", "run", "--locked", *selector, "python")
+
+
+def locked_module_command(plan: RunPlan, check: CheckInvocation) -> tuple[str, ...]:
+    return (
+        *locked_python_command(plan),
+        "-m",
+        CHECK_MODULES[check.name],
+        *check.arguments,
+    )
 
 
 def execute_plan(
@@ -119,8 +152,9 @@ def execute_plan(
 
     for check in plan.checks:
         is_json = plan.output_format == "json"
+        command = locked_module_command(plan, check)
         if not is_json:
-            print(f"\n==> {check.name}: {shlex.join(check.command)}", flush=True)
+            print(f"\n==> {check.name}: {shlex.join(command)}", flush=True)
         if check.pytest is not None:
             from pyrepo_check.pytest_execution import execute_pytest
 
@@ -141,8 +175,8 @@ def execute_plan(
                 processes=(
                     execute_process(
                         role="primary",
-                        command=check.command,
-                        cwd=check.cwd,
+                        command=command,
+                        cwd=plan.root,
                         capture_output=is_json,
                         runner=runner,
                         clock_ns=clock_ns,
@@ -172,6 +206,42 @@ def execute_plan(
         exit_code = 0
 
     return ExecutionResult(checks=tuple(executed), exit_code=exit_code)
+
+
+def execute_legacy_commands(
+    commands: Sequence[tuple[str, ...]],
+    *,
+    cwd: Path,
+    runner: ProcessRunner | None = None,
+    clock_ns: Callable[[], int] = time.monotonic_ns,
+) -> int:
+    """Run raw compatibility commands without producing an Agent Report."""
+    executed = tuple(
+        execute_process(
+            role="legacy",
+            command=command,
+            cwd=cwd,
+            capture_output=False,
+            runner=runner,
+            clock_ns=clock_ns,
+        )
+        for command in commands
+    )
+    first_positive = next(
+        (
+            process.returncode
+            for process in executed
+            if process.returncode is not None and process.returncode > 0
+        ),
+        None,
+    )
+    if first_positive is not None:
+        return first_positive
+    return (
+        2
+        if any(process.returncode is None or process.returncode < 0 for process in executed)
+        else 0
+    )
 
 
 def execute_process(
@@ -210,12 +280,8 @@ def execute_process(
             completed = runner(command, **runner_kwargs)
             returncode = completed.returncode
             if capture_output:
-                stdout = _normalize_buffered_output(
-                    cast(bytes | str | None, completed.stdout)
-                )
-                stderr = _normalize_buffered_output(
-                    cast(bytes | str | None, completed.stderr)
-                )
+                stdout = _normalize_buffered_output(cast(bytes | str | None, completed.stdout))
+                stderr = _normalize_buffered_output(cast(bytes | str | None, completed.stderr))
     except _ProcessExecutionFailure as error:
         spawn_error = str(error)
     except OSError as error:

@@ -38,7 +38,8 @@ from pyrepo_check.coverage_execution import (
 )
 from pyrepo_check.planning import (
     CoverageExecutionPlan,
-    PlannedCheck,
+    CheckInvocation,
+    DefaultRepositoryPython,
     PytestExecutionPlan,
     RunMode,
     RunPlan,
@@ -69,10 +70,12 @@ def _plan(
     shortcut: str | None = None,
     fail_under: int | float | None = 90,
 ) -> RunPlan:
-    coverage = CoverageExecutionPlan(("consumer-python",), Path("pyproject.toml"), fail_under)
-    pytest = PytestExecutionPlan(("consumer-python",), (), coverage=coverage)
-    check = PlannedCheck("pytest", ("consumer-python", "-m", "pytest"), Path("."), pytest)
+    coverage = CoverageExecutionPlan(Path("pyproject.toml"), fail_under)
+    pytest = PytestExecutionPlan((), coverage=coverage)
+    check = CheckInvocation("pytest", (), pytest)
     return RunPlan(
+        root=Path("/").resolve(),
+        repository_python=DefaultRepositoryPython(),
         mode=mode,
         targets=targets,
         checks=(check,),
@@ -111,17 +114,58 @@ def _pytest_result(
         (_plan(), _pytest_result(), True, (True, None, False)),
         (_plan(fail_under=None), _pytest_result(), True, (True, "not_configured", False)),
         (_plan(mode="focused"), _pytest_result(), True, (False, "focused_run", True)),
-        (_plan(mode="focused", targets=("src",)), _pytest_result(), True, (False, "partial_run", True)),
-        (_plan(mode="focused", shortcut="unit"), _pytest_result(), True, (False, "partial_run", True)),
-        (_plan(), _pytest_result(scope="partial", scope_reasons=("deselected_tests",)), True, (False, "partial_run", True)),
+        (
+            _plan(mode="focused", targets=("src",)),
+            _pytest_result(),
+            True,
+            (False, "partial_run", True),
+        ),
+        (
+            _plan(mode="focused", shortcut="unit"),
+            _pytest_result(),
+            True,
+            (False, "partial_run", True),
+        ),
+        (
+            _plan(),
+            _pytest_result(scope="partial", scope_reasons=("deselected_tests",)),
+            True,
+            (False, "partial_run", True),
+        ),
         (_plan(), _pytest_result(exit_code=0), True, (True, None, False)),
         (_plan(), _pytest_result(exit_code=1), True, (False, "pytest_failed", True)),
-        (_plan(), _pytest_result(exit_code=2, complete=False, scope="partial", scope_reasons=("incomplete_session",)), True, (False, "pytest_incomplete", True)),
-        (_plan(), _pytest_result(exit_code=3, complete=False, scope="partial", scope_reasons=("incomplete_session",)), True, (False, "pytest_incomplete", True)),
-        (_plan(), _pytest_result(exit_code=4, complete=False, scope="partial", scope_reasons=("incomplete_session",)), True, (False, "pytest_incomplete", True)),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=2, complete=False, scope="partial", scope_reasons=("incomplete_session",)
+            ),
+            True,
+            (False, "pytest_incomplete", True),
+        ),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=3, complete=False, scope="partial", scope_reasons=("incomplete_session",)
+            ),
+            True,
+            (False, "pytest_incomplete", True),
+        ),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=4, complete=False, scope="partial", scope_reasons=("incomplete_session",)
+            ),
+            True,
+            (False, "pytest_incomplete", True),
+        ),
         (_plan(), _pytest_result(exit_code=5), True, (False, "no_tests_collected", True)),
         (_plan(), replace(_pytest_result(), evidence=None), True, (False, "evidence_error", True)),
-        (_plan(), _pytest_result(complete=False, scope="partial", scope_reasons=("incomplete_session",)), True, (False, "pytest_incomplete", True)),
+        (
+            _plan(),
+            _pytest_result(complete=False, scope="partial", scope_reasons=("incomplete_session",)),
+            True,
+            (False, "pytest_incomplete", True),
+        ),
         (_plan(), _pytest_result(), False, (False, "evidence_error", True)),
     ),
     ids=(
@@ -167,15 +211,39 @@ def test_coverage_gate_policy_matrix(
         (_plan(fail_under=None), _pytest_result(exit_code=1), True, "not_configured"),
         (_plan(fail_under=None), _pytest_result(scope="partial"), True, "not_configured"),
         (_plan(mode="focused", fail_under=None), _pytest_result(), True, "not_configured"),
-        (_plan(), _pytest_result(exit_code=5, complete=False, scope="partial", scope_reasons=("incomplete_session",)), True, "no_tests_collected"),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=5, complete=False, scope="partial", scope_reasons=("incomplete_session",)
+            ),
+            True,
+            "no_tests_collected",
+        ),
         (_plan(), _pytest_result(exit_code=5, scope="partial"), True, "no_tests_collected"),
         (_plan(mode="focused"), _pytest_result(exit_code=5), True, "no_tests_collected"),
-        (_plan(), _pytest_result(exit_code=1, complete=False, scope="partial", scope_reasons=("incomplete_session",)), True, "pytest_incomplete"),
+        (
+            _plan(),
+            _pytest_result(
+                exit_code=1, complete=False, scope="partial", scope_reasons=("incomplete_session",)
+            ),
+            True,
+            "pytest_incomplete",
+        ),
         (_plan(), _pytest_result(complete=False, scope="partial"), True, "pytest_incomplete"),
         (_plan(mode="focused"), _pytest_result(complete=False), True, "pytest_incomplete"),
-        (_plan(), _pytest_result(exit_code=1, scope="partial", scope_reasons=("deselected_tests",)), True, "pytest_failed"),
+        (
+            _plan(),
+            _pytest_result(exit_code=1, scope="partial", scope_reasons=("deselected_tests",)),
+            True,
+            "pytest_failed",
+        ),
         (_plan(mode="focused"), _pytest_result(exit_code=1), True, "pytest_failed"),
-        (_plan(mode="focused"), _pytest_result(scope="partial", scope_reasons=("deselected_tests",)), True, "partial_run"),
+        (
+            _plan(mode="focused"),
+            _pytest_result(scope="partial", scope_reasons=("deselected_tests",)),
+            True,
+            "partial_run",
+        ),
     ),
     ids=(
         "evidence-over-not-configured-and-no-tests",
@@ -225,7 +293,9 @@ def test_coverage_gate_policy_treats_invalid_pytest_evidence_as_an_evidence_erro
     )
 
 
-def test_coverage_gate_policy_keeps_unconfigured_strict_evidence_eligible_but_not_failed_pytest() -> None:
+def test_coverage_gate_policy_keeps_unconfigured_strict_evidence_eligible_but_not_failed_pytest() -> (
+    None
+):
     unconfigured = _plan(fail_under=None)
 
     complete = coverage_gate_policy(unconfigured, _pytest_result(), True)
@@ -470,9 +540,7 @@ def test_coverage_json_rejects_distinct_keys_for_the_same_measured_file(
         if not alias.exists() or not os.path.samefile(alias, root / "src" / "zero.py"):
             pytest.skip()
 
-    document["files"][str(alias.relative_to(root))] = deepcopy(
-        document["files"]["src/zero.py"]
-    )
+    document["files"][str(alias.relative_to(root))] = deepcopy(document["files"]["src/zero.py"])
     document["totals"]["covered_lines"] += 1
     document["totals"]["num_statements"] += 1
 
@@ -620,9 +688,7 @@ def test_coverage_json_rejects_one_schema_or_arithmetic_defect(
     "path_defect",
     ("outside", "symlink_escape", "missing", "directory", "duplicate_normalized"),
 )
-def test_coverage_json_rejects_one_measured_path_defect(
-    tmp_path: Path, path_defect: str
-) -> None:
+def test_coverage_json_rejects_one_measured_path_defect(tmp_path: Path, path_defect: str) -> None:
     root = _coverage_project(tmp_path)
     document = _coverage_json_document()
     if path_defect == "outside":
@@ -639,9 +705,7 @@ def test_coverage_json_rejects_one_measured_path_defect(
     elif path_defect == "directory":
         document["files"]["src"] = document["files"].pop("src/alpha.py")
     else:
-        document["files"]["src/../src/alpha.py"] = deepcopy(
-            document["files"]["src/alpha.py"]
-        )
+        document["files"]["src/../src/alpha.py"] = deepcopy(document["files"]["src/alpha.py"])
 
     with pytest.raises(ValueError):
         validate_coverage_json(
@@ -651,7 +715,9 @@ def test_coverage_json_rejects_one_measured_path_defect(
         )
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX permits literal backslashes and drive-like names")
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX permits literal backslashes and drive-like names"
+)
 @pytest.mark.parametrize(
     ("raw_path", "path_parts"),
     (
@@ -818,8 +884,12 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
         lambda result: replace(result, coverage_version="7.15.2-dev"),
         lambda result: replace(result, evidence_complete=1),
         lambda result: replace(result, gate_eligible=0),
-        lambda result: replace(result, totals=CoverageTotals(CoverageCounts(True, 5), result.totals.branches)),
-        lambda result: replace(result, totals=CoverageTotals(CoverageCounts(6, 5), result.totals.branches)),
+        lambda result: replace(
+            result, totals=CoverageTotals(CoverageCounts(True, 5), result.totals.branches)
+        ),
+        lambda result: replace(
+            result, totals=CoverageTotals(CoverageCounts(6, 5), result.totals.branches)
+        ),
         lambda result: replace(result, threshold=replace(result.threshold, value=float("nan"))),
         lambda result: replace(result, threshold=replace(result.threshold, passed=False)),
         lambda result: replace(result, files=tuple(reversed(result.files))),
@@ -915,9 +985,7 @@ def test_coverage_result_builds_strict_unconfigured_pass_without_evaluation(
     assert result is not None
     assert result.status == "passed"
     assert result.gate_eligible is True
-    assert result.threshold == CoverageThreshold(
-        False, None, False, None, "not_configured"
-    )
+    assert result.threshold == CoverageThreshold(False, None, False, None, "not_configured")
     validate_coverage_result(result)
 
 
@@ -1034,9 +1102,7 @@ def test_coverage_result_builds_valid_non_gating_guidance(
     assert result.scope == expected_scope
     assert result.evidence_complete is True
     assert result.gate_eligible is False
-    assert result.threshold == CoverageThreshold(
-        True, 90, False, None, expected_reason
-    )
+    assert result.threshold == CoverageThreshold(True, 90, False, None, expected_reason)
     assert result.totals is not None
     assert result.error is None
 
@@ -1086,9 +1152,7 @@ def test_coverage_result_maps_every_preflight_and_artifact_error(
     assert result.scope == "partial"
     assert result.evidence_complete is False
     assert result.gate_eligible is False
-    assert result.threshold == CoverageThreshold(
-        True, 90, False, None, "evidence_error"
-    )
+    assert result.threshold == CoverageThreshold(True, 90, False, None, "evidence_error")
     assert result.totals is None
     assert result.files == ()
     assert result.error == CoverageError(expected_code, f"{expected_code} diagnostic")

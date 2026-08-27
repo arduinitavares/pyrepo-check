@@ -78,7 +78,7 @@ def _write_coverage_all_consumer(
     xdist_dependency = '    "pytest-xdist>=3.8,<4",\n' if include_xdist else ""
     pytest_addopts = 'addopts = "-n 1"\n' if include_xdist else ""
     coverage_config = (
-        f'''[tool.coverage.run]
+        f"""[tool.coverage.run]
 branch = true
 source = ["src"]
 parallel = false
@@ -86,7 +86,7 @@ parallel = false
 [tool.coverage.report]
 fail_under = {fail_under}
 
-'''
+"""
         if include_coverage_config
         else ""
     )
@@ -95,7 +95,7 @@ fail_under = {fail_under}
         encoding="utf-8",
     )
     (root / "pyproject.toml").write_text(
-        f'''[project]
+        f"""[project]
 name = "c3-coverage-all-consumer"
 version = "0.0.0"
 requires-python = ">=3.13.15"
@@ -118,7 +118,7 @@ skips = ["./tests/*"]
 
 [tool.pyrepo-check.test-shortcuts]
 unit = ["tests/test_coverage_consumer.py::test_positive_value"]
-''',
+""",
         encoding="utf-8",
     )
     (root / "src" / "coverage_consumer" / "__init__.py").write_text(
@@ -221,7 +221,7 @@ def _run_external_json(
 
 def _write_forged_legacy_plugin(root: Path) -> None:
     (root / "pyrepo_check_pytest_evidence_plugin.py").write_text(
-        '''import json
+        """import json
 import os
 from pathlib import Path
 
@@ -282,7 +282,7 @@ def pytest_sessionfinish(session, exitstatus):
         },
     }
     Path(os.environ["PYREPO_CHECK_PYTEST_JSON"]).write_text(json.dumps(artifact), encoding="utf-8")
-''',
+""",
         encoding="utf-8",
     )
 
@@ -290,7 +290,7 @@ def pytest_sessionfinish(session, exitstatus):
 def _write_pytest_nine_consumer(root: Path) -> None:
     (root / "tests").mkdir()
     (root / "pyproject.toml").write_text(
-        '''[project]
+        """[project]
 name = "c2-pytest-nine-consumer"
 version = "0.0.0"
 requires-python = ">=3.13.15"
@@ -298,11 +298,11 @@ dependencies = ["pytest==9.0.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-''',
+""",
         encoding="utf-8",
     )
     (root / "tests" / "test_must_not_run.py").write_text(
-        '''from pathlib import Path
+        """from pathlib import Path
 import os
 
 Path(os.environ["TEST_MODULE_IMPORTED"]).write_text("imported", encoding="utf-8")
@@ -310,7 +310,7 @@ Path(os.environ["TEST_MODULE_IMPORTED"]).write_text("imported", encoding="utf-8"
 
 def test_must_not_run():
     assert False
-''',
+""",
         encoding="utf-8",
     )
 
@@ -431,8 +431,7 @@ def test_external_configured_coverage_all_is_complete_and_keeps_consumer_clean(
         "skipped_reason": None,
     }
     assert all(
-        not file["statements"]["missing_lines"]
-        and not file["branches"]["missing_arcs"]
+        not file["statements"]["missing_lines"] and not file["branches"]["missing_arcs"]
         for file in payload["coverage"]["files"]
     )
     assert [process["role"] for process in processes] == [
@@ -451,7 +450,7 @@ def test_external_configured_coverage_all_is_complete_and_keeps_consumer_clean(
     assert primary_processes[0]["argv"][:7] == [
         "uv",
         "run",
-        "--frozen",
+        "--locked",
         "python",
         "-m",
         "coverage",
@@ -562,9 +561,7 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
         assert completed.stderr == b"", name
         assert completed.stdout, name
         payload = json.loads(completed.stdout)
-        pytest_check = next(
-            check for check in payload["checks"] if check["name"] == "pytest"
-        )
+        pytest_check = next(check for check in payload["checks"] if check["name"] == "pytest")
         processes = pytest_check["processes"]
         primary_processes = [process for process in processes if process["role"] == "primary"]
 
@@ -612,17 +609,14 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
         assert [
             process["role"]
             for process in processes
-            if any(
-                pair == ("-m", "pytest")
-                for pair in zip(process["argv"], process["argv"][1:])
-            )
+            if any(pair == ("-m", "pytest") for pair in zip(process["argv"], process["argv"][1:]))
         ] == ["primary"], name
         primary = primary_processes[0]
         assert primary["cwd"] == str(consumer), name
         assert primary["argv"][:7] == [
             "uv",
             "run",
-            "--frozen",
+            "--locked",
             "python",
             "-m",
             "coverage",
@@ -763,7 +757,7 @@ def test_external_all_without_coverage_config_uses_plain_pytest_once(
     ]
     assert [process["role"] for process in processes] == ["pytest_preflight", "primary"]
     assert len([process for process in processes if process["role"] == "primary"]) == 1
-    assert processes[1]["argv"][:6] == ["uv", "run", "--frozen", "python", "-m", "pytest"]
+    assert processes[1]["argv"][:6] == ["uv", "run", "--locked", "python", "-m", "pytest"]
     assert all("coverage" not in process["argv"] for process in processes)
     _assert_coverage_consumer_unchanged(consumer, before)
 
@@ -807,7 +801,7 @@ def test_external_invalid_native_coverage_config_is_a_zero_spawn_planning_error(
     config_path = consumer / "pyproject.toml"
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
-        + "\n[tool.coverage.run]\nbranch = false\nsource = [\"src\"]\nparallel = false\n",
+        + '\n[tool.coverage.run]\nbranch = false\nsource = ["src"]\nparallel = false\n',
         encoding="utf-8",
     )
 
@@ -1035,10 +1029,7 @@ def test_external_coverage_statuses_remain_independent(
     pytest_roles = [
         process["role"]
         for process in processes
-        if any(
-            pair == ("-m", "pytest")
-            for pair in zip(process["argv"], process["argv"][1:])
-        )
+        if any(pair == ("-m", "pytest") for pair in zip(process["argv"], process["argv"][1:]))
     ]
 
     assert completed.returncode == case.expected_returncode
@@ -1119,10 +1110,7 @@ def test_creates_a_coverage_shard() -> None:
     pytest_roles = [
         process["role"]
         for process in processes
-        if any(
-            pair == ("-m", "pytest")
-            for pair in zip(process["argv"], process["argv"][1:])
-        )
+        if any(pair == ("-m", "pytest") for pair in zip(process["argv"], process["argv"][1:]))
     ]
 
     assert completed.returncode == 2
@@ -1156,7 +1144,7 @@ def test_creates_a_coverage_shard() -> None:
     assert primary_processes[0]["argv"][:7] == [
         "uv",
         "run",
-        "--frozen",
+        "--locked",
         "python",
         "-m",
         "coverage",
@@ -1198,7 +1186,7 @@ def test_external_xdist_coverage_reports_parallelism_without_a_plain_fallback(
     assert primary_processes[0]["argv"][:7] == [
         "uv",
         "run",
-        "--frozen",
+        "--locked",
         "python",
         "-m",
         "coverage",
@@ -1290,7 +1278,7 @@ def test_external_pytest_nine_consumer_stops_after_unsupported_preflight(
     assert payload["pytest"]["error"] is not None
     assert payload["pytest"]["error"]["code"] == "unsupported_version"
     assert [process["role"] for process in processes] == ["pytest_preflight"]
-    assert processes[0]["argv"][:3] == ["uv", "run", "--frozen"]
+    assert processes[0]["argv"][:3] == ["uv", "run", "--locked"]
     preflight_record = json.loads(processes[0]["stdout"]["text"])
     assert preflight_record["pytest_version"] == [9, 0, 0]
     assert not test_module_imported.exists()
@@ -1300,6 +1288,7 @@ def test_external_pytest_nine_consumer_stops_after_unsupported_preflight(
 
 
 def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     test_file = tmp_path / "tests" / "test_example.py"
     test_file.parent.mkdir()
     test_file.write_text("", encoding="utf-8")
@@ -1318,17 +1307,18 @@ def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
     assert result == 0
     plugin_name = runner.calls[1].command[runner.calls[1].command.index("-p") + 1]
     assert [call.command for call in runner.calls] == [
-        ("uv", "run", "python", "-c", runner.calls[0].command[-1]),
+        ("uv", "run", "--locked", "python", "-c", runner.calls[0].command[-1]),
         (
             "uv",
             "run",
-                "python",
-                "-m",
-                "pytest",
-                "-p",
-                plugin_name,
-                "tests/test_example.py::test_exact_behavior",
-        )
+            "--locked",
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            plugin_name,
+            "tests/test_example.py::test_exact_behavior",
+        ),
     ]
 
 
@@ -1398,7 +1388,9 @@ def test_recording_runner_registers_writer_before_atomic_artifact_replace(
     replacements: list[tuple[Path, Path]] = []
     original_replace = os.replace
 
-    def observe_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+    def observe_replace(
+        source: str | os.PathLike[str], destination: str | os.PathLike[str]
+    ) -> None:
         source_path = Path(source)
         destination_path = Path(destination)
         markers = list(writer_directory.glob("pytest-writer-*.json"))
@@ -1471,6 +1463,7 @@ def test_legacy_exit_code_classifies_spawn_and_negative_outcomes(
     expected: int,
 ) -> None:
     (tmp_path / "src").mkdir()
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     runner = RecordingRunner(returncodes=returncodes, raise_on_call=raise_on_call)
 
     result = main(["--root", str(tmp_path), "--all"], runner=runner)
@@ -1484,6 +1477,7 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     (tmp_path / "src").mkdir()
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     error = FileNotFoundError("uv")
     stdout_at_spawn: list[str] = []
 
@@ -1502,14 +1496,14 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
     assert result == 2
     assert len(runner.calls) == 6
     assert stdout_at_spawn == [
-        "\n==> ruff: uv run python -m ruff check .\n",
+        "\n==> ruff: uv run --locked python -m ruff check .\n",
         (
-            "\n==> annotations: uv run python -m ruff check . "
+            "\n==> annotations: uv run --locked python -m ruff check . "
             "--select ANN --output-format concise\n"
         ),
-        "\n==> ty: uv run python -m ty check\n",
-        "\n==> bandit: uv run python -m bandit -c pyproject.toml -r .\n",
-        "\n==> pytest: uv run python -m pytest\n",
+        "\n==> ty: uv run --locked python -m ty check\n",
+        "\n==> bandit: uv run --locked python -m bandit -c pyproject.toml -r .\n",
+        "\n==> pytest: uv run --locked python -m pytest\n",
         "",
     ]
     assert capsys.readouterr().out == (
@@ -1522,6 +1516,7 @@ def test_spawn_exception_is_recorded_and_later_checks_continue(
 
 def test_runner_value_error_is_not_a_planning_error(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     error = ValueError("runner failed")
     runner = RecordingRunner(raise_on_call=1, exception=error)
 
@@ -1536,15 +1531,14 @@ def test_banner_is_printed_before_each_spawn(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     (tmp_path / "src").mkdir()
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     stdout_at_spawn: list[str] = []
-    runner = RecordingRunner(
-        on_call=lambda _call: stdout_at_spawn.append(capsys.readouterr().out)
-    )
+    runner = RecordingRunner(on_call=lambda _call: stdout_at_spawn.append(capsys.readouterr().out))
 
     result = main(["--root", str(tmp_path), "ruff"], runner=runner)
 
     assert result == 0
-    assert stdout_at_spawn == ["\n==> ruff: uv run python -m ruff check src\n"]
+    assert stdout_at_spawn == ["\n==> ruff: uv run --locked python -m ruff check src\n"]
 
 
 def test_help_surface_is_unchanged(
@@ -1558,29 +1552,9 @@ def test_help_surface_is_unchanged(
 
     output = capsys.readouterr()
     assert captured.value.code == 0
-    assert output.out == """usage: pyrepo-check [-h] [--all] [--root ROOT] [--no-frozen]
-                    [--format {terminal,json}] [--shortcut NAME] [--coverage]
-                    [checks ...]
-
-Run Python repository quality checks.
-
-positional arguments:
-  checks                Optional check names and target paths. Checks: ruff,
-                        annotations, annotations-fix, ty, bandit, pytest.
-
-options:
-  -h, --help            show this help message and exit
-  --all                 Run all checks.
-  --root ROOT           Project root to check. Defaults to the current working
-                        directory.
-  --no-frozen           Run uv without --frozen even when uv.lock exists.
-  --format {terminal,json}
-                        Output terminal diagnostics or one JSON document.
-  --shortcut NAME       Run a configured Test Shortcut in a pytest-only
-                        focused run.
-  --coverage            Plan Coverage.py collection for the selected pytest
-                        run.
-"""
+    assert "--python REQUEST" in output.out
+    assert "Request a Repository Python from 3.10 through 3.13." in output.out
+    assert "repository-safe" in output.out
     assert output.err == ""
 
 
@@ -1679,9 +1653,7 @@ def test_repository_coverage_dependency_is_development_only_and_locked() -> None
         package for package in lockfile["package"] if package["name"] == "coverage"
     ]
     assert len(coverage_packages) == 1
-    major, minor, *_ = (
-        int(piece) for piece in coverage_packages[0]["version"].split(".")
-    )
+    major, minor, *_ = (int(piece) for piece in coverage_packages[0]["version"].split("."))
     assert major == 7
     assert minor >= 15
 

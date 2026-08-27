@@ -40,7 +40,6 @@ class ProjectConfig:
     root: Path
     ruff_targets: tuple[str, ...]
     bandit_targets: tuple[str, ...]
-    frozen: bool
     test_shortcuts: tuple[TestShortcut, ...] = ()
     coverage: CoverageConfig | None = None
 
@@ -57,7 +56,7 @@ def _target_exists(root: Path, target: str) -> bool:
     return path.exists() if path.is_absolute() else (root / path).exists()
 
 
-def load_project_config(root: Path, *, no_frozen: bool = False) -> ProjectConfig:
+def load_project_config(root: Path) -> ProjectConfig:
     resolved_root = root.resolve()
     pyproject_path = resolved_root / "pyproject.toml"
     table, coverage = _load_configuration_tables(pyproject_path)
@@ -75,7 +74,6 @@ def load_project_config(root: Path, *, no_frozen: bool = False) -> ProjectConfig
             default_candidates=BANDIT_DEFAULT_CANDIDATES,
             root=resolved_root,
         ),
-        frozen=(resolved_root / "uv.lock").exists() and not no_frozen,
         test_shortcuts=_configured_test_shortcuts(table, root=resolved_root),
         coverage=_configured_coverage(coverage, config_path=pyproject_path),
     )
@@ -126,9 +124,7 @@ def _configured_coverage(
             config_path,
             "[tool.coverage.run] requires a non-empty source, source_pkgs, or source_dirs entry",
         )
-    if "parallel" in run and (
-        not isinstance(run["parallel"], bool) or run["parallel"]
-    ):
+    if "parallel" in run and (not isinstance(run["parallel"], bool) or run["parallel"]):
         _invalid_coverage(
             config_path,
             "[tool.coverage.run].parallel must be false when present",
@@ -137,11 +133,7 @@ def _configured_coverage(
         if key not in run:
             continue
         value = run[key]
-        if (
-            not isinstance(value, list)
-            or not all(isinstance(item, str) for item in value)
-            or value
-        ):
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value) or value:
             _invalid_coverage(
                 config_path,
                 f"[tool.coverage.run].{key} must be an empty list of strings when present",
@@ -176,9 +168,7 @@ def _has_coverage_source(run: dict[str, Any]) -> bool:
 
 
 def _invalid_coverage(config_path: Path, detail: str) -> NoReturn:
-    raise InvalidCoverageConfigError(
-        f"Invalid coverage configuration in {config_path}: {detail}"
-    )
+    raise InvalidCoverageConfigError(f"Invalid coverage configuration in {config_path}: {detail}")
 
 
 def _configured_targets(
@@ -211,16 +201,13 @@ def _configured_test_shortcuts(
     if raw_shortcuts is None:
         return ()
     if not isinstance(raw_shortcuts, dict):
-        raise InvalidTestShortcutError(
-            "[tool.pyrepo-check.test-shortcuts] must be a TOML table"
-        )
+        raise InvalidTestShortcutError("[tool.pyrepo-check.test-shortcuts] must be a TOML table")
 
     shortcuts: list[TestShortcut] = []
     for name, raw_args in raw_shortcuts.items():
         if TEST_SHORTCUT_NAME_PATTERN.fullmatch(name) is None:
             raise InvalidTestShortcutError(
-                f"Invalid Test Shortcut name {name!r}: "
-                "must match [a-z][a-z0-9_-]*"
+                f"Invalid Test Shortcut name {name!r}: must match [a-z][a-z0-9_-]*"
             )
         if (
             not isinstance(raw_args, list)
@@ -228,8 +215,7 @@ def _configured_test_shortcuts(
             or not all(isinstance(arg, str) for arg in raw_args)
         ):
             raise InvalidTestShortcutError(
-                f"Invalid Test Shortcut {name!r}: "
-                "value must be a non-empty list of strings"
+                f"Invalid Test Shortcut {name!r}: value must be a non-empty list of strings"
             )
         pytest_args = tuple(raw_args)
         _validate_test_shortcut(name, pytest_args, root=root)
@@ -250,8 +236,7 @@ def _validate_test_shortcut(
         if token in TEST_SHORTCUT_SELECTORS:
             if token in seen_selectors:
                 raise InvalidTestShortcutError(
-                    f"Invalid Test Shortcut {name!r}: "
-                    f"selector {token} may appear at most once"
+                    f"Invalid Test Shortcut {name!r}: selector {token} may appear at most once"
                 )
             operand_index = index + 1
             if (
@@ -290,8 +275,7 @@ def _validate_test_shortcut_target(name: str, token: str, *, root: Path) -> None
         path = Path(path_text)
         if not path_text or path.is_absolute():
             raise InvalidTestShortcutError(
-                f"Invalid Test Shortcut {name!r}: "
-                f"target must be project-relative: {token}"
+                f"Invalid Test Shortcut {name!r}: target must be project-relative: {token}"
             )
         resolved_root = root.resolve()
         resolved_target = (resolved_root / path).resolve(strict=False)
@@ -299,8 +283,7 @@ def _validate_test_shortcut_target(name: str, token: str, *, root: Path) -> None
         raise
     except (ValueError, OSError, RuntimeError) as error:
         raise InvalidTestShortcutError(
-            f"Invalid Test Shortcut {name!r}: "
-            f"target path cannot be inspected safely: {path_text}"
+            f"Invalid Test Shortcut {name!r}: target path cannot be inspected safely: {path_text}"
         ) from error
     try:
         resolved_target.relative_to(resolved_root)
@@ -314,8 +297,7 @@ def _validate_test_shortcut_target(name: str, token: str, *, root: Path) -> None
         target_exists = False
     except (ValueError, OSError, RuntimeError) as error:
         raise InvalidTestShortcutError(
-            f"Invalid Test Shortcut {name!r}: "
-            f"target path cannot be inspected safely: {path_text}"
+            f"Invalid Test Shortcut {name!r}: target path cannot be inspected safely: {path_text}"
         ) from error
     else:
         target_exists = True

@@ -45,7 +45,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-frozen",
         action="store_true",
-        help="Run uv without --frozen even when uv.lock exists.",
+        help="Recognized for compatibility; repository-safe execution rejects it.",
+    )
+    parser.add_argument(
+        "--python",
+        metavar="REQUEST",
+        help="Request a Repository Python from 3.10 through 3.13.",
     )
     parser.add_argument(
         "--format",
@@ -86,10 +91,11 @@ def main(
         output_format=output_format,
         test_shortcut=args.shortcut,
         coverage_requested=args.coverage,
+        repository_python=args.python,
     )
 
     try:
-        config = load_project_config(request.root, no_frozen=request.no_frozen)
+        config = load_project_config(request.root)
     except InvalidCoverageConfigError as error:
         return _write_planning_error(
             "invalid_project_config",
@@ -124,7 +130,8 @@ def main(
             existing_positionals=collect_existing_positionals(
                 config.root,
                 request.positionals,
-            )
+            ),
+            pyproject_exists=(config.root / "pyproject.toml").is_file(),
         )
         plan = plan_run(request, config, facts)
     except PlanningFailure as error:
@@ -146,11 +153,7 @@ def main(
     try:
         report = build_run_report(config.root, plan, execution)
         validate_report_v1(report)
-        rendered = (
-            serialize_json(report)
-            if output_format == "json"
-            else render_terminal(report)
-        )
+        rendered = serialize_json(report) if output_format == "json" else render_terminal(report)
         exit_code = select_exit_code(report)
     except Exception as error:
         _write_reporting_fallback(error)
@@ -173,11 +176,7 @@ def _write_planning_error(
     try:
         report = build_planning_error_report(code, message, hint=hint)
         validate_report_v1(report)
-        rendered = (
-            serialize_json(report)
-            if output_format == "json"
-            else render_terminal(report)
-        )
+        rendered = serialize_json(report) if output_format == "json" else render_terminal(report)
         exit_code = select_exit_code(report)
     except Exception as error:
         _write_reporting_fallback(error)

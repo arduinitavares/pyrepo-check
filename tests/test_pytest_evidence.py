@@ -8,7 +8,13 @@ from typing import cast
 import pytest
 
 from pyrepo_check.execution import CapturedBytes, ExecutedCheck, ExecutedProcess
-from pyrepo_check.planning import PlannedCheck, PlannedTestScope, PytestExecutionPlan, RunPlan
+from pyrepo_check.planning import (
+    CheckInvocation,
+    DefaultRepositoryPython,
+    PlannedTestScope,
+    PytestExecutionPlan,
+    RunPlan,
+)
 from pyrepo_check.pytest_execution import (
     ArtifactState,
     PreflightClassification,
@@ -162,20 +168,17 @@ def _check(
     cleanup_error: str | None = None,
 ) -> ExecutedCheck:
     cwd = Path("/consumer")
-    planned = PlannedCheck(
+    planned = CheckInvocation(
         name="pytest",
-        command=("consumer-python", "-m", "pytest", "tests"),
-        cwd=cwd,
-        pytest=PytestExecutionPlan(
-            consumer_python=("consumer-python",), pytest_args=("tests",)
-        ),
+        arguments=("tests",),
+        pytest=PytestExecutionPlan(pytest_args=("tests",)),
     )
     trusted_preflight = PytestPreflightObservation(
         "supported", PytestPreflightRecord((3, 13, 15), True, (8, 4, 2)), None
     )
     primary_process = ExecutedProcess(
         role="primary",
-        command=planned.command,
+        command=("uv", "run", "--locked", "python", "-m", "pytest", *planned.arguments),
         cwd=cwd,
         returncode=0,
         duration_ms=1,
@@ -592,8 +595,7 @@ def test_malformed_artifact_preserves_writer_inventory_diagnostic() -> None:
     assert isinstance(result, PytestValidationFailure)
     assert result.code == "artifact_invalid"
     assert result.message == (
-        "pytest artifact is not valid JSON; "
-        "writer marker iteration failed: PermissionError: denied"
+        "pytest artifact is not valid JSON; writer marker iteration failed: PermissionError: denied"
     )
 
 
@@ -865,12 +867,28 @@ def test_each_preflight_specific_code_wins_over_every_lower_observation(
     ("higher", "lower", "expected_code"),
     (
         *(("preflight-spawn", lower, "spawn_failed") for lower in _PREFLIGHT_LATER_DEFECTS),
-        *(("preflight-signal", lower, "terminated_by_signal") for lower in _PREFLIGHT_LATER_DEFECTS),
+        *(
+            ("preflight-signal", lower, "terminated_by_signal")
+            for lower in _PREFLIGHT_LATER_DEFECTS
+        ),
         *(("primary-spawn", lower, "spawn_failed") for lower in _PREFLIGHT_LATER_DEFECTS[2:]),
-        *(("primary-signal", lower, "terminated_by_signal") for lower in _PREFLIGHT_LATER_DEFECTS[2:]),
-        *(("artifact-missing", lower, "artifact_missing") for lower in _MISSING_ARTIFACT_LATER_DEFECTS),
-        *(("artifact-not-finalized", lower, "artifact_not_finalized") for lower in _NOT_FINALIZED_ARTIFACT_LATER_DEFECTS),
-        *((artifact_invalid, lower, "artifact_invalid") for artifact_invalid in _CONTENT_BEARING_ARTIFACT_INVALID_DEFECTS for lower in ("parallelism", "retry", "exit-mismatch")),
+        *(
+            ("primary-signal", lower, "terminated_by_signal")
+            for lower in _PREFLIGHT_LATER_DEFECTS[2:]
+        ),
+        *(
+            ("artifact-missing", lower, "artifact_missing")
+            for lower in _MISSING_ARTIFACT_LATER_DEFECTS
+        ),
+        *(
+            ("artifact-not-finalized", lower, "artifact_not_finalized")
+            for lower in _NOT_FINALIZED_ARTIFACT_LATER_DEFECTS
+        ),
+        *(
+            (artifact_invalid, lower, "artifact_invalid")
+            for artifact_invalid in _CONTENT_BEARING_ARTIFACT_INVALID_DEFECTS
+            for lower in ("parallelism", "retry", "exit-mismatch")
+        ),
         ("parallelism", "retry", "unsupported_parallelism"),
         ("parallelism", "exit-mismatch", "unsupported_parallelism"),
         ("retry", "exit-mismatch", "unsupported_retries"),
@@ -911,7 +929,9 @@ def test_artifact_observations_map_to_artifact_invalid(defect: str) -> None:
     elif defect == "multiple-writers":
         check = replace(
             check,
-            pytest=replace(check.pytest, artifact=replace(check.pytest.artifact, writer_ids=("a", "b"))),
+            pytest=replace(
+                check.pytest, artifact=replace(check.pytest.artifact, writer_ids=("a", "b"))
+            ),
         )
     elif defect == "writer-mismatch":
         document = _artifact_document(check)
@@ -969,6 +989,8 @@ def _plan(check: ExecutedCheck, *, scope: str = "complete") -> RunPlan:
     pytest = check.planned.pytest
     assert pytest is not None
     return RunPlan(
+        root=Path("/consumer"),
+        repository_python=DefaultRepositoryPython(),
         mode="strict_aggregate",
         targets=(),
         checks=(check.planned,),
@@ -978,7 +1000,9 @@ def _plan(check: ExecutedCheck, *, scope: str = "complete") -> RunPlan:
     )
 
 
-def _with_exit(check: ExecutedCheck, exit_code: int, *, stopped_early: bool = False) -> ExecutedCheck:
+def _with_exit(
+    check: ExecutedCheck, exit_code: int, *, stopped_early: bool = False
+) -> ExecutedCheck:
     document = _artifact_document(check)
     session = cast(dict[str, object], document["session"])
     session["exit_code"] = exit_code
@@ -988,7 +1012,9 @@ def _with_exit(check: ExecutedCheck, exit_code: int, *, stopped_early: bool = Fa
 
 
 def test_evidence_null_on_validation_failure_keeps_only_planner_and_incomplete_scope() -> None:
-    result = build_pytest_result(_plan(_check(), scope="partial"), _check_with_defects("artifact-missing"))
+    result = build_pytest_result(
+        _plan(_check(), scope="partial"), _check_with_defects("artifact-missing")
+    )
 
     assert result == PytestResult(
         status="error",
@@ -1021,7 +1047,9 @@ def test_exit_matrix_retains_valid_evidence_when_allowed(
     expected_complete: bool,
     expected_error: str | None,
 ) -> None:
-    result = build_pytest_result(_plan(_check()), _with_exit(_check(), exit_code, stopped_early=stopped_early))
+    result = build_pytest_result(
+        _plan(_check()), _with_exit(_check(), exit_code, stopped_early=stopped_early)
+    )
 
     assert result.status == expected_status
     assert result.complete is expected_complete
@@ -1278,13 +1306,17 @@ def test_scope_classifies_known_neutral_narrowing_unknown_and_collection_reasons
             "gone",
         ]
         collection["uncovered_removed_nodeids"] = ["gone"]
-    result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
+    result = build_pytest_result(
+        _plan(_with_document(check, document)), _with_document(check, document)
+    )
 
     assert result.scope_reasons == expected_reasons
     assert result.scope == ("complete" if not expected_reasons else "partial")
 
 
-def _phases(nodeid: str, call_outcome: str, expected: str, duration: float) -> list[dict[str, object]]:
+def _phases(
+    nodeid: str, call_outcome: str, expected: str, duration: float
+) -> list[dict[str, object]]:
     phases = [
         _phase(nodeid, "setup", "passed", duration, expected="none"),
         _phase(nodeid, "call", call_outcome, duration, expected=expected),
@@ -1293,7 +1325,9 @@ def _phases(nodeid: str, call_outcome: str, expected: str, duration: float) -> l
     return phases
 
 
-def _phase(nodeid: str, when: str, outcome: str, duration: float, *, expected: str) -> dict[str, object]:
+def _phase(
+    nodeid: str, when: str, outcome: str, duration: float, *, expected: str
+) -> dict[str, object]:
     report: dict[str, object] = {
         "nodeid": nodeid,
         "when": when,
@@ -1335,7 +1369,9 @@ def test_scope_accepts_every_frozen_neutral_option_form(args: tuple[str, ...]) -
     options = cast(dict[str, object], document["semantic_options"])
     options["collection_paths"] = []
 
-    result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
+    result = build_pytest_result(
+        _plan(_with_document(check, document)), _with_document(check, document)
+    )
 
     assert result.scope == "complete"
     assert result.scope_reasons == ()
@@ -1365,7 +1401,9 @@ def test_scope_marks_every_known_narrowing_argument(args: tuple[str, ...]) -> No
     options = cast(dict[str, object], document["semantic_options"])
     options["collection_paths"] = []
 
-    result = build_pytest_result(_plan(_with_document(check, document)), _with_document(check, document))
+    result = build_pytest_result(
+        _plan(_with_document(check, document)), _with_document(check, document)
+    )
 
     assert result.scope_reasons == ("effective_narrowing_option",)
 
@@ -1387,7 +1425,9 @@ def test_scope_uses_fixed_reason_order_for_semantic_mutation_and_incomplete_sess
     collection["uncovered_removed_nodeids"] = ["missing"]
     changed = _with_document(check, document)
 
-    result = build_pytest_result(_plan(changed, scope="partial"), _with_exit(changed, 1, stopped_early=True))
+    result = build_pytest_result(
+        _plan(changed, scope="partial"), _with_exit(changed, 1, stopped_early=True)
+    )
 
     assert result.scope_reasons == (
         "planned_selector",
@@ -1493,9 +1533,7 @@ def test_phase_duration_rounding_preserves_exact_small_value_boundaries(
     result = build_pytest_result(_plan(changed), changed)
 
     assert result.evidence is not None
-    assert result.evidence.slowest == (
-        SlowTest("tests/test_ok.py::test_ok", expected_duration_ms),
-    )
+    assert result.evidence.slowest == (SlowTest("tests/test_ok.py::test_ok", expected_duration_ms),)
 
 
 def test_phase_duration_rounding_carries_many_submillisecond_phases() -> None:

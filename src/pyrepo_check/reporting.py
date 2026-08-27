@@ -25,7 +25,7 @@ from pyrepo_check.execution import (
 from pyrepo_check.planning import (
     CheckName,
     OutputFormat,
-    PlannedCheck,
+    CheckInvocation,
     PlannedTestScope,
     PlanningErrorCode,
     RunMode,
@@ -85,6 +85,8 @@ _PLANNING_ERROR_CODES = frozenset(
         "unknown_test_shortcut",
         "unknown_target",
         "coverage_configuration_required",
+        "unsafe_unlocked_execution",
+        "uv_project_required",
         "internal_planning_error",
     )
 )
@@ -466,9 +468,7 @@ def _append_coverage_summary(lines: list[str], coverage: CoverageResult) -> None
         f"{_coverage_threshold_summary(coverage)}"
     )
     files_with_gaps = tuple(
-        file
-        for file in coverage.files
-        if file.statements.missing or file.branches.missing
+        file for file in coverage.files if file.statements.missing or file.branches.missing
     )
     focus_files = files_with_gaps[:_TERMINAL_COVERAGE_FILE_LIMIT]
     rows = [
@@ -502,9 +502,7 @@ def _append_coverage_summary(lines: list[str], coverage: CoverageResult) -> None
         noun = "file" if omitted == 1 else "files"
         lines.append(f"      ... {omitted} more {noun} with gaps")
     if files_with_gaps:
-        lines.append(
-            "    coverage details: use --format json for exact missing lines and branches"
-        )
+        lines.append("    coverage details: use --format json for exact missing lines and branches")
 
 
 def _coverage_threshold_summary(coverage: CoverageResult) -> str:
@@ -591,9 +589,7 @@ def _append_process_diagnostics(
             if not captured.captured or not captured.text:
                 continue
             for line in captured.text.rstrip("\n").splitlines() or [captured.text]:
-                lines.append(
-                    f"    diagnostic: {check.name} {process.role} {stream_name}: {line}"
-                )
+                lines.append(f"    diagnostic: {check.name} {process.role} {stream_name}: {line}")
 
 
 def serialize_json(report: AgentReportV1) -> bytes:
@@ -816,7 +812,9 @@ def _coverage_result_payload(result: CoverageResult | None) -> dict[str, object]
             for file in result.files
         ],
         "error": (
-            None if result.error is None else {"code": result.error.code, "message": result.error.message}
+            None
+            if result.error is None
+            else {"code": result.error.code, "message": result.error.message}
         ),
     }
 
@@ -898,7 +896,9 @@ def _validate_run_report(report: RunReportV1) -> None:
         report.coverage,
         pytest_check,
     )
-    _validate_advisories(report.advisories, report.checks, report.pytest, report.coverage, selection)
+    _validate_advisories(
+        report.advisories, report.checks, report.pytest, report.coverage, selection
+    )
 
     expected_complete = _run_complete(report.checks, report.pytest, report.coverage)
     if (
@@ -1038,8 +1038,7 @@ def _validate_coverage_report_context(
     if coverage.gate_eligible is not policy.gate_eligible:
         _invalid("coverage gate eligibility contradicts report context")
     pytest_parallelism = (
-        pytest_result.error is not None
-        and pytest_result.error.code == "unsupported_parallelism"
+        pytest_result.error is not None and pytest_result.error.code == "unsupported_parallelism"
     )
     coverage_parallelism = (
         coverage.status == "error"
@@ -1065,7 +1064,9 @@ def _validate_coverage_report_context(
     expected_status = (
         "guidance"
         if not policy.gate_eligible
-        else "failed" if coverage.threshold.passed is False else "passed"
+        else "failed"
+        if coverage.threshold.passed is False
+        else "passed"
     )
     if coverage.status != expected_status:
         _invalid("coverage status contradicts report context")
@@ -1107,12 +1108,8 @@ def _validate_coverage_error_processes(
     if roles == _COVERAGE_PREFLIGHT_ROLES:
         coverage_preflight = pytest_check.processes[-1]
         if error.code in _COVERAGE_PREPRIMARY_ERROR_CODES:
-            if (
-                coverage_preflight.outcome != "exited"
-                or (
-                    error.code != "preflight_invalid"
-                    and coverage_preflight.exit_code != 0
-                )
+            if coverage_preflight.outcome != "exited" or (
+                error.code != "preflight_invalid" and coverage_preflight.exit_code != 0
             ):
                 _invalid("typed coverage preflight error contradicts preflight exit")
             return
@@ -1136,10 +1133,7 @@ def _validate_coverage_error_processes(
         coverage_preflight = pytest_check.processes[1]
         if error.code == "unsupported_parallelism":
             _validate_supported_prejson_coverage_error(coverage, coverage_preflight)
-            if (
-                pytest_result.error is None
-                or pytest_result.error.code != "unsupported_parallelism"
-            ):
+            if pytest_result.error is None or pytest_result.error.code != "unsupported_parallelism":
                 _invalid("coverage parallelism error requires matching pytest evidence")
             return
         if (
@@ -1313,10 +1307,7 @@ def _validate_pytest_check_result(
     if (
         coverage_preflight is not None
         and primary is not None
-        and (
-            coverage_preflight.outcome != "exited"
-            or coverage_preflight.exit_code != 0
-        )
+        and (coverage_preflight.outcome != "exited" or coverage_preflight.exit_code != 0)
     ):
         _invalid("pytest primary cannot follow a failed coverage preflight")
     if (
@@ -1600,14 +1591,14 @@ def _validate_pytest_result(result: PytestResult, selection: Selection) -> None:
         _invalid("complete pytest result cannot contain an error")
     if result.complete and result.evidence is None:
         _invalid("complete pytest result requires evidence")
-    if ("planned_selector" in result.scope_reasons) != (
-        selection.planned_test_scope == "partial"
-    ):
+    if ("planned_selector" in result.scope_reasons) != (selection.planned_test_scope == "partial"):
         _invalid("pytest planned_selector must match planned test scope")
     if ("incomplete_session" in result.scope_reasons) != (not result.complete):
         _invalid("pytest incomplete_session must match completeness")
-    if result.error is not None and result.error.code == "session_incomplete" and (
-        result.status != "failed" or result.complete or result.evidence is None
+    if (
+        result.error is not None
+        and result.error.code == "session_incomplete"
+        and (result.status != "failed" or result.complete or result.evidence is None)
     ):
         _invalid("session_incomplete requires incomplete failed evidence")
     _validate_pytest_evidence(result.evidence, complete=result.complete)
@@ -1701,9 +1692,7 @@ def _validate_pytest_evidence(evidence: PytestEvidence | None, *, complete: bool
         _validate_exact_int(item.duration_ms, "pytest special duration_ms")
         if item.duration_ms < 0:
             _invalid("pytest special duration_ms must be non-negative")
-    if len({item.nodeid for item in evidence.special_outcomes}) != len(
-        evidence.special_outcomes
-    ):
+    if len({item.nodeid for item in evidence.special_outcomes}) != len(evidence.special_outcomes):
         _invalid("pytest special outcomes must use unique nodeids")
     if (
         tuple(sorted(evidence.special_outcomes, key=lambda item: item.nodeid))
@@ -1913,9 +1902,11 @@ def _run_complete(
     pytest_result: PytestResult | None,
     coverage: CoverageResult | None,
 ) -> bool:
-    return all(check.status != "error" for check in checks) and (
-        pytest_result is None or pytest_result.complete
-    ) and (coverage is None or coverage.evidence_complete)
+    return (
+        all(check.status != "error" for check in checks)
+        and (pytest_result is None or pytest_result.complete)
+        and (coverage is None or coverage.evidence_complete)
+    )
 
 
 def _build_advisories(
@@ -1975,11 +1966,11 @@ def _build_advisories(
 
 
 def _match_observations(
-    planned_checks: tuple[PlannedCheck, ...],
+    planned_checks: tuple[CheckInvocation, ...],
     executed_checks: tuple[ExecutedCheck, ...],
 ) -> dict[int, ExecutedCheck]:
     matched: dict[int, ExecutedCheck] = {}
-    seen: set[PlannedCheck] = set()
+    seen: set[CheckInvocation] = set()
     next_index = 0
 
     for observation in executed_checks:
@@ -2013,7 +2004,7 @@ def _match_observations(
 
 
 def _build_check_result(
-    planned: PlannedCheck,
+    planned: CheckInvocation,
     observation: ExecutedCheck | None,
     *,
     output_format: OutputFormat,
@@ -2172,11 +2163,7 @@ def _coverage_preflight_prevented_primary(
 ) -> bool:
     if observation is None or observation.coverage is None:
         return False
-    if (
-        result.status != "error"
-        or result.error is None
-        or result.error.code != "not_started"
-    ):
+    if result.status != "error" or result.error is None or result.error.code != "not_started":
         return False
     pytest_preflight = next(
         (process for process in observation.processes if process.role == "pytest_preflight"),

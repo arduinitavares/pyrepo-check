@@ -21,32 +21,67 @@ from pyrepo_check.execution import (
     ExecutionResult,
     execute_plan,
 )
-from pyrepo_check.planning import OutputFormat, PlannedCheck, PytestExecutionPlan, RunPlan
+from pyrepo_check.planning import (
+    CheckInvocation,
+    DefaultRepositoryPython,
+    ExplicitRepositoryPython,
+    OutputFormat,
+    PytestExecutionPlan,
+    RunPlan,
+)
 from tests.support import RecordingRunner
 
 
 def make_plan(tmp_path: Path) -> RunPlan:
     return RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
         mode="focused",
         targets=(),
         checks=(
-            PlannedCheck(
+            CheckInvocation(
                 name="ruff",
-                command=("uv", "run", "python", "-m", "ruff", "check", "src"),
-                cwd=tmp_path,
+                arguments=("check", "src"),
             ),
-            PlannedCheck(
+            CheckInvocation(
                 name="ty",
-                command=("uv", "run", "python", "-m", "ty", "check"),
-                cwd=tmp_path,
+                arguments=("check",),
             ),
         ),
+    )
+
+
+def test_executor_expands_environment_neutral_invocation_into_locked_command(
+    tmp_path: Path,
+) -> None:
+    plan = RunPlan(
+        root=tmp_path,
+        repository_python=ExplicitRepositoryPython("3.12"),
+        mode="focused",
+        targets=("src", "src"),
+        checks=(CheckInvocation("ruff", ("check", "src", "src")),),
+    )
+
+    assert execution.locked_module_command(plan, plan.checks[0]) == (
+        "uv",
+        "run",
+        "--locked",
+        "--python",
+        "3.12",
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "src",
+        "src",
     )
 
 
 def make_json_plan(tmp_path: Path) -> RunPlan:
     plan = make_plan(tmp_path)
     return RunPlan(
+        root=plan.root,
+        repository_python=plan.repository_python,
         mode=plan.mode,
         targets=plan.targets,
         checks=plan.checks,
@@ -61,6 +96,8 @@ def make_single_check_plan(
 ) -> RunPlan:
     plan = make_plan(tmp_path)
     return RunPlan(
+        root=plan.root,
+        repository_python=plan.repository_python,
         mode=plan.mode,
         targets=plan.targets,
         checks=plan.checks[:1],
@@ -70,13 +107,14 @@ def make_single_check_plan(
 
 def make_python_check_plan(tmp_path: Path, source: str) -> RunPlan:
     return RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
         mode="focused",
         targets=(),
         checks=(
-            PlannedCheck(
+            CheckInvocation(
                 name="ruff",
-                command=(sys.executable, "-c", source),
-                cwd=tmp_path,
+                arguments=("check", source),
             ),
         ),
         output_format="json",
@@ -90,19 +128,23 @@ def test_execute_plan_passes_authoritative_plan_to_pytest_execution(
     from pyrepo_check import pytest_execution
 
     pytest_plan = PytestExecutionPlan(
-        consumer_python=("consumer-python",),
         pytest_args=(),
     )
-    check = PlannedCheck(
+    check = CheckInvocation(
         name="pytest",
-        command=("consumer-python", "-m", "pytest"),
-        cwd=tmp_path,
+        arguments=(),
         pytest=pytest_plan,
     )
-    plan = RunPlan(mode="strict_aggregate", targets=(), checks=(check,))
+    plan = RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
+        mode="strict_aggregate",
+        targets=(),
+        checks=(check,),
+    )
 
     def fake_execute_pytest(
-        observed_check: PlannedCheck,
+        observed_check: CheckInvocation,
         *,
         plan: RunPlan | None,
         output_format: OutputFormat,
@@ -195,9 +237,7 @@ class _FakePopen:
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
         effective_timeout = 2.0 if timeout is None else timeout
-        if self.wait_release is not None and not self.wait_release.wait(
-            timeout=effective_timeout
-        ):
+        if self.wait_release is not None and not self.wait_release.wait(timeout=effective_timeout):
             raise subprocess.TimeoutExpired(("fake",), effective_timeout)
         if self.cleanup_errors and timeout is not None:
             raise OSError("synthetic cleanup wait failure")
@@ -245,6 +285,7 @@ def _install_fake_popen(
 
 def test_production_capture_drains_both_pipes_and_retains_exact_raw_tails(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stdout_size = 3 * 1024 * 1024 + 17
     stderr_size = 2 * 1024 * 1024 + 29
@@ -256,6 +297,11 @@ def test_production_capture_drains_both_pipes_and_retains_exact_raw_tails(
         f"b'D' * {CAPTURE_LIMIT_BYTES})\n"
     )
 
+    monkeypatch.setattr(
+        execution,
+        "locked_module_command",
+        lambda _plan, _check: (sys.executable, "-c", source),
+    )
     result = execute_plan(make_python_check_plan(tmp_path, source), runner=None)
 
     process = result.checks[0].processes[0]
@@ -320,8 +366,12 @@ def test_capture_streams_virtual_multimegabyte_output_with_bounded_memory(
     captured = result.checks[0].processes[0]
     assert len(accumulators) == 2
     assert peak_bytes < 4 * 1024 * 1024
-    assert captured.stdout == CapturedBytes(b"x" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES)
-    assert captured.stderr == CapturedBytes(b"y" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES)
+    assert captured.stdout == CapturedBytes(
+        b"x" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES
+    )
+    assert captured.stderr == CapturedBytes(
+        b"y" * CAPTURE_LIMIT_BYTES, total_bytes - CAPTURE_LIMIT_BYTES
+    )
 
 
 def test_stdout_drain_error_becomes_typed_process_failure(
@@ -363,9 +413,7 @@ def test_drain_error_aborts_before_blocking_wait_and_reaps_child(
     result_holder: list[ExecutionResult] = []
 
     def invoke() -> None:
-        result_holder.append(
-            execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None)
-        )
+        result_holder.append(execute_plan(make_python_check_plan(tmp_path, "unused"), runner=None))
         completed.set()
 
     watchdog = threading.Thread(target=invoke)
@@ -417,6 +465,11 @@ def test_reader_start_failure_returns_promptly_when_descendant_retains_pipe(
             assert ready_path.exists(), "child/descendant readiness handshake failed"
 
     monkeypatch.setattr(execution.threading, "Thread", FailSecondStartThread)
+    monkeypatch.setattr(
+        execution,
+        "locked_module_command",
+        lambda _plan, _check: (sys.executable, "-c", source),
+    )
     completed = threading.Event()
     result_holder: list[ExecutionResult] = []
 
@@ -807,29 +860,35 @@ def test_injected_buffered_runner_output_is_normalized_immediately(
 
 def test_production_spawn_failure_and_signal_preserve_continuation_and_exit_order(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    missing = PlannedCheck(
+    missing = CheckInvocation(
         name="ruff",
-        command=(str(tmp_path / "missing-executable"),),
-        cwd=tmp_path,
+        arguments=("check",),
     )
-    signaled = PlannedCheck(
+    signaled = CheckInvocation(
         name="ty",
-        command=(
-            sys.executable,
-            "-c",
-            f"import os; os.kill(os.getpid(), {signal.SIGTERM})",
-        ),
-        cwd=tmp_path,
+        arguments=("check",),
     )
-    completed = PlannedCheck(
+    completed = CheckInvocation(
         name="bandit",
-        command=(sys.executable, "-c", "raise SystemExit(7)"),
-        cwd=tmp_path,
+        arguments=("-c", "pyproject.toml"),
     )
 
+    raw_commands = {
+        "ruff": (str(tmp_path / "missing-executable"),),
+        "ty": (sys.executable, "-c", f"import os; os.kill(os.getpid(), {signal.SIGTERM})"),
+        "bandit": (sys.executable, "-c", "raise SystemExit(7)"),
+    }
+    monkeypatch.setattr(
+        execution,
+        "locked_module_command",
+        lambda _plan, check: raw_commands[check.name],
+    )
     result = execute_plan(
         RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
             mode="focused",
             targets=(),
             checks=(missing, signaled, completed),
@@ -848,16 +907,31 @@ def test_production_spawn_failure_and_signal_preserve_continuation_and_exit_orde
 
 def test_production_terminal_output_remains_inherited(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    check = PlannedCheck(
+    check = CheckInvocation(
         name="ruff",
-        command=(sys.executable, "-c", "import os; os.write(1, b'inherited-output\\n')"),
-        cwd=tmp_path,
+        arguments=("check",),
     )
 
+    monkeypatch.setattr(
+        execution,
+        "locked_module_command",
+        lambda _plan, _check: (
+            sys.executable,
+            "-c",
+            "import os; os.write(1, b'inherited-output\\n')",
+        ),
+    )
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(check,)),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(check,),
+        ),
         runner=None,
     )
 
@@ -874,16 +948,18 @@ def test_zero_return_codes_produce_exit_zero(tmp_path: Path) -> None:
 
     assert isinstance(result, ExecutionResult)
     assert result.exit_code == 0
-    assert tuple(
-        process.returncode for check in result.checks for process in check.processes
-    ) == (0, 0)
+    assert tuple(process.returncode for check in result.checks for process in check.processes) == (
+        0,
+        0,
+    )
     assert all(
         len(check.processes) == 1
         and check.pytest is None
         and isinstance(check.processes[0], ExecutedProcess)
         and check.processes[0].role == "primary"
-        and check.processes[0].command == check.planned.command
-        and check.processes[0].cwd == check.planned.cwd
+        and check.processes[0].command
+        == execution.locked_module_command(make_plan(tmp_path), check.planned)
+        and check.processes[0].cwd == tmp_path
         for check in result.checks
     )
 
@@ -895,13 +971,13 @@ def test_terminal_commands_run_in_plan_order_with_exact_arguments(tmp_path: Path
 
     assert runner.calls == [
         runner.calls[0].__class__(
-            command=("uv", "run", "python", "-m", "ruff", "check", "src"),
+            command=("uv", "run", "--locked", "python", "-m", "ruff", "check", "src"),
             cwd=tmp_path,
             check=False,
             capture_output=False,
         ),
         runner.calls[1].__class__(
-            command=("uv", "run", "python", "-m", "ty", "check"),
+            command=("uv", "run", "--locked", "python", "-m", "ty", "check"),
             cwd=tmp_path,
             check=False,
             capture_output=False,
@@ -921,8 +997,8 @@ def test_terminal_banner_is_printed_before_spawn(
     execute_plan(make_plan(tmp_path), runner=RecordingRunner(on_call=on_call))
 
     assert events == [
-        "\n==> ruff: uv run python -m ruff check src\n",
-        "\n==> ty: uv run python -m ty check\n",
+        "\n==> ruff: uv run --locked python -m ruff check src\n",
+        "\n==> ty: uv run --locked python -m ty check\n",
     ]
 
 
@@ -1042,9 +1118,10 @@ def test_negative_return_codes_are_recorded_and_later_checks_run(tmp_path: Path)
 
     result = execute_plan(make_plan(tmp_path), runner=runner)
 
-    assert tuple(
-        process.returncode for check in result.checks for process in check.processes
-    ) == (-9, 4)
+    assert tuple(process.returncode for check in result.checks for process in check.processes) == (
+        -9,
+        4,
+    )
     assert result.exit_code == 4
     assert len(runner.calls) == 2
 

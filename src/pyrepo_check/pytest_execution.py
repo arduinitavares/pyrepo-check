@@ -28,6 +28,7 @@ from pyrepo_check.execution import (
     ExecutedProcess,
     ProcessRunner,
     execute_process,
+    locked_python_command,
 )
 from pyrepo_check.coverage_execution import (
     CoverageArtifactObservation,
@@ -46,9 +47,8 @@ from pyrepo_check.coverage_execution import (
     snapshot_coverage_json,
     verify_coverage_data_snapshot,
 )
-from pyrepo_check.planning import CoverageExecutionPlan, OutputFormat, PlannedCheck, RunPlan
+from pyrepo_check.planning import CheckInvocation, CoverageExecutionPlan, OutputFormat, RunPlan
 from pyrepo_check.pytest_evidence import build_pytest_result
-
 
 
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -123,11 +123,10 @@ class PytestExecutionObservation:
     cleanup_error: str | None
 
 
-
 def execute_pytest(
-    check: PlannedCheck,
+    check: CheckInvocation,
     *,
-    plan: RunPlan | None = None,
+    plan: RunPlan,
     output_format: OutputFormat,
     runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
@@ -135,11 +134,9 @@ def execute_pytest(
     """Run the consumer preflight probe and retain its typed observation."""
     pytest_plan = check.pytest
     if pytest_plan is None:
-        raise ValueError("pytest execution requires PlannedCheck.pytest metadata")
+        raise ValueError("pytest execution requires CheckInvocation.pytest metadata")
     artifact = PytestArtifactObservation("not_attempted", None, (), None)
     coverage_plan = pytest_plan.coverage
-    if coverage_plan is not None and plan is None:
-        raise ValueError("planned coverage report generation requires RunPlan")
     coverage: CoverageExecutionObservation | None = (
         invalid_coverage_observation("coverage execution setup did not run")
         if coverage_plan is not None
@@ -170,7 +167,7 @@ def execute_pytest(
             coverage=coverage,
         )
     try:
-        run_directory = execution_workspace.create_run_workspace(check.cwd)
+        run_directory = execution_workspace.create_run_workspace(plan.root)
     except OSError as error:
         if coverage_plan is not None:
             coverage = invalid_coverage_observation(f"{type(error).__name__}: {error}")
@@ -216,8 +213,8 @@ def execute_pytest(
         )
         verified_run.verify("immediately before preflight")
         process = _run_preflight(
-            command=(*pytest_plan.consumer_python, "-c", _PREFLIGHT_PROBE),
-            cwd=check.cwd,
+            command=(*locked_python_command(plan), "-c", _PREFLIGHT_PROBE),
+            cwd=plan.root,
             runner=runner,
             clock_ns=clock_ns,
             environment=environment,
@@ -246,10 +243,8 @@ def execute_pytest(
                     else:
                         coverage_process = execute_process(
                             role="coverage_preflight",
-                            command=coverage_preflight_command(
-                                coverage_plan.consumer_python
-                            ),
-                            cwd=check.cwd,
+                            command=coverage_preflight_command(locked_python_command(plan)),
+                            cwd=plan.root,
                             capture_output=True,
                             runner=runner,
                             clock_ns=clock_ns,
@@ -259,9 +254,7 @@ def execute_pytest(
                         coverage_preflight = classify_coverage_preflight(coverage_process)
                         coverage = CoverageExecutionObservation(
                             preflight=coverage_preflight,
-                            artifact=CoverageArtifactObservation(
-                                "not_attempted", None, None
-                            ),
+                            artifact=CoverageArtifactObservation("not_attempted", None, None),
                         )
                         try:
                             verified_run.verify("after coverage preflight")
@@ -277,13 +270,13 @@ def execute_pytest(
                     processes.append(
                         _run_primary(
                             command=coverage_primary_command(
-                                consumer_python=coverage_plan.consumer_python,
+                                python_prefix=locked_python_command(plan),
                                 config_path=coverage_plan.config_path.resolve(),
                                 run_directory=run_directory.path,
                                 plugin_module=plugin_module,
                                 pytest_args=pytest_plan.pytest_args,
                             ),
-                            cwd=check.cwd,
+                            cwd=plan.root,
                             runner=runner,
                             clock_ns=clock_ns,
                             environment=coverage_env,
@@ -293,9 +286,7 @@ def execute_pytest(
                     try:
                         verified_run.verify("after coverage pytest primary")
                     except OSError as error:
-                        artifact = PytestArtifactObservation(
-                            "unsafe_path", None, (), str(error)
-                        )
+                        artifact = PytestArtifactObservation("unsafe_path", None, (), str(error))
                     else:
                         artifact = _snapshot_artifact(
                             artifact_path,
@@ -313,8 +304,6 @@ def execute_pytest(
                             pytest=interim_pytest,
                             coverage=coverage,
                         )
-                        if plan is None:
-                            raise AssertionError("coverage RunPlan is unavailable")
                         pytest_result = build_pytest_result(plan, interim_check)
                         if (
                             pytest_result.error is not None
@@ -340,13 +329,13 @@ def execute_pytest(
                                 coverage_close_error,
                             ) = _generate_coverage_json(
                                 verified_run=verified_run,
+                                plan=plan,
                                 coverage_plan=coverage_plan,
                                 check=check,
                                 base_environment=coverage_env,
                                 force_fail_under_zero=policy.force_fail_under_zero,
                                 retain_threshold_exit_two=(
-                                    policy.gate_eligible
-                                    and policy.skipped_reason is None
+                                    policy.gate_eligible and policy.skipped_reason is None
                                 ),
                                 runner=runner,
                                 clock_ns=clock_ns,
@@ -367,10 +356,7 @@ def execute_pytest(
                                     else None
                                 ),
                             )
-                elif (
-                    coverage is not None
-                    and coverage.preflight.classification == "supported"
-                ):
+                elif coverage is not None and coverage.preflight.classification == "supported":
                     coverage = CoverageExecutionObservation(
                         preflight=coverage.preflight,
                         artifact=CoverageArtifactObservation(
@@ -383,14 +369,14 @@ def execute_pytest(
                 processes.append(
                     _run_primary(
                         command=(
-                            *pytest_plan.consumer_python,
+                            *locked_python_command(plan),
                             "-m",
                             "pytest",
                             "-p",
                             plugin_module,
                             *pytest_plan.pytest_args,
                         ),
-                        cwd=check.cwd,
+                        cwd=plan.root,
                         runner=runner,
                         clock_ns=clock_ns,
                         environment=environment,
@@ -428,7 +414,7 @@ def execute_pytest(
         try:
             cleanup_observation = execution_workspace.remove_run_workspace(
                 run_directory,
-                repository_root=check.cwd,
+                repository_root=plan.root,
                 clock_ns=clock_ns,
             )
         except OSError as error:
@@ -496,8 +482,9 @@ def _run_primary(
 def _generate_coverage_json(
     *,
     verified_run: execution_workspace.VerifiedRunWorkspace,
+    plan: RunPlan,
     coverage_plan: CoverageExecutionPlan,
-    check: PlannedCheck,
+    check: CheckInvocation,
     base_environment: Mapping[str, str],
     force_fail_under_zero: bool,
     retain_threshold_exit_two: bool,
@@ -535,13 +522,13 @@ def _generate_coverage_json(
             process = execute_process(
                 role="coverage_json",
                 command=coverage_json_command(
-                    consumer_python=coverage_plan.consumer_python,
+                    python_prefix=locked_python_command(plan),
                     config_path=config_path,
                     data_path=snapshot.data_path,
                     output_path=verified_run.workspace.path / "coverage.json",
                     force_fail_under_zero=force_fail_under_zero,
                 ),
-                cwd=check.cwd,
+                cwd=plan.root,
                 capture_output=True,
                 runner=runner,
                 clock_ns=clock_ns,
@@ -642,7 +629,6 @@ def _copy_plugin_source(
         os.close(descriptor)
 
 
-
 def _isolated_environment(
     run_directory: Path,
     artifact_path: Path,
@@ -657,9 +643,7 @@ def _isolated_environment(
     existing_pythonpath = environment.get("PYTHONPATH")
     plugin_path = str(run_directory)
     environment["PYTHONPATH"] = (
-        f"{existing_pythonpath}{os.pathsep}{plugin_path}"
-        if existing_pythonpath
-        else plugin_path
+        f"{existing_pythonpath}{os.pathsep}{plugin_path}" if existing_pythonpath else plugin_path
     )
     environment["PYREPO_CHECK_PYTEST_JSON"] = str(artifact_path)
     environment["PYREPO_CHECK_PYTEST_WRITER_DIR"] = str(writer_directory)
@@ -744,9 +728,7 @@ def _snapshot_writer_ids(
                     try:
                         loaded_document = _load_bounded_json(
                             _read_regular_file(
-                                Path(entry.path)
-                                if writer_descriptor is None
-                                else Path(entry.name),
+                                Path(entry.path) if writer_descriptor is None else Path(entry.name),
                                 max_bytes=_MAX_WRITER_MARKER_BYTES,
                                 dir_fd=writer_descriptor,
                             )
@@ -778,8 +760,7 @@ def _snapshot_writer_ids(
                         continue
                     if not isinstance(document_writer_id, str):
                         diagnostics.append(
-                            f"writer marker is malformed: {entry.name}: "
-                            "writer_id must be a string"
+                            f"writer marker is malformed: {entry.name}: writer_id must be a string"
                         )
                         continue
                     if type(pid) is not int or pid < 0:
@@ -794,9 +775,7 @@ def _snapshot_writer_ids(
                     writer_id = marker_id
         except OSError as error:
             retained_ids = (writer_id,) if writer_id is not None else ()
-            qualification = (
-                f" after validated writer {writer_id}" if writer_id is not None else ""
-            )
+            qualification = f" after validated writer {writer_id}" if writer_id is not None else ""
             diagnostics.append(
                 f"writer inventory failed{qualification}: {type(error).__name__}: {error}"
             )
@@ -824,7 +803,6 @@ def _marker_id(name: str) -> str | None:
     return marker_id
 
 
-
 def _combine_diagnostic(first: str | None, second: str) -> str:
     return f"{first}; {second}" if first else second
 
@@ -844,7 +822,10 @@ def _classify_preflight(process: ExecutedProcess) -> PytestPreflightObservation:
             None,
             f"preflight exited with code {process.returncode}",
         )
-    if any(stream is not None and stream.omitted_bytes > 0 for stream in (process.stdout, process.stderr)):
+    if any(
+        stream is not None and stream.omitted_bytes > 0
+        for stream in (process.stdout, process.stderr)
+    ):
         return PytestPreflightObservation(
             "preflight_invalid",
             None,

@@ -14,8 +14,9 @@ import pytest
 from pyrepo_check.execution import CapturedBytes, ExecutedCheck, ExecutedProcess, execute_plan
 from pyrepo_check.planning import (
     CoverageExecutionPlan,
+    DefaultRepositoryPython,
     OutputFormat,
-    PlannedCheck,
+    CheckInvocation,
     PytestExecutionPlan,
     RunPlan,
     RunMode,
@@ -117,6 +118,7 @@ def test_coverage_data_missing_or_unusable_base_fails_closed(
 
     def call() -> coverage_execution.CoverageDataSnapshot:
         return _prepare_coverage_data(run_directory)
+
     try:
         with pytest.raises(coverage_execution.CoverageDataError) as raised:
             if base_kind == "fifo":
@@ -453,8 +455,20 @@ def _document(
 @pytest.mark.parametrize(
     ("stdout", "returncode", "spawn_error", "classification", "version"),
     [
-        (_document(python_version=[3, 13, 14], coverage_available=False, coverage_version=None), 0, None, "unsupported_python", None),
-        (_document(coverage_available=False, coverage_version=None), 0, None, "module_unavailable", None),
+        (
+            _document(python_version=[3, 13, 14], coverage_available=False, coverage_version=None),
+            0,
+            None,
+            "unsupported_python",
+            None,
+        ),
+        (
+            _document(coverage_available=False, coverage_version=None),
+            0,
+            None,
+            "module_unavailable",
+            None,
+        ),
         (_document(coverage_version="7.15"), 0, None, "supported", "7.15"),
         (_document(coverage_version="7.15.2"), 0, None, "supported", "7.15.2"),
         (_document(coverage_version="7.99.0"), 0, None, "supported", "7.99.0"),
@@ -526,12 +540,7 @@ def test_coverage_preflight_rejects_duplicate_raw_required_members(member: str) 
         "coverage_version": b'"7.15.2"',
     }
     duplicate = (
-        _document()[:-1]
-        + b","
-        + json.dumps(member).encode()
-        + b":"
-        + encoded_values[member]
-        + b"}"
+        _document()[:-1] + b"," + json.dumps(member).encode() + b":" + encoded_values[member] + b"}"
     )
 
     observation = coverage_execution.classify_coverage_preflight(_process(stdout=duplicate))
@@ -560,7 +569,7 @@ def test_coverage_preflight_fails_closed_on_an_oversized_stable_version() -> Non
 def test_coverage_probe_is_python_37_compatible_and_reads_python_first() -> None:
     probe = coverage_execution.COVERAGE_PREFLIGHT_PROBE
 
-    assert "f\"" not in probe
+    assert 'f"' not in probe
     assert probe.index("sys.version_info") < probe.index("import coverage")
     assert 'separators=(",", ":")' in probe
 
@@ -573,21 +582,18 @@ def _coverage_check(
     tmp_path: Path,
     *,
     fail_under: int | float | None = None,
-) -> PlannedCheck:
+) -> CheckInvocation:
     config_path = tmp_path / "pyproject.toml"
     pytest_plan = PytestExecutionPlan(
-        consumer_python=("consumer-python",),
         pytest_args=("tests",),
         coverage=CoverageExecutionPlan(
-            consumer_python=("consumer-python",),
             config_path=config_path,
             fail_under=fail_under,
         ),
     )
-    return PlannedCheck(
+    return CheckInvocation(
         name="pytest",
-        command=("consumer-python", "-m", "pytest", "tests"),
-        cwd=tmp_path,
+        arguments=("tests",),
         pytest=pytest_plan,
     )
 
@@ -623,7 +629,14 @@ def test_coverage_execution_orders_preflights_then_runs_one_instrumented_pytest(
         )
 
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(_coverage_check(tmp_path),), output_format="json"),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(_coverage_check(tmp_path),),
+            output_format="json",
+        ),
         runner=runner,
     )
 
@@ -634,11 +647,11 @@ def test_coverage_execution_orders_preflights_then_runs_one_instrumented_pytest(
         "primary",
     ]
     assert [command for command, _environment in calls][2].count("-m") == 2
-    assert calls[2][0][1:5] == ("-m", "coverage", "run", f"--rcfile={tmp_path / 'pyproject.toml'}")
+    assert calls[2][0][4:8] == ("-m", "coverage", "run", f"--rcfile={tmp_path / 'pyproject.toml'}")
     coverage_environment = calls[2][1]
     assert coverage_environment is not None
-    assert calls[2][0][5] == f"--data-file={coverage_environment['COVERAGE_FILE']}"
-    assert calls[2][0][6:10] == ("-m", "pytest", "-p", calls[2][0][9])
+    assert calls[2][0][8] == f"--data-file={coverage_environment['COVERAGE_FILE']}"
+    assert calls[2][0][9:13] == ("-m", "pytest", "-p", calls[2][0][12])
     assert sum(command.count("pytest") for command, _environment in calls) == 1
     assert calls[0][1] is not None and "COVERAGE_PROCESS_START" not in calls[0][1]
     for _command, environment in calls[1:]:
@@ -736,10 +749,12 @@ def _coverage_run_plan(
             raise AssertionError("pytest plan is unavailable")
         check = replace(
             check,
-            command=("consumer-python", "-m", "pytest"),
+            arguments=(),
             pytest=replace(check.pytest, pytest_args=()),
         )
     return RunPlan(
+        root=tmp_path,
+        repository_python=DefaultRepositoryPython(),
         mode=cast(RunMode, mode),
         targets=targets,
         checks=(check,),
@@ -784,7 +799,7 @@ def _run_coverage_json_case(
                 CompletedProcess[tuple[str, ...]],
                 CompletedProcess(command, 0, stdout=_pytest_document(), stderr=b""),
             )
-        if "run" in command:
+        if "coverage" in command and command[command.index("coverage") + 1] == "run":
             assert env is not None
             Path(env["COVERAGE_FILE"]).write_bytes(b"sqlite-evidence")
             Path(env["PYREPO_CHECK_PYTEST_JSON"]).write_bytes(
@@ -808,8 +823,9 @@ def _run_coverage_json_case(
         if coverage_json_content is not None:
             output_path.write_bytes(coverage_json_content)
         data_path = Path(
-            next(argument for argument in command if argument.startswith("--data-file="))
-            .removeprefix("--data-file=")
+            next(
+                argument for argument in command if argument.startswith("--data-file=")
+            ).removeprefix("--data-file=")
         )
         if during_coverage_json is not None:
             during_coverage_json(output_path.parent, data_path)
@@ -867,7 +883,7 @@ def test_coverage_json_fail_under_policy_uses_finalized_pytest_result(
     roles = [process.role for process in observation.processes]
     assert roles == ["pytest_preflight", "coverage_preflight", "primary", "coverage_json"]
     command, captured, environment = calls[-1]
-    assert command[:4] == ("consumer-python", "-m", "coverage", "json")
+    assert command[:7] == ("uv", "run", "--locked", "python", "-m", "coverage", "json")
     assert ("--fail-under=0" in command) is expect_fail_under_zero
     assert "--keep-combined" in command
     data_argument = next(argument for argument in command if argument.startswith("--data-file="))
@@ -1184,14 +1200,25 @@ def test_coverage_preflight_runs_after_a_non_spawn_pytest_preflight_failure(tmp_
     ) -> CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output, env
         calls.append(command)
-        stdout = _coverage_document() if command[-1] == coverage_execution.COVERAGE_PREFLIGHT_PROBE else b"bad"
+        stdout = (
+            _coverage_document()
+            if command[-1] == coverage_execution.COVERAGE_PREFLIGHT_PROBE
+            else b"bad"
+        )
         return cast(
             CompletedProcess[tuple[str, ...]],
             CompletedProcess(command, 0, stdout=stdout, stderr=b""),
         )
 
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(_coverage_check(tmp_path),), output_format="json"),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(_coverage_check(tmp_path),),
+            output_format="json",
+        ),
         runner=runner,
     )
 
@@ -1222,7 +1249,14 @@ def test_coverage_preflight_is_not_attempted_after_pytest_preflight_spawn_failur
         raise FileNotFoundError("consumer-python")
 
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(_coverage_check(tmp_path),), output_format="json"),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(_coverage_check(tmp_path),),
+            output_format="json",
+        ),
         runner=runner,
     )
 
@@ -1245,14 +1279,25 @@ def test_unsupported_coverage_preflight_prevents_a_primary_fallback(tmp_path: Pa
     ) -> CompletedProcess[tuple[str, ...]]:
         del cwd, check, capture_output, env
         calls.append(command)
-        stdout = _coverage_document(version="7.14.9") if command[-1] == coverage_execution.COVERAGE_PREFLIGHT_PROBE else _pytest_document()
+        stdout = (
+            _coverage_document(version="7.14.9")
+            if command[-1] == coverage_execution.COVERAGE_PREFLIGHT_PROBE
+            else _pytest_document()
+        )
         return cast(
             CompletedProcess[tuple[str, ...]],
             CompletedProcess(command, 0, stdout=stdout, stderr=b""),
         )
 
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(_coverage_check(tmp_path),), output_format="json"),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(_coverage_check(tmp_path),),
+            output_format="json",
+        ),
         runner=runner,
     )
 
@@ -1284,7 +1329,14 @@ def test_workspace_capability_failure_attempts_no_preflight_and_retains_coverage
         raise AssertionError("runner must not be called")
 
     result = execute_plan(
-        RunPlan(mode="focused", targets=(), checks=(_coverage_check(tmp_path),), output_format="json"),
+        RunPlan(
+            root=tmp_path,
+            repository_python=DefaultRepositoryPython(),
+            mode="focused",
+            targets=(),
+            checks=(_coverage_check(tmp_path),),
+            output_format="json",
+        ),
         runner=runner,
     )
 
