@@ -65,7 +65,10 @@ from pyrepo_check.reporting_schema import (
     Selection,
     validate_report_structure_v2,
 )
-from pyrepo_check.repository_environment import SUPPORTED_DEPENDENCIES
+from pyrepo_check.repository_environment import (
+    SUPPORTED_DEPENDENCIES,
+    dependency_version_supported,
+)
 
 
 _CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -296,12 +299,7 @@ def _validate_run_report_v2(report: RunReportV2) -> None:
             coverage_dependency=dependencies.get("coverage") if check.name == "pytest" else None,
             coverage_requested=coverage_expected if check.name == "pytest" else False,
         )
-    expected_advisories = _build_advisories(
-        cast(tuple[CheckResult, ...], report.checks),
-        report.pytest,
-        report.coverage,
-        report.selection.planned_coverage_scope,
-    )
+    expected_advisories = _build_advisories_v2(report)
     if report.advisories != expected_advisories:
         _invalid("advisories must exactly match v2 report evidence")
 
@@ -355,6 +353,7 @@ def _validate_environment_state_v2(
     *,
     project_root: str,
 ) -> None:
+    _validate_pre_execution_stage_v2(environment)
     uv_process = next((item for item in environment.processes if item.role == "uv_version"), None)
     probe = next(
         (item for item in environment.processes if item.role == "environment_probe"), None
@@ -407,6 +406,102 @@ def _validate_environment_state_v2(
             or environment.processes[-1].cwd != project_root
         ):
             _invalid("tracked_files requires canonical successful final safety evidence")
+
+
+def _validate_pre_execution_stage_v2(
+    environment: RepositoryEnvironmentEvidence,
+) -> None:
+    error = environment.error
+    if error is None or error.code == "repository_state_changed":
+        return
+    if any(
+        dependency.status != "unobserved"
+        or dependency.process is not None
+        or dependency.error is not None
+        for dependency in environment.dependencies
+    ):
+        _invalid("environment-wide failure cannot claim dependency probe evidence")
+    core_roles = tuple(
+        process.role
+        for process in environment.processes
+        if process.role != "repository_safety"
+    )
+    if error.code == "repository_lock_missing":
+        if (
+            environment.lock.status != "missing"
+            or environment.processes
+            or environment.manager_version is not None
+            or environment.path is not None
+            or environment.python is not None
+            or environment.mutation_protection != "unobserved"
+        ):
+            _invalid("repository_lock_missing must stop before every process")
+        return
+    if error.code == "uv_unavailable":
+        if (
+            core_roles != ("uv_version",)
+            or environment.lock.status != "unverified"
+            or environment.manager_version is not None
+            or environment.path is not None
+            or environment.python is not None
+        ):
+            _invalid("uv_unavailable contradicts preparation stage evidence")
+        return
+    if error.code == "repository_environment_failed" and (
+        core_roles != ("uv_version", "environment_probe")
+        or environment.lock.status != "unverified"
+        or environment.manager_version is None
+        or environment.path is not None
+        or environment.python is not None
+    ):
+        _invalid("repository_environment_failed contradicts probe-stage evidence")
+    if error.code == "repository_python_unsupported" and (
+        core_roles != ("uv_version", "environment_probe")
+        or environment.lock.status != "current"
+        or environment.manager_version is None
+        or environment.path is None
+        or environment.python is None
+    ):
+        _invalid("repository_python_unsupported requires observed probe evidence")
+    if error.code == "environment_evidence_invalid":
+        uv_evidence_failure = (
+            core_roles == ("uv_version",)
+            and environment.lock.status == "unverified"
+            and environment.manager_version is None
+            and environment.path is None
+            and environment.python is None
+        )
+        probe_evidence_failure = (
+            core_roles == ("uv_version", "environment_probe")
+            and environment.manager_version is not None
+            and (
+                environment.lock.status == "unverified"
+                and environment.path is None
+                and environment.python is None
+                or environment.lock.status == "current"
+                and environment.path is not None
+                and environment.python is not None
+            )
+        )
+        if not (uv_evidence_failure or probe_evidence_failure):
+            _invalid("environment_evidence_invalid contradicts preparation stage")
+    if error.code == "unsafe_repository_environment":
+        before_process = (
+            not core_roles
+            and environment.lock.status == "unverified"
+            and environment.manager_version is None
+            and environment.path is None
+            and environment.python is None
+        )
+        after_probe = (
+            core_roles == ("uv_version", "environment_probe")
+            and environment.lock.status == "current"
+            and environment.manager_version is not None
+            and environment.path is not None
+            and environment.python is not None
+        )
+        if not (before_process or after_probe):
+            _invalid("unsafe_repository_environment contradicts preparation stage")
 
 
 def _expected_dependency_names_v2(selection: Selection) -> tuple[str, ...]:
@@ -493,6 +588,10 @@ def _validate_dependency_evidence_v2(
             or dependency.origin is None
             or not _successful_process(process)
             or dependency.error is not None
+            or not dependency_version_supported(
+                SUPPORTED_DEPENDENCIES[dependency.name],
+                dependency.version,
+            )
         ):
             _invalid("available dependency evidence is incomplete")
         return
@@ -714,7 +813,12 @@ def _validate_ordinary_check_v2(
         if (
             check.status != "error"
             or check.error is None
-            or check.error.code not in {"missing_primary_process", "cleanup_failed"}
+            or check.error.code
+            not in {
+                "missing_primary_process",
+                "cleanup_failed",
+                "check_start_evidence_invalid",
+            }
             or start is not None
             or check.execution_environment is not None
             or check.analysis_python_authority is not None
@@ -814,15 +918,26 @@ def _validate_pytest_check_v2(
         if (
             check.status != "error"
             or check.error is None
-            or check.error.code not in {"missing_primary_process", "cleanup_failed"}
+            or check.error.code
+            not in {
+                "missing_primary_process",
+                "cleanup_failed",
+                "check_start_evidence_invalid",
+                "pytest_evidence_error",
+            }
             or check.start_evidence is not None
         ):
             _invalid("pytest without a primary process requires a setup error")
         if result.exit_code is not None or result.evidence is not None or result.complete:
             _invalid("pytest setup error cannot claim primary evidence")
+        marker_preparation = (
+            check.error is not None
+            and check.error.code == "check_start_evidence_invalid"
+        )
         if (
             result.status != "error"
-            or result.pytest_version is not None
+            or result.pytest_version
+            != (dependency.version if marker_preparation else None)
             or result.error is None
             or result.error.code != "not_started"
         ):
@@ -896,7 +1011,7 @@ def _validate_pytest_check_v2(
             or check.error.code != "check_execution_failed"
         ):
             _invalid("pytest launcher failure requires check_execution_failed")
-    elif result.error is None:
+    elif result.error is None or result.error.code == "session_incomplete":
         if check.status != result.status or check.error is not None:
             _invalid("pytest Check must exactly match completed pytest evidence")
     else:
@@ -1006,7 +1121,11 @@ def _validate_coverage_correlation_v2(
         ):
             _invalid("incomplete instrumented pytest requires Coverage error evidence")
         return
-    if not pytest_result.complete and coverage_json is not None:
+    session_incomplete = (
+        pytest_result.error is not None
+        and pytest_result.error.code == "session_incomplete"
+    )
+    if not pytest_result.complete and not session_incomplete and coverage_json is not None:
         _invalid("Coverage JSON cannot follow incomplete pytest evidence")
     if coverage.status != "error":
         if coverage_json is None:
@@ -1084,7 +1203,13 @@ def _successful_process(process: ProcessResult | None) -> bool:
         process is not None
         and process.outcome == "exited"
         and process.exit_code == 0
+        and _complete_captured_output(process.stdout)
+        and _complete_captured_output(process.stderr)
     )
+
+
+def _complete_captured_output(captured: CapturedText) -> bool:
+    return captured.captured and not captured.truncated and captured.omitted_bytes == 0
 
 
 def _run_complete_v2(report: RunReportV2) -> bool:
@@ -2785,6 +2910,51 @@ def _build_advisories(
                 None,
             )
         )
+    unique = {(advisory.code, advisory.message): advisory for advisory in advisories}
+    return tuple(sorted(unique.values(), key=lambda advisory: (advisory.code, advisory.message)))
+
+
+def _build_advisories_v2(report: RunReportV2) -> tuple[Advisory, ...]:
+    advisories = list(
+        _build_advisories(
+            (),
+            report.pytest,
+            report.coverage,
+            report.selection.planned_coverage_scope,
+        )
+    )
+    seen: set[ProcessResult] = set()
+
+    def append_process(process: ProcessResult, label: str) -> None:
+        if process in seen:
+            return
+        seen.add(process)
+        for stream_name, captured in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        ):
+            if not captured.truncated:
+                continue
+            advisories.append(
+                Advisory(
+                    "output_truncated",
+                    (
+                        f"{label} ({process.role}) {stream_name} omitted "
+                        f"{captured.omitted_bytes} byte(s); only the final "
+                        f"{CAPTURE_LIMIT_BYTES} bytes are included."
+                    ),
+                    None,
+                )
+            )
+
+    for index, process in enumerate(report.repository_environment.processes, start=1):
+        append_process(process, f"repository environment process {index}")
+    for dependency in report.repository_environment.dependencies:
+        if dependency.process is not None:
+            append_process(dependency.process, f"dependency {dependency.name} process")
+    for check in report.checks:
+        for index, process in enumerate(check.processes, start=1):
+            append_process(process, f"{check.name} process {index}")
     unique = {(advisory.code, advisory.message): advisory for advisory in advisories}
     return tuple(sorted(unique.values(), key=lambda advisory: (advisory.code, advisory.message)))
 

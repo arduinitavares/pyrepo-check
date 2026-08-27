@@ -8,15 +8,21 @@ import pytest
 from pyrepo_check.coverage_evidence import (
     CoverageCounts,
     CoverageError,
+    CoverageFile,
     CoverageResult,
     CoverageThreshold,
     CoverageTotals,
+    FileBranchCoverage,
+    FileStatementCoverage,
 )
 from pyrepo_check.pytest_evidence import (
+    CollectionIssue,
     PytestCounts,
     PytestError,
     PytestEvidence,
     PytestResult,
+    SlowTest,
+    SpecialTestOutcome,
 )
 from pyrepo_check.reporting import ReportingError, validate_report_v2
 from pyrepo_check.reporting_schema import (
@@ -349,6 +355,69 @@ def pytest_workspace_failure_report() -> RunReportV2:
             error=PytestError("not_started", "pytest workspace setup failed"),
         ),
         coverage=coverage_error_result(),
+    )
+
+
+def pytest_no_primary_report(*, stage: str) -> RunReportV2:
+    report = pytest_run_report()
+    check = report.checks[0]
+    marker_preparation = stage == "marker_preparation"
+    return replace(
+        report,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                check,
+                status="error",
+                execution_environment=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    "check_start_evidence_invalid"
+                    if marker_preparation
+                    else "pytest_evidence_error",
+                    f"pytest {stage} failed",
+                    None,
+                ),
+            ),
+        ),
+        pytest=PytestResult(
+            status="error",
+            complete=False,
+            scope="partial",
+            scope_reasons=("incomplete_session",),
+            pytest_version="8.4.2" if marker_preparation else None,
+            exit_code=None,
+            evidence=None,
+            error=PytestError("not_started", f"pytest {stage} failed"),
+        ),
+    )
+
+
+def pytest_session_incomplete_report(*, instrumented: bool) -> RunReportV2:
+    report = pytest_run_report(
+        exit_code=1,
+        coverage="available" if instrumented else "not_requested",
+    )
+    pytest_result = cast(PytestResult, report.pytest)
+    coverage_result = cast(CoverageResult, report.coverage) if instrumented else None
+    return replace(
+        report,
+        overall_status="error",
+        complete=False,
+        pytest=replace(
+            pytest_result,
+            complete=False,
+            scope="partial",
+            scope_reasons=("incomplete_session",),
+            error=PytestError("session_incomplete", "pytest stopped early"),
+        ),
+        coverage=(
+            replace(coverage_result, scope="partial")
+            if coverage_result is not None
+            else None
+        ),
     )
 
 
@@ -1465,6 +1534,84 @@ def test_schema_v2_rejects_subclasses_for_every_schema_owned_model() -> None:
         with pytest.raises(ReportingError):
             validate_report_structure_v2(malformed)
 
+
+def test_schema_v2_rejects_subclasses_for_all_nested_serialized_models() -> None:
+    pytest_report = pytest_run_report()
+    pytest_result = cast(PytestResult, pytest_report.pytest)
+    evidence = cast(PytestEvidence, pytest_result.evidence)
+    issue = CollectionIssue("test_example.py", "collection issue")
+    slow = SlowTest("test_example.py::test_slow", 10)
+    special = SpecialTestOutcome(
+        "test_example.py::test_skip",
+        "skipped",
+        "not supported",
+        None,
+        False,
+        1,
+    )
+    pytest_mutations = (
+        extended_dataclass(pytest_result),
+        replace(pytest_result, evidence=extended_dataclass(evidence)),
+        replace(evidence, counts=extended_dataclass(evidence.counts)),
+        replace(evidence, collection_errors=(extended_dataclass(issue),)),
+        replace(evidence, collection_skips=(extended_dataclass(issue),)),
+        replace(evidence, slowest=(extended_dataclass(slow),)),
+        replace(evidence, special_outcomes=(extended_dataclass(special),)),
+        replace(
+            pytest_error_result(),
+            error=extended_dataclass(cast(PytestError, pytest_error_result().error)),
+        ),
+    )
+    for mutation in pytest_mutations:
+        malformed_result = (
+            replace(pytest_result, evidence=mutation)
+            if type(mutation) is PytestEvidence
+            else mutation
+        )
+        with pytest.raises(ReportingError):
+            validate_report_structure_v2(replace(pytest_report, pytest=malformed_result))
+
+    coverage_report = pytest_run_report(coverage="available")
+    coverage = cast(CoverageResult, coverage_report.coverage)
+    totals = cast(CoverageTotals, coverage.totals)
+    coverage_file = CoverageFile(
+        "src/example.py",
+        FileStatementCoverage(1, 0, ()),
+        FileBranchCoverage(0, 0, ()),
+    )
+    coverage_mutations = (
+        extended_dataclass(coverage),
+        replace(coverage, threshold=extended_dataclass(coverage.threshold)),
+        replace(coverage, totals=extended_dataclass(totals)),
+        replace(totals, statements=extended_dataclass(totals.statements)),
+        replace(totals, branches=extended_dataclass(totals.branches)),
+        replace(coverage, files=(extended_dataclass(coverage_file),)),
+        replace(
+            coverage_file,
+            statements=extended_dataclass(coverage_file.statements),
+        ),
+        replace(
+            coverage_file,
+            branches=extended_dataclass(coverage_file.branches),
+        ),
+        replace(
+            coverage_error_result(),
+            error=extended_dataclass(cast(CoverageError, coverage_error_result().error)),
+        ),
+    )
+    for mutation in coverage_mutations:
+        malformed_coverage = (
+            replace(coverage, totals=mutation)
+            if type(mutation) is CoverageTotals
+            else replace(coverage, files=(mutation,))
+            if type(mutation) is CoverageFile
+            else mutation
+        )
+        with pytest.raises(ReportingError):
+            validate_report_structure_v2(
+                replace(coverage_report, coverage=malformed_coverage)
+            )
+
     planning = PlanningErrorReportV2(
         2,
         "planning_error",
@@ -1709,6 +1856,15 @@ def test_schema_v2_repository_integrity_state_families_are_exact() -> None:
         complete=False,
         repository_environment=replace(
             environment,
+            dependencies=(
+                replace(
+                    environment.dependencies[0],
+                    status="unobserved",
+                    version=None,
+                    origin=None,
+                    process=None,
+                ),
+            ),
             error=EnvironmentError(
                 "environment_evidence_invalid",
                 "Repository Environment evidence is incomplete.",
@@ -1754,6 +1910,252 @@ def test_schema_v2_repository_integrity_state_families_are_exact() -> None:
     for invalid in malformed:
         with pytest.raises(ReportingError):
             validate_report_v2(invalid)
+
+
+def test_schema_v2_successful_machine_evidence_requires_complete_capture() -> None:
+    report = valid_run_report()
+    environment = report.repository_environment
+    dependency = environment.dependencies[0]
+    truncated = CapturedText(True, "tail", True, 7)
+    uncaptured = CapturedText(False, "", False, 0)
+    mutations = (
+        replace(
+            environment,
+            processes=(
+                *environment.processes[:-1],
+                replace(environment.processes[-1], stdout=truncated),
+            ),
+        ),
+        replace(
+            environment,
+            processes=(
+                environment.processes[0],
+                replace(environment.processes[1], stdout=uncaptured),
+                *environment.processes[2:],
+            ),
+        ),
+        replace(
+            environment,
+            processes=(
+                *environment.processes[:2],
+                replace(environment.processes[2], stderr=truncated),
+                *environment.processes[3:],
+            ),
+        ),
+        replace(
+            environment,
+            dependencies=(
+                replace(
+                    dependency,
+                    process=replace(
+                        cast(ProcessResult, dependency.process),
+                        stdout=truncated,
+                    ),
+                ),
+            ),
+        ),
+    )
+    for malformed_environment in mutations:
+        with pytest.raises(ReportingError):
+            validate_report_v2(
+                replace(report, repository_environment=malformed_environment)
+            )
+
+
+def test_schema_v2_projects_truncation_from_every_visible_process_once() -> None:
+    environment_report = environment_failure_report()
+    environment = environment_report.repository_environment
+    truncated_uv = replace(
+        process_result("uv_version"),
+        stdout=CapturedText(True, "tail", True, 11),
+    )
+    environment_advisory = Advisory(
+        "output_truncated",
+        (
+            "repository environment process 1 (uv_version) stdout omitted 11 byte(s); "
+            "only the final 65536 bytes are included."
+        ),
+        None,
+    )
+    validate_report_v2(
+        replace(
+            environment_report,
+            repository_environment=replace(
+                environment,
+                lock=replace(environment.lock, status="unverified"),
+                processes=(truncated_uv,),
+                error=EnvironmentError(
+                    "environment_evidence_invalid",
+                    "uv version output is incomplete",
+                    None,
+                ),
+            ),
+            advisories=(environment_advisory,),
+        )
+    )
+
+    report = dependency_failure_report("unobserved")
+    environment = report.repository_environment
+    dependency = environment.dependencies[0]
+    process = cast(ProcessResult, dependency.process)
+    truncated = replace(process.stdout, text="tail", truncated=True, omitted_bytes=9)
+    repeated = replace(process, stdout=truncated)
+    dependency = replace(dependency, process=repeated)
+    expected = Advisory(
+        "output_truncated",
+        (
+            "dependency ruff process (dependency_probe) stdout omitted 9 byte(s); "
+            "only the final 65536 bytes are included."
+        ),
+        None,
+    )
+    projected = replace(
+        report,
+        repository_environment=replace(
+            environment,
+            dependencies=(dependency,),
+        ),
+        advisories=(expected,),
+    )
+    validate_report_v2(projected)
+
+    check = projected.checks[0]
+    ty_error = CheckErrorV2(
+        "check_dependency_unusable",
+        "ty probe evidence is unavailable",
+        "Repair ty.",
+    )
+    ty_dependency = replace(
+        dependency,
+        name="ty",
+        module="ty",
+        required=">=0.0.35,<0.1",
+        error=ty_error,
+    )
+    duplicate = replace(
+        projected,
+        selection=replace(projected.selection, checks=("ruff", "ty")),
+        repository_environment=replace(
+            projected.repository_environment,
+            dependencies=(dependency, ty_dependency),
+        ),
+        checks=(
+            check,
+            replace(check, name="ty", error=ty_error),
+        ),
+    )
+    validate_report_v2(duplicate)
+
+
+def test_schema_v2_enforces_pre_execution_environment_stage_shapes() -> None:
+    missing = environment_failure_report()
+    validate_report_v2(missing)
+    environment = missing.repository_environment
+    dependency = environment.dependencies[0]
+    for malformed in (
+        replace(environment, processes=(process_result("uv_version"),)),
+        replace(
+            environment,
+            dependencies=(
+                replace(
+                    dependency,
+                    status="available",
+                    version="8.4.2",
+                    origin="/repo/.venv/site-packages/pytest/__init__.py",
+                    process=process_result("dependency_probe"),
+                ),
+            ),
+        ),
+    ):
+        with pytest.raises(ReportingError):
+            validate_report_v2(replace(missing, repository_environment=malformed))
+
+
+def test_schema_v2_rejects_impossible_unsafe_and_invalid_evidence_stages() -> None:
+    report = environment_failure_report()
+    environment = report.repository_environment
+    uv_process = process_result("uv_version")
+    invalid_uv = replace(
+        environment,
+        lock=replace(environment.lock, status="unverified"),
+        processes=(uv_process,),
+        error=EnvironmentError(
+            "environment_evidence_invalid",
+            "uv version evidence is malformed",
+            None,
+        ),
+    )
+    unsafe_before_process = replace(
+        environment,
+        lock=replace(environment.lock, status="unverified"),
+        error=EnvironmentError(
+            "unsafe_repository_environment",
+            "uv storage boundary is unsafe",
+            None,
+        ),
+    )
+    for valid_environment in (invalid_uv, unsafe_before_process):
+        validate_report_v2(
+            replace(report, repository_environment=valid_environment)
+        )
+
+    malformed = (
+        replace(invalid_uv, manager_version="0.8.13"),
+        replace(
+            unsafe_before_process,
+            manager_version="0.8.13",
+            processes=(uv_process,),
+        ),
+    )
+    for invalid_environment in malformed:
+        with pytest.raises(ReportingError):
+            validate_report_v2(
+                replace(report, repository_environment=invalid_environment)
+            )
+
+
+def test_schema_v2_accepts_real_no_primary_producer_families() -> None:
+    ordinary = valid_run_report()
+    ordinary_check = ordinary.checks[0]
+    ordinary = replace(
+        ordinary,
+        overall_status="error",
+        complete=False,
+        checks=(
+            replace(
+                ordinary_check,
+                status="error",
+                execution_environment=None,
+                analysis_python_authority=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    "check_start_evidence_invalid",
+                    "staged launcher changed before spawn",
+                    None,
+                ),
+            ),
+        ),
+    )
+    for report in (
+        ordinary,
+        pytest_no_primary_report(stage="marker_preparation"),
+        pytest_no_primary_report(stage="reporter_staging"),
+    ):
+        validate_report_v2(report)
+
+
+@pytest.mark.parametrize("instrumented", (False, True))
+def test_schema_v2_accepts_pytest_exit_one_session_incomplete_producer(
+    instrumented: bool,
+) -> None:
+    report = pytest_session_incomplete_report(instrumented=instrumented)
+    validate_report_v2(report)
+    if instrumented:
+        assert tuple(process.role for process in report.checks[0].processes) == (
+            "primary",
+            "coverage_json",
+        )
 
 
 def test_schema_v2_accepts_exact_ordinary_check_outcome_families() -> None:
@@ -2498,6 +2900,36 @@ def test_schema_v2_rejects_dependency_status_evidence_mutations() -> None:
                         ),
                     )
                 )
+
+
+@pytest.mark.parametrize(
+    ("version", "origin"),
+    (
+        ("banana", "/repo/.venv/site-packages/ruff/__init__.py"),
+        ("0.15.0rc1", "/repo/.venv/site-packages/ruff/__init__.py"),
+        ("0.14.9", "/repo/.venv/site-packages/ruff/__init__.py"),
+        ("1.0", "/repo/.venv/site-packages/ruff/__init__.py"),
+        ("0.15.0", "repo/.venv/site-packages/ruff/__init__.py"),
+        ("0.15.0", "/repo/.venv/../site-packages/ruff/__init__.py"),
+    ),
+)
+def test_schema_v2_rejects_non_authoritative_available_dependency(
+    version: str,
+    origin: str,
+) -> None:
+    report = valid_run_report()
+    environment = report.repository_environment
+    dependency = replace(environment.dependencies[0], version=version, origin=origin)
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                report,
+                repository_environment=replace(
+                    environment,
+                    dependencies=(dependency,),
+                ),
+            )
+        )
 
 
 @pytest.mark.parametrize(

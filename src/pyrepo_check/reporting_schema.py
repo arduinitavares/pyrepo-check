@@ -8,9 +8,26 @@ from pathlib import Path
 import re
 from typing import Literal, cast
 
-from pyrepo_check.coverage_evidence import CoverageResult
+from pyrepo_check.coverage_evidence import (
+    CoverageCounts,
+    CoverageError,
+    CoverageFile,
+    CoverageResult,
+    CoverageThreshold,
+    CoverageTotals,
+    FileBranchCoverage,
+    FileStatementCoverage,
+)
 from pyrepo_check.planning import CheckName, PlannedTestScope, PlanningErrorCode, RunMode
-from pyrepo_check.pytest_evidence import PytestResult
+from pyrepo_check.pytest_evidence import (
+    CollectionIssue,
+    PytestCounts,
+    PytestError,
+    PytestEvidence,
+    PytestResult,
+    SlowTest,
+    SpecialTestOutcome,
+)
 
 
 ReportKind = Literal["planning_error", "run"]
@@ -396,10 +413,10 @@ def _validate_run_report(report: RunReportV2) -> None:
         _invalid("checks must be a tuple")
     for check in report.checks:
         _validate_check(check)
-    if report.pytest is not None and type(report.pytest) is not PytestResult:
-        _invalid("pytest must be null or PytestResult")
-    if report.coverage is not None and type(report.coverage) is not CoverageResult:
-        _invalid("coverage must be null or CoverageResult")
+    if report.pytest is not None:
+        _validate_exact_pytest_types(report.pytest)
+    if report.coverage is not None:
+        _validate_exact_coverage_types(report.coverage)
     if not isinstance(report.advisories, tuple):
         _invalid("advisories must be a tuple")
     for advisory in report.advisories:
@@ -501,6 +518,8 @@ def _validate_dependency(dependency: DependencyEvidence) -> None:
         _invalid("unknown dependency status")
     _validate_optional_string(dependency.version, "dependency version")
     _validate_optional_string(dependency.origin, "dependency origin")
+    if dependency.origin is not None:
+        _validate_absolute_normal_path(dependency.origin, "dependency origin")
     if dependency.process is not None:
         if type(dependency.process) is not ProcessResult:
             _invalid("dependency process must be null or ProcessResult")
@@ -695,6 +714,53 @@ def _validate_absolute_normal_path(value: object, field: str) -> None:
         or os.path.abspath(os.path.normpath(value)) != value
     ):
         _invalid(f"{field} must be an absolute lexically normalized path string")
+
+
+def _validate_exact_pytest_types(result: object) -> None:
+    if type(result) is not PytestResult:
+        _invalid("pytest must be null or exact PytestResult")
+    result = cast(PytestResult, result)
+    if result.error is not None and type(result.error) is not PytestError:
+        _invalid("pytest error must be exact PytestError")
+    evidence = result.evidence
+    if evidence is None:
+        return
+    if type(evidence) is not PytestEvidence:
+        _invalid("pytest evidence must be exact PytestEvidence")
+    if type(evidence.counts) is not PytestCounts:
+        _invalid("pytest counts must be exact PytestCounts")
+    for issue in (*evidence.collection_errors, *evidence.collection_skips):
+        if type(issue) is not CollectionIssue:
+            _invalid("pytest collection issues must use exact CollectionIssue")
+    if any(type(item) is not SlowTest for item in evidence.slowest):
+        _invalid("pytest slowest entries must use exact SlowTest")
+    if any(type(item) is not SpecialTestOutcome for item in evidence.special_outcomes):
+        _invalid("pytest special outcomes must use exact SpecialTestOutcome")
+
+
+def _validate_exact_coverage_types(result: object) -> None:
+    if type(result) is not CoverageResult:
+        _invalid("coverage must be null or exact CoverageResult")
+    result = cast(CoverageResult, result)
+    if type(result.threshold) is not CoverageThreshold:
+        _invalid("coverage threshold must be exact CoverageThreshold")
+    if result.error is not None and type(result.error) is not CoverageError:
+        _invalid("coverage error must be exact CoverageError")
+    if result.totals is not None:
+        if type(result.totals) is not CoverageTotals:
+            _invalid("coverage totals must be exact CoverageTotals")
+        if (
+            type(result.totals.statements) is not CoverageCounts
+            or type(result.totals.branches) is not CoverageCounts
+        ):
+            _invalid("coverage total counts must be exact CoverageCounts")
+    for item in result.files:
+        if type(item) is not CoverageFile:
+            _invalid("coverage files must use exact CoverageFile")
+        if type(item.statements) is not FileStatementCoverage:
+            _invalid("coverage statements must use exact FileStatementCoverage")
+        if type(item.branches) is not FileBranchCoverage:
+            _invalid("coverage branches must use exact FileBranchCoverage")
 
 
 def _invalid(message: str) -> None:
