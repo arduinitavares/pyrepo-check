@@ -162,12 +162,18 @@ def main(
         )
 
     terminal_progress_emitted = False
+    terminal_progress_error: Exception | None = None
 
     def write_terminal_progress(text: str) -> None:
-        nonlocal terminal_progress_emitted
-        sys.stdout.write(text)
-        sys.stdout.flush()
-        terminal_progress_emitted = True
+        nonlocal terminal_progress_emitted, terminal_progress_error
+        if terminal_progress_error is not None:
+            return
+        try:
+            sys.stdout.write(text)
+            terminal_progress_emitted = True
+            sys.stdout.flush()
+        except Exception as error:
+            terminal_progress_error = error
 
     execution = execute_plan(
         plan,
@@ -175,6 +181,9 @@ def main(
         runner=runner,
         terminal_writer=write_terminal_progress if output_format == "terminal" else None,
     )
+    if terminal_progress_error is not None:
+        _write_reporting_fallback(terminal_progress_error)
+        return 2
     try:
         report = build_run_report(config.root, plan, execution)
         validate_report_v2(report)

@@ -1107,3 +1107,90 @@ def test_final_repository_verification_runs_whenever_baseline_exists(
     assert result.repository_environment.mutation_protection == "protected_files"
     assert result.checks[0].error is not None
     assert result.checks[0].error.code == "repository_environment_unavailable"
+
+
+@pytest.mark.parametrize("fail_at_call", (1, 3), ids=("environment", "later-banner"))
+def test_terminal_writer_failure_does_not_stop_checks_or_repository_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_at_call: int,
+) -> None:
+    plan = replace(
+        _internal_plan(tmp_path.resolve(), "ty", "bandit"),
+        output_format="terminal",
+    )
+    baseline = RepositoryStateSnapshot(None, (), ())
+    safe = _safe_preparation(
+        plan,
+        baseline=baseline,
+        dependencies=(
+            available_dependency("ty", "0.0.35"),
+            available_dependency("bandit", "1.9.2"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    verification_calls = 0
+
+    def verify(*args: object, **kwargs: object) -> RepositoryVerificationResult:
+        nonlocal verification_calls
+        verification_calls += 1
+        return RepositoryVerificationResult((), "protected_files", None)
+
+    monkeypatch.setattr(repository_executor, "verify_repository_state", verify)
+    writer_calls = 0
+
+    def writer(_text: str) -> None:
+        nonlocal writer_calls
+        writer_calls += 1
+        if writer_calls == fail_at_call:
+            raise RuntimeError("terminal writer failed")
+
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+        terminal_writer=writer,
+    )
+
+    assert [check.error for check in result.checks] == [None, None]
+    assert len(runner.calls) == 2
+    assert verification_calls == 1
+    assert result.repository_environment.mutation_protection == "protected_files"
+
+
+def test_unexpected_check_phase_exception_verifies_repository_before_propagating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    marker = RuntimeError("unexpected check-phase failure")
+    safe = _safe_preparation(
+        plan,
+        baseline=RepositoryStateSnapshot(None, (), ()),
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    monkeypatch.setattr(
+        repository_executor,
+        "_execute_in_workspace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(marker),
+    )
+    verified = False
+
+    def verify(*args: object, **kwargs: object) -> RepositoryVerificationResult:
+        nonlocal verified
+        verified = True
+        return RepositoryVerificationResult((), "protected_files", None)
+
+    monkeypatch.setattr(repository_executor, "verify_repository_state", verify)
+
+    with pytest.raises(RuntimeError) as raised:
+        repository_executor.execute_repository_plan(
+            plan,
+            runner=RecordingRunner(),
+            clock_ns=monotonic_clock(),
+        )
+
+    assert raised.value is marker
+    assert verified

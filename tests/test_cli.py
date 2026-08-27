@@ -262,3 +262,69 @@ def test_reporting_failure_emits_no_partial_json_and_returns_two(
     captured = capsysbinary.readouterr()
     assert captured.out == b""
     assert b"internal reporting error: report broken" in captured.err
+
+
+@pytest.mark.parametrize("failure", ("write", "flush"))
+def test_cli_terminal_output_failure_finishes_execution_then_returns_fallback_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    execution_finished = False
+    verification_finished = False
+    progress = (
+        "==> environment: tool Python 3.13.15 -> "
+        "repository Python 3.12.11 (uv, locked)\n"
+    )
+
+    def execute(
+        plan: RunPlan,
+        *,
+        tool_environment: ToolEnvironmentObservation | None = None,
+        runner: ProcessRunner | None = None,
+        terminal_writer: TerminalWriter | None = None,
+    ) -> RepositoryExecutionResult:
+        nonlocal execution_finished, verification_finished
+        del tool_environment, runner
+        assert terminal_writer is not None
+        terminal_writer(progress)
+        terminal_writer("\n==> ty: python -m ty check\n")
+        execution_finished = True
+        verification_finished = True
+        return _successful_ty_execution(plan)
+
+    class FailingStdout:
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+            self.write_calls = 0
+            self.flush_calls = 0
+
+        def write(self, text: str) -> int:
+            self.write_calls += 1
+            if failure == "write":
+                raise OSError("stdout write failed")
+            self.writes.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            self.flush_calls += 1
+            if failure == "flush":
+                raise OSError("stdout flush failed")
+
+    stdout = FailingStdout()
+    monkeypatch.setattr("pyrepo_check.cli.execute_plan", execute)
+    monkeypatch.setattr("pyrepo_check.cli.sys.stdout", stdout)
+    monkeypatch.setattr(
+        "pyrepo_check.cli.build_run_report",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("reporting must not run")),
+    )
+
+    assert main(("--root", str(tmp_path), "ty")) == 2
+
+    assert execution_finished and verification_finished
+    assert stdout.write_calls == 1
+    assert stdout.writes == ([] if failure == "write" else [progress])
+    assert "==> pyrepo-check summary:" not in "".join(stdout.writes)
+    assert "".join(stdout.writes).count("==> environment:") <= 1
+    assert "internal reporting error:" in capsys.readouterr().err

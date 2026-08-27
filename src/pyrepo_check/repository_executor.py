@@ -261,97 +261,118 @@ def execute_repository_plan(
 ) -> RepositoryExecutionResult:
     """Compose preparation, dependencies, per-Check workspaces, and verification."""
     observed_tool_environment = tool_environment or observe_tool_environment()
-    progress_writer = terminal_writer if plan.output_format == "terminal" else None
+    progress_writer = (
+        _nonthrowing_progress_writer(terminal_writer)
+        if terminal_writer is not None and plan.output_format == "terminal"
+        else None
+    )
     safe = prepare_safe_repository(plan, runner=runner, clock_ns=clock_ns)
     preparation = safe.preparation
     checks: list[RepositoryCheckObservation] = []
-    if preparation.prepared is None:
-        checks.extend(
-            _check_failure(
-                invocation,
-                "repository_environment_unavailable",
-                "Repository Environment is unavailable for this Check.",
-            )
-            for invocation in plan.checks
-        )
-    else:
-        if progress_writer is not None:
-            progress_writer(
-                format_terminal_environment_line(
-                    observed_tool_environment.python.version,
-                    preparation.prepared.python.version,
+    repository_observation = preparation.observation
+    try:
+        if preparation.prepared is None:
+            checks.extend(
+                _check_failure(
+                    invocation,
+                    "repository_environment_unavailable",
+                    "Repository Environment is unavailable for this Check.",
                 )
+                for invocation in plan.checks
             )
-        dependencies = {
-            dependency.name: dependency for dependency in preparation.observation.dependencies
-        }
-        for invocation in plan.checks:
-            dependency = dependencies[_dependency_name(invocation)]
-            if invocation.name == "pytest":
+        else:
+            if progress_writer is not None:
+                progress_writer(
+                    format_terminal_environment_line(
+                        observed_tool_environment.python.version,
+                        preparation.prepared.python.version,
+                    )
+                )
+            dependencies = {
+                dependency.name: dependency
+                for dependency in preparation.observation.dependencies
+            }
+            for invocation in plan.checks:
+                dependency = dependencies[_dependency_name(invocation)]
+                if invocation.name == "pytest":
+                    checks.append(
+                        _execute_in_workspace(
+                            invocation,
+                            plan=plan,
+                            prepared=preparation.prepared,
+                            pytest_dependency=dependency,
+                            coverage_dependency=dependencies.get("coverage"),
+                            runner=runner,
+                            clock_ns=clock_ns,
+                            terminal_writer=progress_writer,
+                        )
+                    )
+                    continue
+                if dependency.status != "available":
+                    checks.append(
+                        RepositoryCheckObservation(
+                            invocation=invocation,
+                            execution_environment=None,
+                            analysis_python_authority=None,
+                            start=None,
+                            processes=(),
+                            error=dependency.error
+                            or CheckExecutionFailure(
+                                "check_dependency_unusable",
+                                f"Repository dependency {dependency.name} is unavailable.",
+                                None,
+                            ),
+                        )
+                    )
+                    continue
                 checks.append(
                     _execute_in_workspace(
                         invocation,
                         plan=plan,
                         prepared=preparation.prepared,
-                        pytest_dependency=dependency,
-                        coverage_dependency=dependencies.get("coverage"),
+                        pytest_dependency=None,
+                        coverage_dependency=None,
                         runner=runner,
                         clock_ns=clock_ns,
                         terminal_writer=progress_writer,
                     )
                 )
-                continue
-            if dependency.status != "available":
-                checks.append(
-                    RepositoryCheckObservation(
-                        invocation=invocation,
-                        execution_environment=None,
-                        analysis_python_authority=None,
-                        start=None,
-                        processes=(),
-                        error=dependency.error
-                        or CheckExecutionFailure(
-                            "check_dependency_unusable",
-                            f"Repository dependency {dependency.name} is unavailable.",
-                            None,
-                        ),
-                    )
-                )
-                continue
-            checks.append(
-                _execute_in_workspace(
-                    invocation,
-                    plan=plan,
-                    prepared=preparation.prepared,
-                    pytest_dependency=None,
-                    coverage_dependency=None,
-                    runner=runner,
-                    clock_ns=clock_ns,
-                    terminal_writer=progress_writer,
-                )
+    finally:
+        if safe.baseline is not None:
+            verification = verify_repository_state(
+                safe.baseline,
+                annotations_fix_selected=any(
+                    invocation.name == "annotations-fix" for invocation in plan.checks
+                ),
+                runner=runner,
+                clock_ns=clock_ns,
             )
-
-    repository_observation = preparation.observation
-    if safe.baseline is not None:
-        verification = verify_repository_state(
-            safe.baseline,
-            annotations_fix_selected=any(
-                invocation.name == "annotations-fix" for invocation in plan.checks
-            ),
-            runner=runner,
-            clock_ns=clock_ns,
-        )
-        repository_observation = replace(
-            repository_observation,
-            processes=repository_observation.processes + verification.processes,
-            mutation_protection=verification.mutation_protection,
-            error=verification.error or repository_observation.error,
-        )
+            repository_observation = replace(
+                repository_observation,
+                processes=repository_observation.processes + verification.processes,
+                mutation_protection=verification.mutation_protection,
+                error=verification.error or repository_observation.error,
+            )
     return RepositoryExecutionResult(
         tool_environment=observed_tool_environment,
         repository_environment=repository_observation,
         checks=tuple(checks),
     )
+
+
+def _nonthrowing_progress_writer(writer: TerminalWriter) -> TerminalWriter:
+    failed = False
+
+    def emit(text: str) -> None:
+        nonlocal failed
+        if failed:
+            return
+        try:
+            writer(text)
+        except Exception:
+            failed = True
+
+    return emit
 
 
 def _execute_in_workspace(
