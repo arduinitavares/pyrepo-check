@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, fields, make_dataclass, replace
 import json
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import pytest
 
@@ -28,6 +28,7 @@ from pyrepo_check.execution import (
     ExecutedCheck,
     ExecutedProcess,
     RepositoryEnvironmentObservation,
+    RepositoryExecutionResult,
     RepositoryLockPresence,
     RepositoryPreparation,
 )
@@ -2063,6 +2064,300 @@ def observed_processless_repository_change_report(
             ),
         ),
     )
+
+
+def observed_unavailable_pytest_workspace_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pytest_status: Literal["missing", "incompatible"],
+    failure_stage: Literal["creation", "cleanup"],
+    repository_changed: bool,
+) -> tuple[RepositoryExecutionResult, RunReportV2]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(tmp_path, "pytest")
+    invocation = plan.checks[0]
+    assert invocation.pytest is not None
+    invocation = replace(
+        invocation,
+        pytest=replace(
+            invocation.pytest,
+            coverage=CoverageExecutionPlan(tmp_path / "pyproject.toml", None),
+        ),
+    )
+    plan = replace(
+        plan,
+        checks=(invocation,),
+        planned_coverage_scope="complete",
+    )
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    pytest_dependency = missing_dependency("pytest")
+    if pytest_status == "incompatible":
+        pytest_dependency = replace(
+            available_dependency("pytest", "8.4.2"),
+            status="incompatible",
+            version="7.4.0",
+            error=CheckExecutionFailure(
+                "check_dependency_incompatible",
+                "Repository dependency pytest is incompatible.",
+                "Lock a supported pytest version.",
+            ),
+        )
+    coverage_dependency = available_dependency("coverage", "7.15.2")
+    environment_observation = RepositoryEnvironmentObservation(
+        manager_version="0.10.12",
+        path=prepared.path,
+        python_selection=plan.repository_python,
+        python=prepared.python,
+        lock_path=plan.root / "uv.lock",
+        lock_status="current",
+        mutation_protection="unobserved",
+        dependencies=(pytest_dependency, coverage_dependency),
+        processes=(),
+        error=None,
+    )
+    baseline = (
+        RepositoryStateSnapshot(None, (), ()) if repository_changed else None
+    )
+    safe = SafeRepositoryPreparation(
+        baseline,
+        RepositoryPreparation(prepared, environment_observation),
+    )
+    final_error = EnvironmentFailureObservation(
+        "repository_state_changed",
+        "Repository state changed after Check execution.",
+        "Restore the repository state, then retry.",
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            repository_executor,
+            "prepare_safe_repository",
+            lambda *args, **kwargs: safe,
+        )
+        if repository_changed:
+            patch.setattr(
+                repository_executor,
+                "verify_repository_state",
+                lambda *args, **kwargs: RepositoryVerificationResult(
+                    (),
+                    "protected_files",
+                    final_error,
+                ),
+            )
+        if failure_stage == "creation":
+            patch.setattr(
+                execution_workspace,
+                "create_run_workspace",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    OSError("workspace creation blocked")
+                ),
+            )
+        else:
+            patch.setattr(
+                execution_workspace,
+                "remove_run_workspace",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    OSError("workspace cleanup blocked")
+                ),
+            )
+        execution = repository_executor.execute_repository_plan(
+            plan,
+            runner=RecordingRunner(),
+            clock_ns=monotonic_clock(),
+        )
+
+    observed_check = execution.checks[0]
+    executed_check = ExecutedCheck(
+        planned=invocation,
+        processes=observed_check.processes,
+        pytest=observed_check.pytest,
+        coverage=observed_check.coverage,
+    )
+    pytest_result = build_pytest_result(
+        plan,
+        executed_check,
+        dependency_version=pytest_dependency.version,
+    )
+    coverage_result = build_coverage_result(
+        tmp_path,
+        plan,
+        pytest_result,
+        observed_check.coverage,
+        dependency_version=coverage_dependency.version,
+    )
+    assert coverage_result is not None
+
+    report = pytest_run_report(coverage="available")
+    environment = report.repository_environment
+    check = report.checks[0]
+    environment_error = execution.repository_environment.error
+    projected_environment_error = (
+        None
+        if environment_error is None
+        else EnvironmentError(
+            environment_error.code,
+            environment_error.message,
+            environment_error.hint,
+        )
+    )
+    projected_processes = (
+        environment.processes[:-1]
+        if repository_changed
+        else environment.processes
+    )
+    projected = replace(
+        report,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            environment,
+            mutation_protection=(
+                "protected_files" if repository_changed else "tracked_files"
+            ),
+            dependencies=(
+                dependency_evidence_from_observation(pytest_dependency),
+                dependency_evidence_from_observation(coverage_dependency),
+            ),
+            processes=projected_processes,
+            error=projected_environment_error,
+        ),
+        checks=(
+            replace(
+                check,
+                status="error",
+                execution_environment=None,
+                analysis_python_authority=None,
+                start_evidence=None,
+                processes=tuple(
+                    observed_process_result(process)
+                    for process in observed_check.processes
+                ),
+                error=(
+                    None
+                    if observed_check.error is None
+                    else CheckErrorV2(
+                        observed_check.error.code,
+                        observed_check.error.message,
+                        observed_check.error.hint,
+                    )
+                ),
+            ),
+        ),
+        pytest=pytest_result,
+        coverage=coverage_result,
+    )
+    return execution, projected
+
+
+@pytest.mark.parametrize("repository_changed", (False, True))
+@pytest.mark.parametrize("failure_stage", ("creation", "cleanup"))
+@pytest.mark.parametrize("pytest_status", ("missing", "incompatible"))
+def test_schema_v2_accepts_unavailable_pytest_workspace_producer_cross_product(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pytest_status: Literal["missing", "incompatible"],
+    failure_stage: Literal["creation", "cleanup"],
+    repository_changed: bool,
+) -> None:
+    execution, report = observed_unavailable_pytest_workspace_report(
+        tmp_path,
+        monkeypatch,
+        pytest_status=pytest_status,
+        failure_stage=failure_stage,
+        repository_changed=repository_changed,
+    )
+    observed = execution.checks[0]
+    assert observed.processes == ()
+    assert observed.start is None
+    assert observed.error is not None
+    assert observed.error.code == "cleanup_failed"
+    assert (
+        None
+        if execution.repository_environment.error is None
+        else execution.repository_environment.error.code
+    ) == ("repository_state_changed" if repository_changed else None)
+
+    pytest_result = cast(PytestResult, report.pytest)
+    coverage_result = cast(CoverageResult, report.coverage)
+    assert pytest_result.error is not None
+    assert coverage_result.error is not None
+    if failure_stage == "creation":
+        assert observed.pytest is None
+        assert observed.coverage is None
+        assert pytest_result.pytest_version is None
+        assert pytest_result.error.code == "not_started"
+    else:
+        assert observed.pytest is not None
+        assert observed.pytest.preflight.classification == (
+            "module_unavailable"
+            if pytest_status == "missing"
+            else "unsupported_version"
+        )
+        assert observed.coverage is not None
+        assert observed.coverage.preflight.classification == "preflight_invalid"
+        assert pytest_result.pytest_version == (
+            None if pytest_status == "missing" else "7.4.0"
+        )
+        assert pytest_result.error.code == (
+            "module_unavailable"
+            if pytest_status == "missing"
+            else "unsupported_version"
+        )
+    assert coverage_result.coverage_version is None
+    assert coverage_result.error.code == "preflight_invalid"
+    validate_report_v2(report)
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "failure_stage"),
+    (
+        ("missing", "creation"),
+        ("missing", "cleanup"),
+        ("incompatible", "cleanup"),
+    ),
+)
+def test_schema_v2_rejects_unavailable_pytest_cleanup_nested_contradictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pytest_status: Literal["missing", "incompatible"],
+    failure_stage: Literal["creation", "cleanup"],
+) -> None:
+    _, report = observed_unavailable_pytest_workspace_report(
+        tmp_path,
+        monkeypatch,
+        pytest_status=pytest_status,
+        failure_stage=failure_stage,
+        repository_changed=False,
+    )
+    pytest_result = cast(PytestResult, report.pytest)
+    coverage_result = cast(CoverageResult, report.coverage)
+    contradictory_pytest = replace(
+        pytest_result,
+        pytest_version=None,
+        error=PytestError(
+            (
+                "unsupported_version"
+                if pytest_status == "missing"
+                else "module_unavailable"
+            ),
+            "contradictory pytest dependency preflight",
+        ),
+    )
+    contradictory_coverage = replace(
+        coverage_result,
+        coverage_version="7.15.2",
+        error=CoverageError(
+            "data_missing",
+            "contradictory Coverage setup phase",
+        ),
+    )
+    for malformed in (
+        replace(report, pytest=contradictory_pytest),
+        replace(report, coverage=contradictory_coverage),
+    ):
+        with pytest.raises(ReportingError):
+            validate_report_v2(malformed)
 
 
 @pytest.mark.parametrize("family", ("dependency", "workspace"))

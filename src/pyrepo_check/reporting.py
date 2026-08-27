@@ -710,6 +710,23 @@ def _validate_check_result_v2(
         and check.error.code == "repository_environment_unavailable"
     ):
         _invalid("post-run repository change must preserve actual Check evidence")
+    elif (
+        check.name == "pytest"
+        and dependency.status != "available"
+        and primary is None
+        and check.error is not None
+        and check.error.code == "cleanup_failed"
+    ):
+        _validate_pytest_check_v2(
+            check,
+            primary,
+            pytest_result,
+            dependency,
+            coverage_result,
+            coverage_dependency,
+            coverage_requested=coverage_requested,
+        )
+        return
     elif dependency.status != "available":
         if (
             check.error is None
@@ -948,6 +965,17 @@ def _validate_pytest_check_v2(
             _invalid("pytest without a primary process requires a setup error")
         if result.exit_code is not None or result.evidence is not None or result.complete:
             _invalid("pytest setup error cannot claim primary evidence")
+        if dependency.status != "available":
+            _validate_unavailable_pytest_cleanup_v2(result, dependency)
+            _validate_unstarted_coverage_v2(
+                check,
+                result,
+                coverage,
+                coverage_dependency,
+                requested=coverage_requested,
+                pytest_available=False,
+            )
+            return
         marker_preparation = result.pytest_version == dependency.version
         error = check.error
         setup_error = "missing_primary_process" if error is None else error.code
@@ -974,6 +1002,7 @@ def _validate_pytest_check_v2(
             coverage,
             coverage_dependency,
             requested=coverage_requested,
+            pytest_available=True,
         )
         return
     if primary.outcome == "spawn_failed":
@@ -1058,6 +1087,38 @@ def _validate_pytest_check_v2(
     )
 
 
+def _validate_unavailable_pytest_cleanup_v2(
+    result: PytestResult,
+    dependency: DependencyEvidence,
+) -> None:
+    error = result.error
+    expected_error = {
+        "missing": "module_unavailable",
+        "incompatible": "unsupported_version",
+        "shadowed": "preflight_invalid",
+        "unusable": "preflight_invalid",
+        "unobserved": "preflight_invalid",
+    }[dependency.status]
+    expected_version = (
+        dependency.version if dependency.status == "incompatible" else None
+    )
+    workspace_creation_failed = (
+        result.pytest_version is None
+        and error is not None
+        and error.code == "not_started"
+    )
+    dependency_preflight_retained = (
+        result.pytest_version == expected_version
+        and error is not None
+        and error.code == expected_error
+    )
+    if (
+        result.status != "error"
+        or not (workspace_creation_failed or dependency_preflight_retained)
+    ):
+        _invalid("unavailable pytest cleanup contradicts its observed setup phase")
+
+
 def _validate_unstarted_coverage_v2(
     check: CheckResultV2,
     pytest_result: PytestResult,
@@ -1065,6 +1126,7 @@ def _validate_unstarted_coverage_v2(
     dependency: DependencyEvidence | None,
     *,
     requested: bool,
+    pytest_available: bool,
 ) -> None:
     if not requested:
         if coverage is not None or dependency is not None:
@@ -1075,11 +1137,14 @@ def _validate_unstarted_coverage_v2(
     coverage = cast(CoverageResult, coverage)
     dependency = cast(DependencyEvidence, dependency)
     setup_failure_owns_coverage = (
-        check.error is not None
-        and (
-            check.error.code == "pytest_evidence_error"
-            or check.error.code == "cleanup_failed"
-            and pytest_result.pytest_version is None
+        not pytest_available
+        or (
+            check.error is not None
+            and (
+                check.error.code == "pytest_evidence_error"
+                or check.error.code == "cleanup_failed"
+                and pytest_result.pytest_version is None
+            )
         )
     )
     if setup_failure_owns_coverage:
