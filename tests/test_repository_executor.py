@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 from pathlib import Path
 import subprocess  # nosec B404
 
+from pyrepo_check.config import ProjectConfig
+from pyrepo_check.planning import CoverageExecutionPlan, build_checks
 from pyrepo_check.repository_executor import prepare_safe_repository
 from tests.support import (
     RecordingRunner,
@@ -65,6 +69,11 @@ def _successful_runner(root: Path) -> RecordingRunner:
                 executable=environment_root / "bin/python",
                 environment_root=environment_root,
             ),
+            _dependency_payload(
+                "ruff",
+                version="0.15.1",
+                origin=environment_root / "lib/python3.13/site-packages/ruff/__init__.py",
+            ),
         )
     )
 
@@ -87,6 +96,18 @@ def test_missing_lock_returns_canonical_failure_before_git_or_uv(tmp_path: Path)
     assert observation.error.code == "repository_lock_missing"
     assert observation.lock_status == "missing"
     assert observation.processes == ()
+    assert len(observation.dependencies) == 1
+    dependency = observation.dependencies[0]
+    assert (
+        dependency.name,
+        dependency.module,
+        dependency.required,
+        dependency.status,
+        dependency.version,
+        dependency.origin,
+        dependency.process,
+        dependency.error,
+    ) == ("ruff", "ruff", ">=0.15,<1", "unobserved", None, None, None, None)
     assert runner.calls == []
 
 
@@ -167,7 +188,7 @@ def test_failed_preparation_retains_baseline_process_order(tmp_path: Path) -> No
     assert all("ruff" not in call.command for call in runner.calls)
 
 
-def test_safe_preparation_runs_safety_before_uv_and_starts_no_check(tmp_path: Path) -> None:
+def test_safe_preparation_runs_dependency_probe_before_any_check(tmp_path: Path) -> None:
     root = _write_locked_project(tmp_path)
     runner = _successful_runner(root)
 
@@ -198,5 +219,124 @@ def test_safe_preparation_runs_safety_before_uv_and_starts_no_check(tmp_path: Pa
     )
     assert observation.processes[4].command == ("uv", "--version")
     assert observation.mutation_protection == "unobserved"
-    assert all("ruff" not in call.command for call in runner.calls)
-    assert len(runner.calls) == 6
+    assert tuple(dependency.name for dependency in observation.dependencies) == ("ruff",)
+    assert observation.dependencies[0].status == "available"
+    assert observation.dependencies[0].process is not None
+    assert observation.dependencies[0].process.role == "dependency_probe"
+    assert all("-m" not in call.command for call in runner.calls)
+    assert len(runner.calls) == 7
+
+
+def test_dependency_probes_continue_in_first_required_order_after_errors(
+    tmp_path: Path,
+) -> None:
+    root = _write_locked_project(tmp_path)
+    stage = _run_git(root, "ls-files", "--stage", "-z", "--", ".").stdout
+    environment_root = root / ".venv"
+    plan = focused_plan(root, "ruff")
+    checks = build_checks(
+        ProjectConfig(root=root, ruff_targets=(), bandit_targets=())
+    )
+    pytest_check = checks["pytest"]
+    assert pytest_check.pytest is not None
+    plan = replace(
+        plan,
+        checks=(
+            checks["ruff"],
+            checks["annotations"],
+            checks["ty"],
+            checks["bandit"],
+            replace(
+                pytest_check,
+                pytest=replace(
+                    pytest_check.pytest,
+                    coverage=CoverageExecutionPlan(root / "pyproject.toml", 80),
+                ),
+            ),
+        ),
+        planned_coverage_scope="complete",
+    )
+    runner = RecordingRunner(
+        stdout=(
+            str(root).encode() + b"\n",
+            b"",
+            b"",
+            stage,
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 13, 15),
+                executable=environment_root / "bin/python",
+                environment_root=environment_root,
+            ),
+            _dependency_payload("ruff", status="missing", diagnostic="missing"),
+            _dependency_payload("ty", version="0.0.35", origin=environment_root / "ty.py"),
+            _dependency_payload(
+                "bandit", status="unusable", version="1.9.2", diagnostic="broken"
+            ),
+            _dependency_payload(
+                "pytest", version="8.4.2", origin=environment_root / "pytest.py"
+            ),
+            _dependency_payload(
+                "coverage", status="missing", diagnostic="missing"
+            ),
+        )
+    )
+
+    result = prepare_safe_repository(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert result.preparation.prepared is not None
+    dependencies = result.preparation.observation.dependencies
+    assert tuple(dependency.name for dependency in dependencies) == (
+        "ruff",
+        "ty",
+        "bandit",
+        "pytest",
+        "coverage",
+    )
+    assert tuple(dependency.status for dependency in dependencies) == (
+        "missing",
+        "available",
+        "unusable",
+        "available",
+        "missing",
+    )
+    dependency_calls = [
+        call for call in runner.calls if "dependency_probe" not in call.command
+        and "-c" in call.command
+        and call.command[-3] in {"ruff", "ty", "bandit", "pytest", "coverage"}
+    ]
+    assert tuple(call.command[-3] for call in dependency_calls) == (
+        "ruff",
+        "ty",
+        "bandit",
+        "pytest",
+        "coverage",
+    )
+    assert len(runner.calls) == 11
+    assert all("-m" not in call.command for call in runner.calls)
+
+
+def _dependency_payload(
+    name: str,
+    *,
+    status: str = "available",
+    version: str | None = None,
+    origin: Path | None = None,
+    diagnostic: str | None = None,
+) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "distribution": name,
+            "module": name,
+            "status": status,
+            "version": version,
+            "origin": None if origin is None else str(origin),
+            "diagnostic": diagnostic,
+        },
+        separators=(",", ":"),
+    ).encode()

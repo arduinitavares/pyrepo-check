@@ -15,6 +15,8 @@ from pyrepo_check.planning import RunPlan
 from pyrepo_check.repository_environment import (
     inspect_repository_lock,
     prepare_repository_environment,
+    probe_repository_dependencies,
+    unobserved_repository_dependencies,
 )
 from pyrepo_check.repository_safety import (
     RepositoryStateSnapshot,
@@ -37,13 +39,20 @@ def prepare_safe_repository(
     """Inspect the lock, capture safety state, then prepare without a Check."""
     lock_presence = inspect_repository_lock(plan.root)
     if lock_presence.state != "present":
+        preparation = prepare_repository_environment(
+            plan,
+            lock_presence=lock_presence,
+            runner=runner,
+            clock_ns=clock_ns,
+        )
         return SafeRepositoryPreparation(
             baseline=None,
-            preparation=prepare_repository_environment(
-                plan,
-                lock_presence=lock_presence,
-                runner=runner,
-                clock_ns=clock_ns,
+            preparation=replace(
+                preparation,
+                observation=replace(
+                    preparation.observation,
+                    dependencies=unobserved_repository_dependencies(plan),
+                ),
             ),
         )
 
@@ -61,7 +70,7 @@ def prepare_safe_repository(
             lock_path=lock_presence.path,
             lock_status="unverified",
             mutation_protection="unobserved",
-            dependencies=(),
+            dependencies=unobserved_repository_dependencies(plan),
             processes=baseline.processes,
             error=baseline.error,
         )
@@ -78,6 +87,28 @@ def prepare_safe_repository(
         runner=runner,
         clock_ns=clock_ns,
     )
+    if preparation.prepared is not None:
+        dependencies = probe_repository_dependencies(
+            plan,
+            preparation.prepared,
+            runner=runner,
+            clock_ns=clock_ns,
+        )
+        preparation = replace(
+            preparation,
+            observation=replace(
+                preparation.observation,
+                dependencies=dependencies,
+            ),
+        )
+    else:
+        preparation = replace(
+            preparation,
+            observation=replace(
+                preparation.observation,
+                dependencies=unobserved_repository_dependencies(plan),
+            ),
+        )
     observation = preparation.observation
     combined = replace(
         preparation,

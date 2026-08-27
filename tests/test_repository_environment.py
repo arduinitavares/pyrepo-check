@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path, PureWindowsPath
 import shutil
+import subprocess  # nosec B404
 import sys
 from types import MappingProxyType
 from typing import Any, cast
@@ -19,15 +21,25 @@ from pyrepo_check.repository_environment import (
     sanitized_repository_environment,
     validate_uv_storage_boundaries,
 )
-from pyrepo_check.execution import RepositoryLockPresence
+from pyrepo_check.execution import (
+    CAPTURE_LIMIT_BYTES,
+    PreparedRepositoryEnvironment,
+    PythonObservation,
+    RepositoryLockPresence,
+)
 from pyrepo_check.planning import RunPlan
 from tests.support import (
     RecordingRunner,
+    available_dependency,
     environment_probe_bytes,
     focused_plan,
+    missing_dependency,
     monotonic_clock,
     write_minimal_uv_project,
 )
+
+
+_MKFIFO = getattr(os, "mkfifo", None)
 
 
 _ALLOWED_UV_CONTROLS = (
@@ -1174,6 +1186,663 @@ def test_explicit_python_request_contradiction_is_invalid_evidence(tmp_path: Pat
     assert preparation.observation.lock_status == "current"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "environment_evidence_invalid"
+
+
+@pytest.mark.parametrize(
+    ("checks", "coverage", "expected"),
+    (
+        (("ruff", "annotations"), False, ("ruff",)),
+        (("ty", "ruff", "bandit"), False, ("ty", "ruff", "bandit")),
+        (("pytest",), False, ("pytest",)),
+        (("pytest",), True, ("pytest", "coverage")),
+    ),
+)
+def test_required_dependencies_are_unique_and_canonical(
+    checks: tuple[str, ...],
+    coverage: bool,
+    expected: tuple[str, ...],
+) -> None:
+    required_dependencies = repository_environment.required_dependencies
+
+    assert tuple(
+        dependency.name
+        for dependency in required_dependencies(checks, coverage=coverage)
+    ) == expected
+
+
+def test_supported_dependencies_use_exact_numeric_ranges() -> None:
+    dependencies = repository_environment.SUPPORTED_DEPENDENCIES
+
+    assert {
+        name: (dependency.module, dependency.minimum, dependency.maximum)
+        for name, dependency in dependencies.items()
+    } == {
+        "ruff": ("ruff", (0, 15), (1,)),
+        "ty": ("ty", (0, 0, 35), (0, 1)),
+        "bandit": ("bandit", (1, 9), (2,)),
+        "pytest": ("pytest", (8,), (9,)),
+        "coverage": ("coverage", (7, 15), (8,)),
+    }
+    with pytest.raises(TypeError):
+        cast(dict[str, Any], dependencies)["ruff"] = dependencies["ruff"]
+
+
+def test_dependency_helpers_return_complete_canonical_observations() -> None:
+    available = available_dependency("ty", "0.0.35")
+    missing = missing_dependency("coverage")
+
+    assert (
+        available.name,
+        available.module,
+        available.required,
+        available.status,
+        available.version,
+        available.origin,
+        available.process is not None,
+        available.error,
+    ) == (
+        "ty",
+        "ty",
+        ">=0.0.35,<0.1",
+        "available",
+        "0.0.35",
+        "/repository/.venv/site-packages/ty/__init__.py",
+        True,
+        None,
+    )
+    assert (
+        missing.name,
+        missing.module,
+        missing.required,
+        missing.status,
+        missing.version,
+        missing.origin,
+        missing.process is not None,
+        missing.error.code if missing.error is not None else None,
+    ) == (
+        "coverage",
+        "coverage",
+        ">=7.15,<8",
+        "missing",
+        None,
+        None,
+        True,
+        "check_dependency_missing",
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "version", "supported"),
+    (
+        ("ruff", "0.15", True),
+        ("ruff", "0.15.0", True),
+        ("ruff", "1", False),
+        ("ty", "0.0.35", True),
+        ("ty", "0.1", False),
+        ("bandit", "1.9", True),
+        ("bandit", "2.0", False),
+        ("pytest", "8", True),
+        ("pytest", "9", False),
+        ("coverage", "7.15", True),
+        ("coverage", "8", False),
+        ("pytest", None, False),
+        ("pytest", "not-a-version", False),
+        ("pytest", "8.4.0rc1", False),
+        ("pytest", "8.4.0.post1", False),
+        ("pytest", "8.4.0.dev1", False),
+        ("pytest", "8.4.0+local", False),
+    ),
+)
+def test_supported_dependency_versions_are_stable_numeric_releases_only(
+    name: str,
+    version: str | None,
+    supported: bool,
+) -> None:
+    dependency = repository_environment.SUPPORTED_DEPENDENCIES[name]
+
+    assert repository_environment.dependency_version_supported(
+        dependency, version
+    ) is supported
+
+
+def test_oversized_numeric_dependency_version_is_rejected_without_raising() -> None:
+    dependency = repository_environment.SUPPORTED_DEPENDENCIES["pytest"]
+
+    assert not repository_environment.dependency_version_supported(
+        dependency, "9" * 5000
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "returncode", "expected_status", "expected_code"),
+    (
+        (
+            {
+                "schema_version": 1,
+                "distribution": "pytest",
+                "module": "pytest",
+                "status": "available",
+                "version": "8.4.2",
+                "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+                "diagnostic": None,
+            },
+            0,
+            "available",
+            None,
+        ),
+        (
+            {
+                "schema_version": 1,
+                "distribution": "pytest",
+                "module": "pytest",
+                "status": "missing",
+                "version": None,
+                "origin": None,
+                "diagnostic": "distribution or module is missing",
+            },
+            0,
+            "missing",
+            "check_dependency_missing",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "distribution": "pytest",
+                "module": "pytest",
+                "status": "available",
+                "version": "9.0.0",
+                "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+                "diagnostic": None,
+            },
+            0,
+            "incompatible",
+            "check_dependency_incompatible",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "distribution": "pytest",
+                "module": "pytest",
+                "status": "shadowed",
+                "version": "8.4.2",
+                "origin": "/project/pytest.py",
+                "diagnostic": "module origin is not owned by the distribution",
+            },
+            0,
+            "shadowed",
+            "check_dependency_shadowed",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "distribution": "pytest",
+                "module": "pytest",
+                "status": "unusable",
+                "version": "8.4.2",
+                "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+                "diagnostic": "module import failed",
+            },
+            0,
+            "unusable",
+            "check_dependency_unusable",
+        ),
+    ),
+)
+def test_dependency_probe_payloads_preserve_status_error_and_process(
+    tmp_path: Path,
+    payload: dict[str, object],
+    returncode: int,
+    expected_status: str,
+    expected_code: str | None,
+) -> None:
+    plan, prepared = _prepared_dependency_environment(tmp_path, "pytest")
+    runner = RecordingRunner(
+        returncodes=(returncode,),
+        stdout=(json.dumps(payload, separators=(",", ":")).encode(),),
+    )
+
+    observations = repository_environment.probe_repository_dependencies(
+        plan,
+        prepared,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.status == expected_status
+    assert observation.version == payload["version"]
+    assert observation.origin == payload["origin"]
+    assert observation.process is not None
+    assert observation.process.role == "dependency_probe"
+    if expected_code is None:
+        assert observation.error is None
+    else:
+        assert observation.error is not None
+        assert observation.error.code == expected_code
+        assert observation.error.hint == {
+            "check_dependency_missing": (
+                "Add pytest >=8,<9 to the locked Repository Environment, then retry."
+            ),
+            "check_dependency_incompatible": (
+                "Lock pytest to >=8,<9 in the Repository Environment, then retry."
+            ),
+            "check_dependency_shadowed": (
+                "Remove the shadowing path and use the locked ordinary pytest "
+                "distribution, then retry."
+            ),
+            "check_dependency_unusable": (
+                "Install pytest as a locked ordinary distribution in the Repository "
+                "Environment, then retry."
+            ),
+        }[expected_code]
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "spawn", "expected_returncode"),
+    (
+        (b"not-json", 0, False, 0),
+        (
+            b'{"schema_version":1,"distribution":"pytest","module":"pytest",'
+            b'"status":"available","version":"8.4.2","origin":"/project/pytest.py",'
+            b'"diagnostic":null,"unknown":true}',
+            0,
+            False,
+            0,
+        ),
+        (
+            b'{"schema_version":1,"schema_version":1,"distribution":"pytest",'
+            b'"module":"pytest","status":"available","version":"8.4.2",'
+            b'"origin":"/project/pytest.py","diagnostic":null}',
+            0,
+            False,
+            0,
+        ),
+        (
+            b'{"schema_version":1,"distribution":"pytest","module":"pytest",'
+            b'"status":"available","version":null,"origin":"/project/pytest.py",'
+            b'"diagnostic":null}',
+            0,
+            False,
+            0,
+        ),
+        (b"{}", 3, False, 3),
+        (b"{}", -9, False, -9),
+        (b"{}", 0, True, None),
+    ),
+)
+def test_dependency_probe_evidence_failures_are_unobserved(
+    tmp_path: Path,
+    stdout: bytes,
+    returncode: int,
+    spawn: bool,
+    expected_returncode: int | None,
+) -> None:
+    plan, prepared = _prepared_dependency_environment(tmp_path, "pytest")
+    runner = RecordingRunner(
+        returncodes=(returncode,),
+        stdout=(stdout,),
+        raise_on_call=1 if spawn else None,
+    )
+
+    (observation,) = repository_environment.probe_repository_dependencies(
+        plan,
+        prepared,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert observation.status == "unobserved"
+    assert observation.version is None
+    assert observation.origin is None
+    assert observation.process is not None
+    assert observation.process.returncode == expected_returncode
+    assert (observation.process.spawn_error is not None) is spawn
+    assert observation.error is not None
+    assert observation.error.code == "check_dependency_unusable"
+    assert observation.error.hint == (
+        "Repair the locked ordinary pytest installation and retry."
+    )
+
+
+@pytest.mark.parametrize(("extra_bytes", "status"), ((0, "available"), (1, "unobserved")))
+def test_dependency_probe_uses_exact_capture_bound(
+    tmp_path: Path,
+    extra_bytes: int,
+    status: str,
+) -> None:
+    plan, prepared = _prepared_dependency_environment(tmp_path, "pytest")
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "distribution": "pytest",
+            "module": "pytest",
+            "status": "available",
+            "version": "8.4.2",
+            "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+            "diagnostic": None,
+        },
+        separators=(",", ":"),
+    ).encode()
+    stdout = payload + b" " * (CAPTURE_LIMIT_BYTES - len(payload) + extra_bytes)
+    runner = RecordingRunner(stdout=(stdout,))
+
+    (observation,) = repository_environment.probe_repository_dependencies(
+        plan,
+        prepared,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert observation.status == status
+
+
+def test_standalone_dependency_probe_emits_exact_available_document(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(site_packages, version="8.4.2")
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+
+    origin = site_packages / "sample_dep/__init__.py"
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    assert completed.stdout == (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "distribution": "sample-dep",
+                "module": "sample_dep",
+                "status": "available",
+                "version": "8.4.2",
+                "origin": str(origin),
+                "diagnostic": None,
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+
+
+def test_standalone_dependency_probe_is_python_310_syntax() -> None:
+    ast.parse(repository_environment.DEPENDENCY_PROBE_SOURCE, feature_version=(3, 10))
+
+
+@pytest.mark.parametrize("missing", ("distribution", "module"))
+def test_standalone_dependency_probe_reports_missing_distribution_or_module(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    if missing == "module":
+        _write_distribution(site_packages, version="8.4.2", write_module=False)
+    else:
+        (site_packages / "sample_dep.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "missing"
+    assert payload["diagnostic"] is not None
+
+
+def test_standalone_dependency_probe_rejects_repository_shadow_without_import(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(site_packages, version="8.4.2")
+    imported = project / "imported"
+    (project / "sample_dep.py").write_text(
+        f"from pathlib import Path\nPath({str(imported)!r}).write_text('bad')\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "shadowed"
+    assert payload["origin"] == str(project / "sample_dep.py")
+    assert not imported.exists()
+
+
+def test_standalone_dependency_probe_rejects_missing_files_metadata(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(site_packages, version="8.4.2", write_record=False)
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert "files metadata" in payload["diagnostic"]
+
+
+@pytest.mark.parametrize(
+    "direct_url",
+    (
+        {"url": "file:///project", "dir_info": {"editable": True}},
+        {"url": "file:///project", "dir_info": {"editable": False}},
+    ),
+)
+def test_standalone_dependency_probe_rejects_editable_or_local_install(
+    tmp_path: Path,
+    direct_url: dict[str, object],
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(site_packages, version="8.4.2", direct_url=direct_url)
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert "ordinary distribution" in payload["diagnostic"]
+
+
+def test_standalone_dependency_probe_rejects_malformed_direct_url_metadata(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(site_packages, version="8.4.2")
+    metadata = site_packages / "sample_dep-8.4.2.dist-info/direct_url.json"
+    metadata.write_text("[]", encoding="utf-8")
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert "direct URL metadata is invalid" in payload["diagnostic"]
+
+
+@pytest.mark.parametrize("symlink_kind", ("origin", "ancestor"))
+def test_standalone_dependency_probe_rejects_symlinks_before_import(
+    tmp_path: Path,
+    symlink_kind: str,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    imported = project / "imported"
+    payload_source = (
+        f"from pathlib import Path\nPath({str(imported)!r}).write_text('bad')\n"
+    )
+    if symlink_kind == "origin":
+        _write_distribution(site_packages, version="8.4.2", write_module=False)
+        package = site_packages / "sample_dep"
+        package.mkdir()
+        repository_payload = project / "payload.py"
+        repository_payload.write_text(payload_source, encoding="utf-8")
+        (package / "__init__.py").symlink_to(repository_payload)
+    else:
+        _write_distribution(site_packages, version="8.4.2", write_module=False)
+        real_package = site_packages / "real_sample_dep"
+        real_package.mkdir()
+        (real_package / "__init__.py").write_text(payload_source, encoding="utf-8")
+        (site_packages / "sample_dep").symlink_to(
+            real_package, target_is_directory=True
+        )
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "shadowed"
+    assert not imported.exists()
+
+
+def test_standalone_dependency_probe_classifies_import_failure_as_unusable(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(
+        site_packages,
+        version="8.4.2",
+        module_source="raise RuntimeError('broken import')\n",
+    )
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "unusable"
+    assert payload["version"] == "8.4.2"
+    assert payload["origin"] == str(site_packages / "sample_dep/__init__.py")
+    assert "RuntimeError" in payload["diagnostic"]
+
+
+def test_standalone_dependency_probe_rejects_special_module_origin(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, site_packages = _dependency_probe_layout(tmp_path)
+    _write_distribution(site_packages, version="8.4.2", write_module=False)
+    package = site_packages / "sample_dep"
+    package.mkdir()
+    if _MKFIFO is None:
+        pytest.skip()
+    _MKFIFO(package / "__init__.py")
+
+    completed = _run_dependency_probe(project, environment_root, site_packages)
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "shadowed"
+    assert "regular file" in payload["diagnostic"]
+
+
+def test_standalone_dependency_probe_rejects_distribution_root_disagreement(
+    tmp_path: Path,
+) -> None:
+    project, environment_root, _site_packages = _dependency_probe_layout(tmp_path)
+    external_site_packages = tmp_path / "external-site-packages"
+    external_site_packages.mkdir()
+    imported = project / "imported"
+    _write_distribution(
+        external_site_packages,
+        version="8.4.2",
+        module_source=(
+            f"from pathlib import Path\nPath({str(imported)!r}).write_text('bad')\n"
+        ),
+    )
+
+    completed = _run_dependency_probe(
+        project, environment_root, external_site_packages
+    )
+    payload = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "shadowed"
+    assert "root disagrees" in payload["diagnostic"]
+    assert not imported.exists()
+
+
+def _prepared_dependency_environment(
+    tmp_path: Path,
+    check: str,
+) -> tuple[RunPlan, PreparedRepositoryEnvironment]:
+    plan = focused_plan(tmp_path, cast(Any, check))
+    environment_root = tmp_path / ".venv"
+    return (
+        plan,
+        PreparedRepositoryEnvironment(
+            root=plan.root,
+            path=environment_root,
+            python=PythonObservation(
+                implementation="cpython",
+                version=(3, 12, 11),
+                executable=environment_root / "bin/python",
+            ),
+            python_selection=plan.repository_python,
+            manager_version="0.10.12",
+            child_environment={"PATH": "/bin"},
+        ),
+    )
+
+
+def _dependency_probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    project = tmp_path / "project"
+    project.mkdir()
+    environment_root = project / ".venv"
+    site_packages = environment_root / "lib/python3.13/site-packages"
+    site_packages.mkdir(parents=True)
+    return project, environment_root, site_packages
+
+
+def _write_distribution(
+    site_packages: Path,
+    *,
+    version: str,
+    write_module: bool = True,
+    write_record: bool = True,
+    module_source: str = "VALUE = 1\n",
+    direct_url: dict[str, object] | None = None,
+) -> None:
+    package = site_packages / "sample_dep"
+    if write_module:
+        package.mkdir(exist_ok=True)
+        (package / "__init__.py").write_text(module_source, encoding="utf-8")
+    metadata = site_packages / "sample_dep-8.4.2.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: sample_dep\nVersion: {version}\n",
+        encoding="utf-8",
+    )
+    if write_record:
+        (metadata / "RECORD").write_text(
+            "sample_dep/__init__.py,,\nsample_dep-8.4.2.dist-info/METADATA,,\n",
+            encoding="utf-8",
+        )
+    if direct_url is not None:
+        (metadata / "direct_url.json").write_text(
+            json.dumps(direct_url), encoding="utf-8"
+        )
+
+
+def _run_dependency_probe(
+    project: Path,
+    environment_root: Path,
+    site_packages: Path,
+) -> subprocess.CompletedProcess[bytes]:
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(site_packages)
+    return subprocess.run(  # nosec B603
+        (
+            sys.executable,
+            "-c",
+            repository_environment.DEPENDENCY_PROBE_SOURCE,
+            "sample-dep",
+            "sample_dep",
+            str(environment_root),
+        ),
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
 
 
 def _valid_probe(

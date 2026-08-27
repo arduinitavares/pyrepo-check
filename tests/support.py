@@ -10,6 +10,12 @@ from typing import cast
 import uuid
 
 from pyrepo_check.config import ProjectConfig
+from pyrepo_check.execution import (
+    CapturedBytes,
+    CheckExecutionFailure,
+    DependencyObservation,
+    ExecutedProcess,
+)
 from pyrepo_check.planning import (
     CheckName,
     DefaultRepositoryPython,
@@ -17,6 +23,7 @@ from pyrepo_check.planning import (
     RunPlan,
     build_checks,
 )
+from pyrepo_check.repository_environment import DependencyName, SUPPORTED_DEPENDENCIES
 
 
 _SUPPORTED_PYTEST_PREFLIGHT = (
@@ -136,6 +143,64 @@ def environment_probe_bytes(
         },
         separators=(",", ":"),
     ).encode()
+
+
+def available_dependency(name: DependencyName, version: str) -> DependencyObservation:
+    dependency = SUPPORTED_DEPENDENCIES[name]
+    return DependencyObservation(
+        name=dependency.name,
+        module=dependency.module,
+        required=_dependency_required(dependency.minimum, dependency.maximum),
+        status="available",
+        version=version,
+        origin=f"/repository/.venv/site-packages/{dependency.module}/__init__.py",
+        process=_dependency_process(name),
+        error=None,
+    )
+
+
+def missing_dependency(name: DependencyName) -> DependencyObservation:
+    dependency = SUPPORTED_DEPENDENCIES[name]
+    required = _dependency_required(dependency.minimum, dependency.maximum)
+    return DependencyObservation(
+        name=dependency.name,
+        module=dependency.module,
+        required=required,
+        status="missing",
+        version=None,
+        origin=None,
+        process=_dependency_process(name),
+        error=CheckExecutionFailure(
+            code="check_dependency_missing",
+            message=f"Repository dependency {name} is missing.",
+            hint=(
+                f"Add {name} {required} to the locked Repository Environment, "
+                "then retry."
+            ),
+        ),
+    )
+
+
+def _dependency_process(name: DependencyName) -> ExecutedProcess:
+    return ExecutedProcess(
+        role="dependency_probe",
+        command=("uv", "run", "dependency-probe", name),
+        cwd=Path("/repository"),
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+
+
+def _dependency_required(
+    minimum: tuple[int, ...],
+    maximum: tuple[int, ...],
+) -> str:
+    lower = ".".join(str(part) for part in minimum)
+    upper = ".".join(str(part) for part in maximum)
+    return f">={lower},<{upper}"
 
 
 def write_minimal_uv_project(root: Path) -> None:
