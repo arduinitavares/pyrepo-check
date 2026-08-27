@@ -285,8 +285,15 @@ def _validate_run_report_v2(report: RunReportV2) -> None:
     observed_dependencies = tuple(item.name for item in environment.dependencies)
     if observed_dependencies != expected_dependencies:
         _invalid("dependencies must use first-required order without duplicates")
+    pre_execution_environment_error = (
+        environment.error is not None
+        and environment.error.code != "repository_state_changed"
+    )
     for dependency in environment.dependencies:
-        _validate_dependency_evidence_v2(dependency, environment_error=environment.error is not None)
+        _validate_dependency_evidence_v2(
+            dependency,
+            pre_execution_environment_error=pre_execution_environment_error,
+        )
 
     dependencies = {dependency.name: dependency for dependency in environment.dependencies}
     for check in report.checks:
@@ -590,7 +597,7 @@ def _dependency_for_check_v2(
 def _validate_dependency_evidence_v2(
     dependency: DependencyEvidence,
     *,
-    environment_error: bool,
+    pre_execution_environment_error: bool,
 ) -> None:
     expected_module = dependency.name
     if dependency.module != expected_module:
@@ -620,8 +627,10 @@ def _validate_dependency_evidence_v2(
         if dependency.version is not None or dependency.origin is not None:
             _invalid("unobserved dependency cannot claim version or origin")
         if process is None:
-            if dependency.error is not None or not environment_error:
-                _invalid("not-attempted dependency requires an environment error")
+            if dependency.error is not None or not pre_execution_environment_error:
+                _invalid(
+                    "not-attempted dependency requires a pre-execution environment error"
+                )
         elif dependency.error is None or dependency.error.code != "check_dependency_unusable":
             _invalid("attempted unobserved dependency requires unusable evidence error")
         return

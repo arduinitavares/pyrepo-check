@@ -65,7 +65,10 @@ from pyrepo_check.reporting_schema import (
     ToolEnvironmentEvidence,
     validate_report_structure_v2,
 )
-from pyrepo_check.repository_environment import prepare_repository_environment
+from pyrepo_check.repository_environment import (
+    prepare_repository_environment,
+    probe_repository_dependencies,
+)
 from pyrepo_check.repository_executor import SafeRepositoryPreparation
 from pyrepo_check.repository_safety import (
     RepositoryStateSnapshot,
@@ -2070,7 +2073,7 @@ def observed_unavailable_pytest_workspace_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    pytest_status: Literal["missing", "incompatible"],
+    pytest_status: Literal["missing", "incompatible", "unobserved"],
     failure_stage: Literal["creation", "cleanup"],
     repository_changed: bool,
 ) -> tuple[RepositoryExecutionResult, RunReportV2]:
@@ -2103,6 +2106,14 @@ def observed_unavailable_pytest_workspace_report(
                 "Repository dependency pytest is incompatible.",
                 "Lock a supported pytest version.",
             ),
+        )
+    elif pytest_status == "unobserved":
+        probe_plan = focused_plan(tmp_path, "pytest")
+        (pytest_dependency,) = probe_repository_dependencies(
+            probe_plan,
+            prepared,
+            runner=RecordingRunner(stdout=(b"{}",)),
+            clock_ns=monotonic_clock(),
         )
     coverage_dependency = available_dependency("coverage", "7.15.2")
     environment_observation = RepositoryEnvironmentObservation(
@@ -2252,11 +2263,11 @@ def observed_unavailable_pytest_workspace_report(
 
 @pytest.mark.parametrize("repository_changed", (False, True))
 @pytest.mark.parametrize("failure_stage", ("creation", "cleanup"))
-@pytest.mark.parametrize("pytest_status", ("missing", "incompatible"))
+@pytest.mark.parametrize("pytest_status", ("missing", "incompatible", "unobserved"))
 def test_schema_v2_accepts_unavailable_pytest_workspace_producer_cross_product(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    pytest_status: Literal["missing", "incompatible"],
+    pytest_status: Literal["missing", "incompatible", "unobserved"],
     failure_stage: Literal["creation", "cleanup"],
     repository_changed: bool,
 ) -> None:
@@ -2289,24 +2300,97 @@ def test_schema_v2_accepts_unavailable_pytest_workspace_producer_cross_product(
         assert pytest_result.error.code == "not_started"
     else:
         assert observed.pytest is not None
-        assert observed.pytest.preflight.classification == (
-            "module_unavailable"
-            if pytest_status == "missing"
-            else "unsupported_version"
-        )
+        expected_preflight = {
+            "missing": "module_unavailable",
+            "incompatible": "unsupported_version",
+            "unobserved": "preflight_invalid",
+        }[pytest_status]
+        expected_version = "7.4.0" if pytest_status == "incompatible" else None
+        assert observed.pytest.preflight.classification == expected_preflight
         assert observed.coverage is not None
         assert observed.coverage.preflight.classification == "preflight_invalid"
-        assert pytest_result.pytest_version == (
-            None if pytest_status == "missing" else "7.4.0"
-        )
-        assert pytest_result.error.code == (
-            "module_unavailable"
-            if pytest_status == "missing"
-            else "unsupported_version"
-        )
+        assert pytest_result.pytest_version == expected_version
+        assert pytest_result.error.code == expected_preflight
     assert coverage_result.coverage_version is None
     assert coverage_result.error.code == "preflight_invalid"
+    if pytest_status == "unobserved":
+        observed_dependency = execution.repository_environment.dependencies[0]
+        assert observed_dependency.status == "unobserved"
+        assert observed_dependency.process is not None
+        assert observed_dependency.error is not None
+        assert observed_dependency.error.code == "check_dependency_unusable"
+        dependency = report.repository_environment.dependencies[0]
+        assert dependency.process is not None
+        assert dependency.error is not None
+        assert dependency.error.code == "check_dependency_unusable"
     validate_report_v2(report)
+
+
+@pytest.mark.parametrize("repository_changed", (False, True))
+def test_schema_v2_rejects_unattempted_pytest_after_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repository_changed: bool,
+) -> None:
+    _, report = observed_unavailable_pytest_workspace_report(
+        tmp_path,
+        monkeypatch,
+        pytest_status="unobserved",
+        failure_stage="cleanup",
+        repository_changed=repository_changed,
+    )
+    environment = report.repository_environment
+    pytest_dependency, coverage_dependency = environment.dependencies
+    assert pytest_dependency.process is not None
+    assert pytest_dependency.error is not None
+    unattempted = replace(pytest_dependency, process=None, error=None)
+
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                report,
+                repository_environment=replace(
+                    environment,
+                    dependencies=(unattempted, coverage_dependency),
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize("repository_changed", (False, True))
+def test_schema_v2_rejects_unattempted_requested_coverage_after_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repository_changed: bool,
+) -> None:
+    _, report = observed_unavailable_pytest_workspace_report(
+        tmp_path,
+        monkeypatch,
+        pytest_status="missing",
+        failure_stage="cleanup",
+        repository_changed=repository_changed,
+    )
+    environment = report.repository_environment
+    pytest_dependency, coverage_dependency = environment.dependencies
+    unattempted = replace(
+        coverage_dependency,
+        status="unobserved",
+        version=None,
+        origin=None,
+        process=None,
+        error=None,
+    )
+
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                report,
+                repository_environment=replace(
+                    environment,
+                    dependencies=(pytest_dependency, unattempted),
+                ),
+            )
+        )
 
 
 @pytest.mark.parametrize(
