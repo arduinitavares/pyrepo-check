@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from pyrepo_check.config import ProjectConfig
+from pyrepo_check.execution import execute_legacy_commands
 from pyrepo_check.runner import Check, build_checks, run_checks, select_checks
 from tests.support import RecordingRunner
 
@@ -35,13 +36,13 @@ def test_legacy_select_returns_original_checks_in_canonical_order() -> None:
     assert selected[1] is ty
 
 
-def test_legacy_run_checks_preserves_raw_vectors_without_using_run_plan(
+def test_legacy_runner_facade_delegates_raw_vectors_through_patchable_helper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     check = Check("ruff", ("uv", "run", "ruff"))
-    received: list[tuple[tuple[tuple[str, ...], ...], Path, object]] = []
     injected_runner = RecordingRunner()
+    received: list[tuple[tuple[tuple[str, ...], ...], Path, object]] = []
 
     def fake_execute_legacy_commands(
         commands: tuple[tuple[str, ...], ...],
@@ -50,12 +51,33 @@ def test_legacy_run_checks_preserves_raw_vectors_without_using_run_plan(
         runner: object,
     ) -> int:
         received.append((commands, cwd, runner))
-        assert runner is injected_runner
         return 7
 
-    monkeypatch.setattr("pyrepo_check.runner.execute_legacy_commands", fake_execute_legacy_commands)
+    monkeypatch.setattr(
+        "pyrepo_check.execution.execute_legacy_commands", fake_execute_legacy_commands
+    )
 
-    result = run_checks((check,), cwd=tmp_path, runner=injected_runner)
-
-    assert result == 7
+    assert run_checks((check,), cwd=tmp_path, runner=injected_runner) == 7
     assert received == [((check.command,), tmp_path, injected_runner)]
+
+
+@pytest.mark.parametrize(
+    ("returncodes", "raise_on_call", "expected"),
+    (
+        ((-15, 7, 0), None, 7),
+        ((0, 0, 0), 2, 2),
+        ((0, 0, 7), 2, 7),
+    ),
+)
+def test_legacy_command_execution_continues_and_preserves_exit_precedence(
+    tmp_path: Path,
+    returncodes: tuple[int, ...],
+    raise_on_call: int | None,
+    expected: int,
+) -> None:
+    commands = (("first",), ("second",), ("third",))
+    runner = RecordingRunner(returncodes=returncodes, raise_on_call=raise_on_call)
+
+    assert execute_legacy_commands(commands, cwd=tmp_path, runner=runner) == expected
+    assert [call.command for call in runner.calls] == list(commands)
+    assert all(call.cwd == tmp_path for call in runner.calls)

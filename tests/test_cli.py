@@ -49,12 +49,17 @@ def test_python_request_is_accepted_before_or_after_check_tokens(
     assert args.checks == ["ty"]
 
 
-def test_missing_pyproject_is_a_zero_spawn_planning_error(tmp_path: Path) -> None:
+def test_missing_pyproject_is_a_zero_spawn_planning_error(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
     (tmp_path / "pyproject.toml").unlink()
     runner = RecordingRunner()
 
-    assert main(("--root", str(tmp_path), "ty"), runner=runner) == 2
+    assert main(("--root", str(tmp_path), "--format", "json", "ty"), runner=runner) == 2
     assert runner.calls == []
+    payload = json.loads(capsysbinary.readouterr().out)
+    assert payload["error"]["code"] == "uv_project_required"
 
 
 @pytest.mark.parametrize(

@@ -1552,9 +1552,35 @@ def test_help_surface_is_unchanged(
 
     output = capsys.readouterr()
     assert captured.value.code == 0
-    assert "--python REQUEST" in output.out
-    assert "Request a Repository Python from 3.10 through 3.13." in output.out
-    assert "repository-safe" in output.out
+    assert (
+        output.out
+        == """usage: pyrepo-check [-h] [--all] [--root ROOT] [--no-frozen]
+                    [--python REQUEST] [--format {terminal,json}]
+                    [--shortcut NAME] [--coverage]
+                    [checks ...]
+
+Run Python repository quality checks.
+
+positional arguments:
+  checks                Optional check names and target paths. Checks: ruff,
+                        annotations, annotations-fix, ty, bandit, pytest.
+
+options:
+  -h, --help            show this help message and exit
+  --all                 Run all checks.
+  --root ROOT           Project root to check. Defaults to the current working
+                        directory.
+  --no-frozen           Recognized for compatibility; repository-safe
+                        execution rejects it.
+  --python REQUEST      Request a Repository Python from 3.10 through 3.13.
+  --format {terminal,json}
+                        Output terminal diagnostics or one JSON document.
+  --shortcut NAME       Run a configured Test Shortcut in a pytest-only
+                        focused run.
+  --coverage            Plan Coverage.py collection for the selected pytest
+                        run.
+"""
+    )
     assert output.err == ""
 
 

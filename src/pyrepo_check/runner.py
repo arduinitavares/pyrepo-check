@@ -4,8 +4,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from pyrepo_check import execution
 from pyrepo_check.config import ProjectConfig
-from pyrepo_check.execution import CHECK_MODULES, ProcessRunner, execute_legacy_commands
+from pyrepo_check.execution import CHECK_MODULES, ProcessRunner
 from pyrepo_check.planning import (
     CHECK_ORDER as CHECK_ORDER,
     SELECTABLE_CHECK_ORDER as SELECTABLE_CHECK_ORDER,
@@ -68,7 +69,7 @@ def run_checks(
     cwd: Path,
     runner: ProcessRunner | None = None,
 ) -> int:
-    return execute_legacy_commands(
+    return execution.execute_legacy_commands(
         tuple(check.command for check in checks),
         cwd=cwd,
         runner=runner,
