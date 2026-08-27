@@ -65,6 +65,9 @@ def test_legacy_runner_facade_delegates_raw_vectors_through_patchable_helper(
     ("returncodes", "raise_on_call", "expected"),
     (
         ((-15, 7, 0), None, 7),
+        ((-15, 0, 0), None, 2),
+        ((7, 8, 0), None, 7),
+        ((0, 0, 0), None, 0),
         ((0, 0, 0), 2, 2),
         ((0, 0, 7), 2, 7),
     ),
