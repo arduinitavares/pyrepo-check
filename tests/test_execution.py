@@ -20,6 +20,7 @@ from pyrepo_check.execution import (
     ExecutedProcess,
     ExecutionResult,
     execute_plan,
+    observe_tool_environment,
 )
 from pyrepo_check.planning import (
     CheckInvocation,
@@ -30,6 +31,24 @@ from pyrepo_check.planning import (
     RunPlan,
 )
 from tests.support import RecordingRunner
+
+
+def test_tool_environment_observation_uses_controller_without_a_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbid_process(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("tool environment observation must not spawn a process")
+
+    monkeypatch.setattr(subprocess, "Popen", forbid_process)
+
+    observation = observe_tool_environment()
+
+    assert observation.pyrepo_check_version == "0.1.0"
+    assert observation.python.implementation == sys.implementation.name
+    assert observation.python.version == tuple(sys.version_info[:3])
+    assert observation.python.executable == Path(
+        os.path.abspath(os.path.normpath(sys.executable))
+    )
 
 
 def make_plan(tmp_path: Path) -> RunPlan:

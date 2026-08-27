@@ -9,6 +9,15 @@ import subprocess  # nosec B404
 from typing import cast
 import uuid
 
+from pyrepo_check.config import ProjectConfig
+from pyrepo_check.planning import (
+    CheckName,
+    DefaultRepositoryPython,
+    ExplicitRepositoryPython,
+    RunPlan,
+    build_checks,
+)
+
 
 _SUPPORTED_PYTEST_PREFLIGHT = (
     b'{"schema_version":1,"python_version":[3,13,15],'
@@ -104,6 +113,63 @@ class RecordingRunner:
                 ),
             ),
         )
+
+
+def monotonic_clock() -> Callable[[], int]:
+    values = iter(range(0, 10_000_000_000, 1_000_000))
+    return lambda: next(values)
+
+
+def environment_probe_bytes(
+    *,
+    version: tuple[int, int, int],
+    executable: Path,
+    environment_root: Path,
+) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "implementation": "cpython",
+            "version": list(version),
+            "executable": str(executable),
+            "environment_root": str(environment_root),
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def write_minimal_uv_project(root: Path) -> None:
+    (root / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0'\nrequires-python='>=3.10'\n",
+        encoding="utf-8",
+    )
+    (root / "uv.lock").write_text("version = 1\nrevision = 3\n", encoding="utf-8")
+    (root / ".venv/bin").mkdir(parents=True)
+    (root / ".venv/bin/python").write_bytes(b"")
+
+
+def focused_plan(
+    root: Path,
+    check: CheckName,
+    repository_python: str | None = None,
+) -> RunPlan:
+    resolved_root = root.resolve()
+    checks = build_checks(
+        ProjectConfig(root=resolved_root, ruff_targets=(), bandit_targets=())
+    )
+    selection = (
+        DefaultRepositoryPython()
+        if repository_python is None
+        else ExplicitRepositoryPython(repository_python)
+    )
+    return RunPlan(
+        root=resolved_root,
+        repository_python=selection,
+        mode="focused",
+        targets=(),
+        checks=(checks[check],),
+        output_format="json",
+    )
 
 
 def _default_stdout(

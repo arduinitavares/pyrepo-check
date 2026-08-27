@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import queue
 import shlex
 import subprocess  # nosec B404
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, cast
@@ -14,8 +16,10 @@ from pyrepo_check.planning import (
     CheckInvocation,
     CheckName,
     DefaultRepositoryPython,
+    RepositoryPythonSelection,
     RunPlan,
 )
+from pyrepo_check import __version__
 
 if TYPE_CHECKING:
     from pyrepo_check.coverage_execution import CoverageExecutionObservation
@@ -98,6 +102,162 @@ class ExecutedProcess:
     stdout: CapturedBytes | None
     stderr: CapturedBytes | None
     spawn_error: str | None
+
+
+PythonVersion = tuple[int, int, int]
+LockStatus = Literal["current", "missing", "unverified"]
+MutationProtection = Literal["unobserved", "protected_files", "tracked_files"]
+EnvironmentErrorCode = Literal[
+    "repository_lock_missing",
+    "uv_unavailable",
+    "repository_environment_failed",
+    "repository_python_unsupported",
+    "unsafe_repository_environment",
+    "environment_evidence_invalid",
+    "repository_state_changed",
+]
+CheckExecutionErrorCode = Literal[
+    "spawn_failed",
+    "terminated_by_signal",
+    "pytest_preflight_failed",
+    "pytest_evidence_error",
+    "coverage_preflight_failed",
+    "missing_primary_process",
+    "cleanup_failed",
+    "repository_environment_unavailable",
+    "check_dependency_missing",
+    "check_dependency_incompatible",
+    "check_dependency_shadowed",
+    "check_dependency_unusable",
+    "check_start_evidence_invalid",
+    "check_execution_failed",
+]
+DependencyStatus = Literal[
+    "available", "missing", "incompatible", "shadowed", "unusable", "unobserved"
+]
+CheckModule = Literal["ruff", "ty", "bandit", "pytest", "coverage"]
+
+
+@dataclass(frozen=True)
+class PythonObservation:
+    implementation: str
+    version: PythonVersion
+    executable: Path
+
+
+@dataclass(frozen=True)
+class ToolEnvironmentObservation:
+    pyrepo_check_version: str
+    python: PythonObservation
+
+
+@dataclass(frozen=True)
+class EnvironmentFailureObservation:
+    code: EnvironmentErrorCode
+    message: str
+    hint: str | None
+
+
+@dataclass(frozen=True)
+class CheckExecutionFailure:
+    code: CheckExecutionErrorCode
+    message: str
+    hint: str | None
+
+
+@dataclass(frozen=True)
+class CheckStartObservation:
+    schema_version: Literal[1]
+    check: CheckName
+    module: CheckModule
+    arguments_sha256: str
+    python: PythonObservation
+
+
+@dataclass(frozen=True)
+class AnalysisPythonAuthorityObservation:
+    authority: Literal["repository_tool"] = "repository_tool"
+    pyrepo_check_override: None = None
+
+
+@dataclass(frozen=True)
+class DependencyObservation:
+    name: Literal["ruff", "ty", "bandit", "pytest", "coverage"]
+    module: str
+    required: str
+    status: DependencyStatus
+    version: str | None
+    origin: str | None
+    process: ExecutedProcess | None
+    error: CheckExecutionFailure | None
+
+
+@dataclass(frozen=True)
+class PreparedRepositoryEnvironment:
+    root: Path
+    path: Path
+    python: PythonObservation
+    python_selection: RepositoryPythonSelection
+    manager_version: str
+    child_environment: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class RepositoryEnvironmentObservation:
+    manager_version: str | None
+    path: Path | None
+    python_selection: RepositoryPythonSelection
+    python: PythonObservation | None
+    lock_path: Path
+    lock_status: LockStatus
+    mutation_protection: MutationProtection
+    dependencies: tuple[DependencyObservation, ...]
+    processes: tuple[ExecutedProcess, ...]
+    error: EnvironmentFailureObservation | None
+
+
+@dataclass(frozen=True)
+class RepositoryPreparation:
+    prepared: PreparedRepositoryEnvironment | None
+    observation: RepositoryEnvironmentObservation
+
+
+@dataclass(frozen=True)
+class RepositoryLockPresence:
+    path: Path
+    state: Literal["missing", "present", "unsafe"]
+    diagnostic: str | None
+
+
+@dataclass(frozen=True)
+class RepositoryCheckObservation:
+    invocation: CheckInvocation
+    execution_environment: Literal["repository"] | None
+    analysis_python_authority: AnalysisPythonAuthorityObservation | None
+    start: CheckStartObservation | None
+    processes: tuple[ExecutedProcess, ...]
+    error: CheckExecutionFailure | None
+    pytest: PytestExecutionObservation | None = None
+    coverage: CoverageExecutionObservation | None = None
+
+
+@dataclass(frozen=True)
+class RepositoryExecutionResult:
+    tool_environment: ToolEnvironmentObservation
+    repository_environment: RepositoryEnvironmentObservation
+    checks: tuple[RepositoryCheckObservation, ...]
+
+
+def observe_tool_environment() -> ToolEnvironmentObservation:
+    executable = Path(os.path.abspath(os.path.normpath(sys.executable)))
+    return ToolEnvironmentObservation(
+        pyrepo_check_version=__version__,
+        python=PythonObservation(
+            implementation=sys.implementation.name,
+            version=cast(PythonVersion, tuple(sys.version_info[:3])),
+            executable=executable,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -252,7 +412,7 @@ def execute_process(
     capture_output: bool,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
-    environment: dict[str, str] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> ExecutedProcess:
     started_ns: int | None = None
     returncode: int | None = None
@@ -305,7 +465,7 @@ def _run_bounded_process(
     *,
     cwd: Path,
     capture_output: bool,
-    environment: dict[str, str] | None,
+    environment: Mapping[str, str] | None,
 ) -> tuple[int, CapturedBytes | None, CapturedBytes | None]:
     process = subprocess.Popen(  # nosec B603
         command,
