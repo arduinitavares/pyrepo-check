@@ -60,6 +60,12 @@ from urllib.parse import unquote_to_bytes, urlsplit
 
 distribution_name, module_name, environment_root_text = sys.argv[1:]
 
+UNRESERVED_CHARACTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+SUBDELIMITER_CHARACTERS = "!$&'()*+,;="
+PCHARACTERS = UNRESERVED_CHARACTERS + SUBDELIMITER_CHARACTERS + ":@%"
+USERINFO_CHARACTERS = UNRESERVED_CHARACTERS + SUBDELIMITER_CHARACTERS + ":%"
+URI_CHARACTERS = PCHARACTERS + "/?#[]"
+
 
 def emit(status, version, origin, diagnostic):
     record = {
@@ -129,10 +135,23 @@ def valid_domain_name(value):
     return True
 
 
+def valid_hierarchical_components(parsed_url):
+    return (
+        all(character in PCHARACTERS + "/" for character in parsed_url.path)
+        and all(character in PCHARACTERS + "/?" for character in parsed_url.query)
+        and all(character in PCHARACTERS + "/?" for character in parsed_url.fragment)
+    )
+
+
 def valid_remote_authority(parsed_url):
     if parsed_url.netloc.count("@") > 1:
         return False
-    authority = parsed_url.netloc.rsplit("@", 1)[-1]
+    if "@" in parsed_url.netloc:
+        userinfo, authority = parsed_url.netloc.split("@", 1)
+        if any(character not in USERINFO_CHARACTERS for character in userinfo):
+            return False
+    else:
+        authority = parsed_url.netloc
     hostname = parsed_url.hostname
     if not authority or hostname is None:
         return False
@@ -237,8 +256,7 @@ if direct_url_text is not None:
     if not url or url != url.strip() or any(character.isspace() for character in url):
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
-    allowed_url_characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'()*+,;=%"
-    if any(character not in allowed_url_characters for character in url) or not valid_percent_escapes(url):
+    if any(character not in URI_CHARACTERS for character in url) or not valid_percent_escapes(url):
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
     try:
@@ -253,7 +271,7 @@ if direct_url_text is not None:
     if editable is True or scheme == "file" or scheme.endswith("+file"):
         emit("unusable", version, origin, "dependency is not an ordinary distribution")
         raise SystemExit(0)
-    if not valid_remote_authority(parsed_url):
+    if not valid_remote_authority(parsed_url) or not valid_hierarchical_components(parsed_url):
         emit("unusable", version, origin, "direct URL metadata is invalid")
         raise SystemExit(0)
 

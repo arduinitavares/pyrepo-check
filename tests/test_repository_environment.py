@@ -1727,6 +1727,11 @@ def test_standalone_dependency_probe_rejects_blank_direct_url_before_import(
         "https:///tool.whl",
         "https://-example.invalid/tool.whl",
         "https://example.invalid:99999/tool.whl",
+        "https://example.invalid/tool[1].whl",
+        "https://example.invalid/tool.whl?part=[one]",
+        "https://example.invalid/tool.whl#part[one]",
+        "https://example.invalid/tool.whl#first#second",
+        "https://user[one]@example.invalid/tool.whl",
     ),
     ids=(
         "malformed-host-escape",
@@ -1735,6 +1740,11 @@ def test_standalone_dependency_probe_rejects_blank_direct_url_before_import(
         "missing-host",
         "invalid-domain",
         "invalid-port",
+        "raw-brackets-in-path",
+        "raw-brackets-in-query",
+        "raw-brackets-in-fragment",
+        "second-fragment-delimiter",
+        "raw-brackets-in-userinfo",
     ),
 )
 def test_standalone_dependency_probe_rejects_malformed_direct_url_before_import(
@@ -1765,8 +1775,17 @@ def test_standalone_dependency_probe_rejects_malformed_direct_url_before_import(
         "https://example.invalid/tool%20name.whl",
         "git+https://example.invalid/repository.git@abcdef",
         "https://[2001:db8::1]/tool.whl",
+        "https://example.invalid/tool.whl?part=/one?two#section/one?two",
+        "https://user:token@example.invalid/tool.whl",
     ),
-    ids=("https", "escaped-path", "vcs-https", "ipv6"),
+    ids=(
+        "https",
+        "escaped-path",
+        "vcs-https",
+        "ipv6",
+        "query-fragment",
+        "userinfo",
+    ),
 )
 def test_standalone_dependency_probe_accepts_valid_remote_direct_url(
     tmp_path: Path,
