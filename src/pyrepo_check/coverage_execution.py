@@ -439,6 +439,24 @@ def coverage_primary_command(
         *python_prefix,
         "-m",
         "coverage",
+        *coverage_primary_arguments(
+            config_path=config_path,
+            run_directory=run_directory,
+            plugin_module=plugin_module,
+            pytest_args=pytest_args,
+        ),
+    )
+
+
+def coverage_primary_arguments(
+    *,
+    config_path: Path,
+    run_directory: Path,
+    plugin_module: str,
+    pytest_args: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Build Coverage.py module arguments for trusted launcher dispatch."""
+    return (
         "run",
         f"--rcfile={config_path}",
         f"--data-file={run_directory / '.coverage'}",

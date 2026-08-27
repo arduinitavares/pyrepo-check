@@ -96,17 +96,24 @@ def build_launcher_command(
     staged: StagedCheckLauncher,
     invocation: CheckInvocation,
     marker_path: Path,
+    *,
+    module: CheckModule | None = None,
+    use_observed_python_executable: bool = False,
 ) -> tuple[str, ...]:
     """Build the exact locked Repository Python launcher command."""
+    selected_module = CHECK_MODULE[invocation.name] if module is None else module
+    prefix = locked_repository_prefix(prepared)
+    if use_observed_python_executable:
+        prefix = (*prefix[:-1], str(prepared.python.executable))
     return (
-        *locked_repository_prefix(prepared),
+        *prefix,
         str(staged.path),
         "--evidence",
         str(marker_path),
         "--check",
         invocation.name,
         "--module",
-        CHECK_MODULE[invocation.name],
+        selected_module,
         "--",
         *invocation.arguments,
     )

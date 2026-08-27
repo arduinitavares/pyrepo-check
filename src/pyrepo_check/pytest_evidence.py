@@ -154,6 +154,8 @@ class _ArtifactInvalid(ValueError):
 
 def validate_pytest_execution(
     check: ExecutedCheck,
+    *,
+    dependency_version: str | None = None,
 ) -> ValidatedPytestSession | PytestValidationFailure:
     """Trust one preflight, primary process, and finalized plugin artifact."""
     observation = check.pytest
@@ -163,9 +165,13 @@ def validate_pytest_execution(
     preflight = observation.preflight
     if preflight.classification != "supported":
         return _preflight_failure(check)
-    if preflight.record is None or preflight.record.pytest_version is None:
+    if preflight.record is None or (
+        dependency_version is None and preflight.record.pytest_version is None
+    ):
         return _failure("preflight_invalid", "supported preflight has no pytest version", None, None)
-    pytest_version = ".".join(str(piece) for piece in preflight.record.pytest_version)
+    pytest_version = dependency_version or ".".join(
+        str(piece) for piece in cast(tuple[int, int, int], preflight.record.pytest_version)
+    )
 
     primary = _primary_process(check)
     if primary is None:
@@ -246,9 +252,14 @@ def validate_pytest_execution(
     return validated
 
 
-def build_pytest_result(plan: RunPlan, check: ExecutedCheck) -> PytestResult:
+def build_pytest_result(
+    plan: RunPlan,
+    check: ExecutedCheck,
+    *,
+    dependency_version: str | None = None,
+) -> PytestResult:
     """Consolidate trusted pytest observations into the public schema-v1 result."""
-    validated = validate_pytest_execution(check)
+    validated = validate_pytest_execution(check, dependency_version=dependency_version)
     if isinstance(validated, PytestValidationFailure):
         return _result_from_validation_failure(plan, validated)
 

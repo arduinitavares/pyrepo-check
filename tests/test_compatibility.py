@@ -12,7 +12,8 @@ import uuid
 import pytest
 
 from pyrepo_check.cli import main, parse_args
-from tests.support import RecordedCall, RecordingRunner
+from pyrepo_check import repository_executor
+from tests.support import RecordedCall, RecordingRunner, focused_plan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,70 @@ def test_consumer_execution_is_owned_by_the_consumer() -> None:
 """,
         encoding="utf-8",
     )
+
+
+def test_prepared_repository_pytest_cannot_import_controller_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer = tmp_path / "prepared-consumer"
+    consumer.mkdir()
+    (consumer / "tests").mkdir()
+    (consumer / ".gitignore").write_text(
+        ".venv/\n.pytest_cache/\n__pycache__/\n",
+        encoding="utf-8",
+    )
+    (consumer / "pyproject.toml").write_text(
+        """[project]
+name = "prepared-consumer"
+version = "0.0.0"
+requires-python = ">=3.13.15"
+dependencies = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+""",
+        encoding="utf-8",
+    )
+    witness = tmp_path / "prepared-witness.json"
+    (consumer / "tests" / "test_environment.py").write_text(
+        """import importlib.util
+import json
+import os
+from pathlib import Path
+
+
+def test_controller_package_is_unavailable() -> None:
+    Path(os.environ["PREPARED_WITNESS"]).write_text(
+        json.dumps(
+            {
+                "pyrepo_check_available": importlib.util.find_spec("pyrepo_check") is not None,
+                "pythonpath": os.environ.get("PYTHONPATH"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert importlib.util.find_spec("pyrepo_check") is None
+""",
+        encoding="utf-8",
+    )
+    _lock_and_snapshot_consumer(consumer)
+    monkeypatch.setenv("PYTHONPATH", str(PROJECT_ROOT / "src"))
+    monkeypatch.setenv("PREPARED_WITNESS", str(witness))
+
+    result = repository_executor.execute_repository_plan(focused_plan(consumer, "pytest"))
+
+    check = result.checks[0]
+    evidence = json.loads(witness.read_text(encoding="utf-8"))
+    assert check.error is None
+    assert check.start is not None
+    assert check.start.module == "pytest"
+    assert check.pytest is not None
+    assert check.pytest.artifact.state == "snapshot"
+    assert evidence["pyrepo_check_available"] is False
+    assert evidence["pythonpath"] is not None
+    assert str(PROJECT_ROOT / "src") not in evidence["pythonpath"]
+    assert os.pathsep not in evidence["pythonpath"]
 
 
 def _write_coverage_test_source(root: Path, source: str) -> None:

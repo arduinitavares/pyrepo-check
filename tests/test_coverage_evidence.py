@@ -7,7 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -873,6 +873,29 @@ def test_coverage_result_builds_strict_configured_threshold_pass(tmp_path: Path)
         "src/zero.py",
     )
     validate_coverage_result(result)
+
+
+def test_coverage_result_uses_exact_repository_dependency_version(tmp_path: Path) -> None:
+    root = _coverage_project(tmp_path)
+    document = _coverage_json_document()
+    meta = cast(dict[str, object], document["meta"])
+    meta["version"] = "7.15"
+    observation = _coverage_observation(
+        version="7.15.2",
+        content=_coverage_json_bytes(document),
+    )
+
+    result = build_coverage_result(
+        root,
+        _plan(),
+        _pytest_result(),
+        observation,
+        dependency_version="7.15",
+    )
+
+    assert result is not None
+    assert result.coverage_version == "7.15"
+    assert result.error is None
 
 
 @pytest.mark.parametrize(

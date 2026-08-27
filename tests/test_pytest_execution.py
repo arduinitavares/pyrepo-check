@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -8,13 +9,22 @@ import stat
 import subprocess  # nosec B404
 import tempfile
 import threading
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Callable, Never, TypeVar, cast
 
 import pytest
 
-from pyrepo_check.execution import CapturedBytes, ExecutionResult, execute_plan
+from pyrepo_check.check_launcher import stage_check_launcher
+from pyrepo_check.execution import (
+    CapturedBytes,
+    DependencyObservation,
+    ExecutionResult,
+    PreparedRepositoryEnvironment,
+    ProcessRunner,
+    execute_plan,
+)
 from pyrepo_check.planning import (
+    CoverageExecutionPlan,
     DefaultRepositoryPython,
     OutputFormat,
     CheckInvocation,
@@ -26,7 +36,16 @@ import pyrepo_check.pytest_execution as pytest_execution
 from pyrepo_check.pytest_execution import execute_pytest
 from pyrepo_check.pytest_evidence import PytestValidationFailure, validate_pytest_execution
 from pyrepo_check.reporting import build_run_report, validate_report_v1
-from tests.support import RecordingRunner
+import tests.support as test_support
+from tests.support import (
+    RecordingRunner,
+    available_dependency,
+    launcher_aware_runner,
+    missing_dependency,
+    monotonic_clock,
+    prepared_repository,
+    test_workspace,
+)
 
 
 _T = TypeVar("_T")
@@ -34,6 +53,62 @@ _OS_NONBLOCK = cast(int, getattr(os, "O_NONBLOCK"))
 _OS_DIRECTORY = cast(int, getattr(os, "O_DIRECTORY"))
 _OS_NOFOLLOW = cast(int, getattr(os, "O_NOFOLLOW"))
 _MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo"))
+
+
+class PreparedPytestRunner:
+    def __init__(
+        self,
+        *,
+        returncodes: tuple[int, ...] = (),
+        raise_on_call: int | None = None,
+        exception: Exception | None = None,
+    ) -> None:
+        self._runner = launcher_aware_runner(
+            returncodes=returncodes,
+            publish_valid_marker=True,
+            raise_on_call=raise_on_call,
+            exception=exception,
+        )
+        self.calls = self._runner.calls
+
+    def __call__(
+        self,
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        completed_process = self._runner(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        logical = self._logical_module_command(command)
+        if logical is not None:
+            test_support._publish_pytest_artifact(  # noqa: SLF001
+                logical,
+                env,
+                completed_process.returncode,
+            )
+            test_support._publish_coverage_artifact(logical)  # noqa: SLF001
+        return completed_process
+
+    @staticmethod
+    def _logical_module_command(command: tuple[str, ...]) -> tuple[str, ...] | None:
+        if "--module" not in command:
+            return command if "-m" in command else None
+        module_index = command.index("--module")
+        separator_index = command.index("--", module_index + 2)
+        return (
+            "python",
+            "-m",
+            command[module_index + 1],
+            *command[separator_index + 1 :],
+        )
 
 
 def _run_fifo_call_with_watchdog(call: Callable[[], _T], fifo: Path) -> _T:
@@ -428,6 +503,246 @@ def pytest_run_plan(tmp_path: Path, check: CheckInvocation | None = None) -> Run
         checks=(invocation,),
         output_format="json",
     )
+
+
+def run_prepared_pytest_fixture(
+    *,
+    prepared: PreparedRepositoryEnvironment,
+    pytest_dependency: DependencyObservation,
+    coverage_dependency: DependencyObservation | None,
+    runner: ProcessRunner,
+    coverage_requested: bool = False,
+) -> pytest_execution.PreparedPytestExecution:
+    coverage = (
+        CoverageExecutionPlan(
+            config_path=prepared.root / "pyproject.toml",
+            fail_under=None,
+        )
+        if coverage_requested
+        else None
+    )
+    pytest_plan = PytestExecutionPlan(pytest_args=("tests",), coverage=coverage)
+    check = CheckInvocation(
+        name="pytest",
+        arguments=pytest_plan.pytest_args,
+        pytest=pytest_plan,
+    )
+    plan = replace(
+        pytest_run_plan(prepared.root, check),
+        planned_coverage_scope="partial" if coverage_requested else "not_requested",
+    )
+    with test_workspace(prepared.root) as workspace:
+        launcher = stage_check_launcher(workspace)
+        return pytest_execution.execute_prepared_pytest(
+            check,
+            plan=plan,
+            prepared=prepared,
+            pytest_dependency=pytest_dependency,
+            coverage_dependency=coverage_dependency,
+            workspace=workspace,
+            launcher=launcher,
+            output_format="json",
+            runner=runner,
+            clock_ns=monotonic_clock(),
+        )
+
+
+def test_pytest_uses_prepared_repository_python_and_no_controller_pythonpath(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 10, 19))
+    environment = dict(prepared.child_environment)
+    environment["PYTHONPATH"] = "/controller/source"
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    result = run_prepared_pytest_fixture(
+        prepared=replace(prepared, child_environment=MappingProxyType(environment)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=None,
+        runner=runner,
+    )
+
+    primary = next(process for process in result.processes if process.role == "primary")
+    assert primary.command[:6] == (
+        "uv",
+        "run",
+        "--locked",
+        "--python",
+        str(prepared.python.executable),
+        str(prepared.python.executable),
+    )
+    assert result.start is not None
+    assert result.start.python == prepared.python
+    primary_call = next(call for call in runner.calls if call.command == primary.command)
+    assert primary_call.env is not None
+    assert "/controller/source" not in primary_call.env["PYTHONPATH"]
+
+
+def test_missing_coverage_runs_plain_pytest_once_and_keeps_coverage_error(
+    tmp_path: Path,
+) -> None:
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=missing_dependency("coverage"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    primaries = [process for process in result.processes if process.role == "primary"]
+    assert len(primaries) == 1
+    assert "pytest" in primaries[0].command
+    assert "coverage" not in primaries[0].command
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "not_attempted"
+
+
+def test_prepared_pytest_pythonpath_contains_only_the_reporter_directory(
+    tmp_path: Path,
+) -> None:
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 11, 12)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=None,
+        runner=runner,
+    )
+
+    primary = next(process for process in result.processes if process.role == "primary")
+    primary_call = next(call for call in runner.calls if call.command == primary.command)
+    assert primary_call.env is not None
+    reporter_directory = Path(primary_call.env["PYREPO_CHECK_PYTEST_JSON"]).parent
+    assert primary_call.env["PYTHONPATH"] == str(reporter_directory)
+    assert os.pathsep not in primary_call.env["PYTHONPATH"]
+    assert result.start is not None
+    assert result.start.module == "pytest"
+
+
+def test_prepared_coverage_primary_uses_launcher_but_json_helper_does_not(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+    runner = PreparedPytestRunner()
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert [process.role for process in result.processes] == ["primary", "coverage_json"]
+    primary, helper = result.processes
+    assert primary.command[:6] == (
+        "uv",
+        "run",
+        "--locked",
+        "--python",
+        str(prepared.python.executable),
+        str(prepared.python.executable),
+    )
+    assert "--evidence" in primary.command
+    assert primary.command[primary.command.index("--module") + 1] == "coverage"
+    separator = primary.command.index("--")
+    assert primary.command[separator + 1 : separator + 5] == (
+        "run",
+        f"--rcfile={tmp_path / 'pyproject.toml'}",
+        f"--data-file={Path(primary.command[primary.command.index('--evidence') + 1]).parent / '.coverage'}",
+        "-m",
+    )
+    assert helper.command[:6] == (
+        "uv",
+        "run",
+        "--locked",
+        "--python",
+        str(prepared.python.executable),
+        "python",
+    )
+    assert helper.command[6:9] == ("-m", "coverage", "json")
+    assert "--evidence" not in helper.command
+    assert result.start is not None
+    assert result.start.module == "coverage"
+    assert result.pytest is not None
+    assert result.pytest.artifact.state == "snapshot"
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "snapshot"
+
+
+def test_missing_pytest_prevents_both_pytest_and_coverage(
+    tmp_path: Path,
+) -> None:
+    runner = PreparedPytestRunner()
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=missing_dependency("pytest"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert result.processes == ()
+    assert result.start is None
+    assert result.error == missing_dependency("pytest").error
+    assert result.pytest is not None
+    assert result.pytest.preflight.classification == "module_unavailable"
+    assert result.coverage is not None
+    assert result.coverage.preflight.classification == "preflight_invalid"
+    assert result.coverage.artifact.state == "not_attempted"
+    assert runner.calls == []
+
+
+def test_coverage_json_helper_failure_keeps_primary_start_evidence(
+    tmp_path: Path,
+) -> None:
+    runner = PreparedPytestRunner(returncodes=(0, 3))
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert result.start is not None
+    assert result.start.module == "coverage"
+    assert result.error is None
+    assert [process.returncode for process in result.processes] == [0, 3]
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "generation_failed"
+    assert result.coverage.json_exit_code == 3
+
+
+def test_coverage_primary_spawn_failure_discards_start_and_skips_json_helper(
+    tmp_path: Path,
+) -> None:
+    runner = PreparedPytestRunner(
+        raise_on_call=1,
+        exception=FileNotFoundError("repository python"),
+    )
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared_repository(tmp_path, python=(3, 12, 11)),
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert len(result.processes) == 1
+    assert result.processes[0].role == "primary"
+    assert result.processes[0].spawn_error == "FileNotFoundError: repository python"
+    assert result.start is None
+    assert result.error is not None
+    assert result.error.code == "spawn_failed"
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "data_missing"
+    assert not [process for process in result.processes if process.role == "coverage_json"]
 
 
 def preflight_document(

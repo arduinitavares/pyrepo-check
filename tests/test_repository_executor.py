@@ -24,6 +24,7 @@ from pyrepo_check.repository_safety import (
     RepositoryStateSnapshot,
     RepositoryVerificationResult,
 )
+import tests.support as test_support
 from tests.support import (
     RecordingRunner,
     available_dependency,
@@ -471,6 +472,24 @@ def test_missing_coverage_is_retained_but_plain_pytest_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = _internal_plan(tmp_path.resolve(), "pytest")
+    invocation = plan.checks[0]
+    assert invocation.pytest is not None
+    plan = replace(
+        plan,
+        checks=(
+            replace(
+                invocation,
+                pytest=replace(
+                    invocation.pytest,
+                    coverage=CoverageExecutionPlan(
+                        config_path=tmp_path / "pyproject.toml",
+                        fail_under=None,
+                    ),
+                ),
+            ),
+        ),
+        planned_coverage_scope="complete",
+    )
     safe = _safe_preparation(
         plan,
         dependencies=(
@@ -479,7 +498,39 @@ def test_missing_coverage_is_retained_but_plain_pytest_runs(
         ),
     )
     monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
-    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+    marker_runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    def runner(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        completed = marker_runner(
+            command,
+            cwd=cwd,
+            check=check,
+            capture_output=capture_output,
+            env=env,
+        )
+        if "--module" in command:
+            module_index = command.index("--module")
+            separator_index = command.index("--", module_index + 2)
+            logical = (
+                "python",
+                "-m",
+                command[module_index + 1],
+                *command[separator_index + 1 :],
+            )
+            if "-p" in logical:
+                test_support._publish_pytest_artifact(  # noqa: SLF001
+                    logical,
+                    env,
+                    completed.returncode,
+                )
+        return completed
 
     result = repository_executor.execute_repository_plan(
         plan,
@@ -495,11 +546,69 @@ def test_missing_coverage_is_retained_but_plain_pytest_runs(
     assert check.invocation.name == "pytest"
     assert check.start is not None
     assert check.error is None
-    primary_calls = [call for call in runner.calls if "--evidence" in call.command]
+    assert check.pytest is not None
+    assert check.pytest.artifact.state == "snapshot"
+    assert check.coverage is not None
+    assert check.coverage.preflight.classification == "module_unavailable"
+    assert check.coverage.artifact.state == "not_attempted"
+    primary_calls = [call for call in marker_runner.calls if "--evidence" in call.command]
     assert len(primary_calls) == 1
     command = primary_calls[0].command
     assert command[command.index("--module") + 1] == "pytest"
     assert "coverage" not in command
+
+
+def test_missing_coverage_does_not_suppress_a_later_independent_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "pytest", "ty")
+    pytest_invocation, ty_invocation = plan.checks
+    assert pytest_invocation.pytest is not None
+    pytest_invocation = replace(
+        pytest_invocation,
+        pytest=replace(
+            pytest_invocation.pytest,
+            coverage=CoverageExecutionPlan(
+                config_path=tmp_path / "pyproject.toml",
+                fail_under=None,
+            ),
+        ),
+    )
+    plan = replace(
+        plan,
+        checks=(pytest_invocation, ty_invocation),
+        planned_coverage_scope="complete",
+    )
+    safe = _safe_preparation(
+        plan,
+        dependencies=(
+            available_dependency("pytest", "8.4.2"),
+            available_dependency("ty", "0.0.35"),
+            missing_dependency("coverage"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    pytest_check, ty_check = result.checks
+    assert pytest_check.pytest is not None
+    assert pytest_check.coverage is not None
+    assert pytest_check.coverage.preflight.classification == "module_unavailable"
+    assert ty_check.invocation.name == "ty"
+    assert ty_check.start is not None
+    assert ty_check.error is None
+    primaries = [call for call in runner.calls if "--evidence" in call.command]
+    assert [call.command[call.command.index("--module") + 1] for call in primaries] == [
+        "pytest",
+        "ty",
+    ]
 
 
 def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(

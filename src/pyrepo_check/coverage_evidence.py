@@ -492,6 +492,8 @@ def build_coverage_result(
     plan: RunPlan,
     pytest_result: PytestResult,
     observation: CoverageExecutionObservation | None,
+    *,
+    dependency_version: str | None = None,
 ) -> CoverageResult | None:
     """Build the sole public coverage result from immutable execution evidence."""
     if plan.planned_coverage_scope in {"not_requested", "unavailable"}:
@@ -499,8 +501,11 @@ def build_coverage_result(
 
     threshold_value = _coverage_threshold_value(plan)
     configured = threshold_value is not None
-    coverage_version = _trusted_coverage_version(observation)
-    observed_error = _coverage_observation_error(observation)
+    coverage_version = _trusted_coverage_version(
+        observation,
+        dependency_version=dependency_version,
+    )
+    observed_error = _coverage_observation_error(observation, coverage_version)
     if observed_error is not None:
         return _coverage_error_result(
             configured=configured,
@@ -599,12 +604,16 @@ def build_coverage_result(
 
 def _trusted_coverage_version(
     observation: CoverageExecutionObservation | None,
+    *,
+    dependency_version: str | None = None,
 ) -> str | None:
     if observation is None or observation.preflight.classification not in {
         "supported",
         "unsupported_version",
     }:
         return None
+    if dependency_version is not None:
+        return dependency_version if is_stable_coverage_version(dependency_version) else None
     record = observation.preflight.record
     if record is None:
         return None
@@ -614,6 +623,7 @@ def _trusted_coverage_version(
 
 def _coverage_observation_error(
     observation: CoverageExecutionObservation | None,
+    coverage_version: str | None,
 ) -> CoverageError | None:
     if observation is None:
         return CoverageError(
@@ -631,7 +641,6 @@ def _coverage_observation_error(
             cast(CoverageErrorCode, preflight.classification),
             preflight.diagnostic or f"coverage preflight: {preflight.classification}",
         )
-    coverage_version = _trusted_coverage_version(observation)
     if coverage_version is None:
         return CoverageError(
             "preflight_invalid",

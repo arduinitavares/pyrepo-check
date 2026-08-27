@@ -20,6 +20,7 @@ from pyrepo_check.execution import (
     AnalysisPythonAuthorityObservation,
     CheckExecutionFailure,
     CheckExecutionErrorCode,
+    DependencyObservation,
     ExecutedProcess,
     PreparedRepositoryEnvironment,
     RepositoryCheckObservation,
@@ -34,6 +35,7 @@ from pyrepo_check.execution import (
 from pyrepo_check import execution_workspace
 from pyrepo_check.execution_workspace import VerifiedRunWorkspace
 from pyrepo_check.planning import CheckInvocation, RunPlan
+from pyrepo_check.pytest_execution import execute_prepared_pytest
 from pyrepo_check.repository_environment import (
     DependencyName,
     inspect_repository_lock,
@@ -260,6 +262,19 @@ def execute_repository_plan(
         }
         for invocation in plan.checks:
             dependency = dependencies[_dependency_name(invocation)]
+            if invocation.name == "pytest":
+                checks.append(
+                    _execute_in_workspace(
+                        invocation,
+                        plan=plan,
+                        prepared=preparation.prepared,
+                        pytest_dependency=dependency,
+                        coverage_dependency=dependencies.get("coverage"),
+                        runner=runner,
+                        clock_ns=clock_ns,
+                    )
+                )
+                continue
             if dependency.status != "available":
                 checks.append(
                     RepositoryCheckObservation(
@@ -280,7 +295,10 @@ def execute_repository_plan(
             checks.append(
                 _execute_in_workspace(
                     invocation,
+                    plan=plan,
                     prepared=preparation.prepared,
+                    pytest_dependency=None,
+                    coverage_dependency=None,
                     runner=runner,
                     clock_ns=clock_ns,
                 )
@@ -312,7 +330,10 @@ def execute_repository_plan(
 def _execute_in_workspace(
     invocation: CheckInvocation,
     *,
+    plan: RunPlan,
     prepared: PreparedRepositoryEnvironment,
+    pytest_dependency: DependencyObservation | None,
+    coverage_dependency: DependencyObservation | None,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
 ) -> RepositoryCheckObservation:
@@ -331,14 +352,42 @@ def _execute_in_workspace(
     try:
         verified = execution_workspace.open_verified_workspace(run_workspace)
         launcher = stage_check_launcher(verified)
-        observation = execute_invocation(
-            invocation,
-            prepared=prepared,
-            workspace=verified,
-            launcher=launcher,
-            runner=runner,
-            clock_ns=clock_ns,
-        )
+        if invocation.pytest is None:
+            observation = execute_invocation(
+                invocation,
+                prepared=prepared,
+                workspace=verified,
+                launcher=launcher,
+                runner=runner,
+                clock_ns=clock_ns,
+            )
+        else:
+            if pytest_dependency is None:
+                raise AssertionError("pytest dependency observation is unavailable")
+            prepared_pytest = execute_prepared_pytest(
+                invocation,
+                plan=plan,
+                prepared=prepared,
+                pytest_dependency=pytest_dependency,
+                coverage_dependency=coverage_dependency,
+                workspace=verified,
+                launcher=launcher,
+                output_format=plan.output_format,
+                runner=runner,
+                clock_ns=clock_ns,
+            )
+            observation = RepositoryCheckObservation(
+                invocation=invocation,
+                execution_environment=(
+                    "repository" if prepared_pytest.start is not None else None
+                ),
+                analysis_python_authority=None,
+                start=prepared_pytest.start,
+                processes=prepared_pytest.processes,
+                error=prepared_pytest.error,
+                pytest=prepared_pytest.pytest,
+                coverage=prepared_pytest.coverage,
+            )
     except OSError as error:
         diagnostics.append(f"workspace setup failed: {type(error).__name__}: {error}")
     finally:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -20,12 +20,24 @@ from pyrepo_check.artifact_safety import (
     load_bounded_json as _load_bounded_json,
 )
 from pyrepo_check import execution_workspace
+from pyrepo_check.check_launcher import (
+    StagedCheckLauncher,
+    build_launcher_command,
+    ensure_staged_launcher,
+    ensure_start_marker_absent,
+    validate_start_marker,
+)
 from pyrepo_check.coverage_evidence import coverage_gate_policy
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CapturedBytes,
+    CheckExecutionFailure,
+    CheckModule,
+    CheckStartObservation,
+    DependencyObservation,
     ExecutedCheck,
     ExecutedProcess,
+    PreparedRepositoryEnvironment,
     ProcessRunner,
     execute_process,
     locked_python_command,
@@ -35,11 +47,14 @@ from pyrepo_check.coverage_execution import (
     CoverageDataError,
     CoverageDataSnapshot,
     CoverageExecutionObservation,
+    CoveragePreflightObservation,
+    CoveragePreflightRecord,
     classify_coverage_preflight,
     coverage_environment,
     coverage_json_command,
     coverage_json_environment,
     coverage_preflight_command,
+    coverage_primary_arguments,
     coverage_primary_command,
     invalid_coverage_observation,
     prepare_coverage_data_snapshot,
@@ -47,8 +62,10 @@ from pyrepo_check.coverage_execution import (
     snapshot_coverage_json,
     verify_coverage_data_snapshot,
 )
+from pyrepo_check.execution_workspace import VerifiedRunWorkspace
 from pyrepo_check.planning import CheckInvocation, CoverageExecutionPlan, OutputFormat, RunPlan
 from pyrepo_check.pytest_evidence import build_pytest_result
+from pyrepo_check.repository_environment import locked_repository_prefix
 
 
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -121,6 +138,410 @@ class PytestExecutionObservation:
     preflight: PytestPreflightObservation
     artifact: PytestArtifactObservation
     cleanup_error: str | None
+
+
+@dataclass(frozen=True)
+class PreparedPytestExecution:
+    processes: tuple[ExecutedProcess, ...]
+    start: CheckStartObservation | None
+    error: CheckExecutionFailure | None
+    pytest: PytestExecutionObservation | None
+    coverage: CoverageExecutionObservation | None
+
+
+def execute_prepared_pytest(
+    check: CheckInvocation,
+    *,
+    plan: RunPlan,
+    prepared: PreparedRepositoryEnvironment,
+    pytest_dependency: DependencyObservation,
+    coverage_dependency: DependencyObservation | None,
+    workspace: VerifiedRunWorkspace,
+    launcher: StagedCheckLauncher,
+    output_format: OutputFormat,
+    runner: ProcessRunner | None,
+    clock_ns: Callable[[], int],
+) -> PreparedPytestExecution:
+    """Run pytest through one already prepared Repository Environment."""
+    pytest_plan = check.pytest
+    if pytest_plan is None:
+        raise ValueError("pytest execution requires CheckInvocation.pytest metadata")
+
+    pytest_preflight = _prepared_pytest_preflight(prepared, pytest_dependency)
+    artifact = PytestArtifactObservation("not_attempted", None, (), None)
+    coverage_plan = pytest_plan.coverage
+    coverage = _prepared_coverage_observation(
+        prepared,
+        coverage_dependency,
+        requested=coverage_plan is not None,
+    )
+    if pytest_preflight.classification != "supported":
+        if coverage is not None:
+            coverage = invalid_coverage_observation(
+                "coverage was not attempted because pytest is unavailable"
+            )
+        return PreparedPytestExecution(
+            processes=(),
+            start=None,
+            error=pytest_dependency.error
+            or CheckExecutionFailure(
+                "pytest_preflight_failed",
+                pytest_preflight.diagnostic or "pytest dependency is unavailable",
+                None,
+            ),
+            pytest=PytestExecutionObservation(pytest_preflight, artifact, None),
+            coverage=coverage,
+        )
+
+    try:
+        workspace.verify("before prepared pytest reporter staging")
+        plugin_module = f"_pyrepo_check_pytest_{secrets.token_hex(16)}"
+        artifact_path, writer_directory = _prepare_run_directory(workspace, plugin_module)
+        workspace.verify("after prepared pytest reporter staging")
+    except OSError as error:
+        diagnostic = f"{type(error).__name__}: {error}"
+        return PreparedPytestExecution(
+            processes=(),
+            start=None,
+            error=CheckExecutionFailure("pytest_evidence_error", diagnostic, None),
+            pytest=PytestExecutionObservation(
+                PytestPreflightObservation("not_started", None, diagnostic),
+                artifact,
+                None,
+            ),
+            coverage=invalid_coverage_observation(diagnostic) if coverage is not None else None,
+        )
+
+    environment = _prepared_pytest_environment(
+        prepared.child_environment,
+        workspace.workspace.path,
+        artifact_path,
+        writer_directory,
+    )
+    instrumented = (
+        coverage_plan is not None
+        and coverage is not None
+        and coverage.preflight.classification == "supported"
+    )
+    if instrumented:
+        if coverage_plan is None:
+            raise AssertionError("instrumented pytest requires a Coverage execution plan")
+        primary_arguments = coverage_primary_arguments(
+            config_path=coverage_plan.config_path.resolve(),
+            run_directory=workspace.workspace.path,
+            plugin_module=plugin_module,
+            pytest_args=pytest_plan.pytest_args,
+        )
+        module: CheckModule = "coverage"
+        primary_environment = coverage_environment(
+            environment,
+            run_directory=workspace.workspace.path,
+            config_path=coverage_plan.config_path.resolve(),
+        )
+    else:
+        primary_arguments = ("-p", plugin_module, *pytest_plan.pytest_args)
+        module = "pytest"
+        primary_environment = environment
+
+    primary_invocation = replace(check, arguments=primary_arguments)
+    process, start, execution_error = _run_prepared_primary(
+        primary_invocation,
+        module=module,
+        prepared=prepared,
+        workspace=workspace,
+        launcher=launcher,
+        environment=primary_environment,
+        capture_output=output_format == "json",
+        runner=runner,
+        clock_ns=clock_ns,
+    )
+    if process is None:
+        return PreparedPytestExecution(
+            processes=(),
+            start=None,
+            error=execution_error,
+            pytest=PytestExecutionObservation(pytest_preflight, artifact, None),
+            coverage=coverage,
+        )
+    processes = [process]
+    try:
+        workspace.verify("after prepared pytest primary")
+    except OSError as error:
+        artifact = PytestArtifactObservation("unsafe_path", None, (), str(error))
+    else:
+        artifact = _snapshot_artifact(
+            artifact_path,
+            writer_directory,
+            run_descriptor=workspace.descriptor,
+        )
+
+    pytest_observation = PytestExecutionObservation(pytest_preflight, artifact, None)
+    if instrumented and coverage is not None:
+        if execution_error is not None:
+            coverage = replace(
+                coverage,
+                artifact=CoverageArtifactObservation(
+                    "data_missing",
+                    None,
+                    "coverage data was not produced by a trusted pytest primary",
+                ),
+            )
+        else:
+            interim = ExecutedCheck(
+                planned=check,
+                processes=tuple(processes),
+                pytest=pytest_observation,
+                coverage=coverage,
+            )
+            pytest_result = build_pytest_result(
+                plan,
+                interim,
+                dependency_version=pytest_dependency.version,
+            )
+            if (
+                pytest_result.error is not None
+                and pytest_result.error.code == "unsupported_parallelism"
+            ):
+                coverage = replace(
+                    coverage,
+                    artifact=CoverageArtifactObservation(
+                        "unsupported_parallelism",
+                        None,
+                        "pytest artifact reports unsupported parallel execution",
+                    ),
+                )
+            else:
+                if coverage_plan is None:
+                    raise AssertionError("coverage plan is unavailable")
+                policy = coverage_gate_policy(plan, pytest_result, True)
+                coverage_artifact, coverage_process, close_error = _generate_coverage_json(
+                    verified_run=workspace,
+                    plan=plan,
+                    coverage_plan=coverage_plan,
+                    check=check,
+                    base_environment=primary_environment,
+                    python_prefix=locked_repository_prefix(prepared),
+                    force_fail_under_zero=policy.force_fail_under_zero,
+                    retain_threshold_exit_two=(
+                        policy.gate_eligible and policy.skipped_reason is None
+                    ),
+                    runner=runner,
+                    clock_ns=clock_ns,
+                )
+                if coverage_process is not None:
+                    processes.append(coverage_process)
+                if close_error is not None:
+                    pytest_observation = replace(
+                        pytest_observation,
+                        cleanup_error=close_error,
+                    )
+                coverage = replace(
+                    coverage,
+                    artifact=coverage_artifact,
+                    json_exit_code=(
+                        coverage_process.returncode if coverage_process is not None else None
+                    ),
+                )
+
+    return PreparedPytestExecution(
+        processes=tuple(processes),
+        start=start,
+        error=execution_error,
+        pytest=pytest_observation,
+        coverage=coverage,
+    )
+
+
+def _prepared_pytest_preflight(
+    prepared: PreparedRepositoryEnvironment,
+    dependency: DependencyObservation,
+) -> PytestPreflightObservation:
+    diagnostic = dependency.error.message if dependency.error is not None else None
+    version = _dependency_numeric_version(dependency.version)
+    if dependency.status == "available" and version is not None:
+        return PytestPreflightObservation(
+            "supported",
+            PytestPreflightRecord(prepared.python.version, True, version),
+            None,
+        )
+    if dependency.status == "missing":
+        return PytestPreflightObservation(
+            "module_unavailable",
+            PytestPreflightRecord(prepared.python.version, False, None),
+            diagnostic,
+        )
+    if dependency.status == "incompatible" and version is not None:
+        return PytestPreflightObservation(
+            "unsupported_version",
+            PytestPreflightRecord(prepared.python.version, True, version),
+            diagnostic,
+        )
+    return PytestPreflightObservation(
+        "preflight_invalid",
+        None,
+        diagnostic or "pytest dependency evidence is unusable",
+    )
+
+
+def _prepared_coverage_observation(
+    prepared: PreparedRepositoryEnvironment,
+    dependency: DependencyObservation | None,
+    *,
+    requested: bool,
+) -> CoverageExecutionObservation | None:
+    if not requested:
+        return None
+    if dependency is None:
+        return invalid_coverage_observation("coverage dependency evidence is unavailable")
+    diagnostic = dependency.error.message if dependency.error is not None else None
+    if dependency.status == "available" and dependency.version is not None:
+        preflight = CoveragePreflightObservation(
+            "supported",
+            CoveragePreflightRecord(prepared.python.version, True, dependency.version),
+            None,
+        )
+    elif dependency.status == "missing":
+        preflight = CoveragePreflightObservation(
+            "module_unavailable",
+            CoveragePreflightRecord(prepared.python.version, False, None),
+            diagnostic,
+        )
+    elif dependency.status == "incompatible" and dependency.version is not None:
+        preflight = CoveragePreflightObservation(
+            "unsupported_version",
+            CoveragePreflightRecord(prepared.python.version, True, dependency.version),
+            diagnostic,
+        )
+    else:
+        preflight = CoveragePreflightObservation(
+            "preflight_invalid",
+            None,
+            diagnostic or "coverage dependency evidence is unusable",
+        )
+    return CoverageExecutionObservation(
+        preflight=preflight,
+        artifact=CoverageArtifactObservation("not_attempted", None, None),
+    )
+
+
+def _dependency_numeric_version(version: str | None) -> tuple[int, int, int] | None:
+    if version is None:
+        return None
+    try:
+        parts = tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return None
+    if not 1 <= len(parts) <= 3 or any(part < 0 for part in parts):
+        return None
+    return cast(tuple[int, int, int], (*parts, *(0 for _ in range(3 - len(parts)))))
+
+
+def _prepared_pytest_environment(
+    base_environment: Mapping[str, str],
+    run_directory: Path,
+    artifact_path: Path,
+    writer_directory: Path,
+) -> dict[str, str]:
+    environment = dict(base_environment)
+    environment.pop("PYTHONPATH", None)
+    for name in tuple(environment):
+        if name in {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"} or name.startswith(
+            "COV_CORE_"
+        ):
+            del environment[name]
+    environment["PYTHONPATH"] = str(run_directory)
+    environment["PYREPO_CHECK_PYTEST_JSON"] = str(artifact_path)
+    environment["PYREPO_CHECK_PYTEST_WRITER_DIR"] = str(writer_directory)
+    return environment
+
+
+def _run_prepared_primary(
+    invocation: CheckInvocation,
+    *,
+    module: CheckModule,
+    prepared: PreparedRepositoryEnvironment,
+    workspace: VerifiedRunWorkspace,
+    launcher: StagedCheckLauncher,
+    environment: Mapping[str, str],
+    capture_output: bool,
+    runner: ProcessRunner | None,
+    clock_ns: Callable[[], int],
+) -> tuple[ExecutedProcess | None, CheckStartObservation | None, CheckExecutionFailure | None]:
+    marker_path = workspace.workspace.path / f"check-start-{secrets.token_hex(16)}.json"
+    try:
+        ensure_staged_launcher(launcher, workspace=workspace)
+        ensure_start_marker_absent(marker_path, workspace=workspace)
+    except OSError as error:
+        return (
+            None,
+            None,
+            CheckExecutionFailure(
+                "check_start_evidence_invalid",
+                f"Check start evidence could not be prepared: {error}",
+                None,
+            ),
+        )
+
+    process = execute_process(
+        role="primary",
+        command=build_launcher_command(
+            prepared,
+            launcher,
+            invocation,
+            marker_path,
+            module=module,
+            use_observed_python_executable=True,
+        ),
+        cwd=prepared.root,
+        capture_output=capture_output,
+        runner=runner,
+        clock_ns=clock_ns,
+        environment=dict(environment),
+    )
+    start: CheckStartObservation | None = None
+    marker_error: OSError | None = None
+    try:
+        start = validate_start_marker(
+            marker_path,
+            workspace=workspace,
+            invocation=invocation,
+            module=module,
+            prepared=prepared,
+        )
+    except OSError as error:
+        marker_error = error
+
+    if process.spawn_error is not None or process.returncode is None:
+        return (
+            process,
+            None,
+            CheckExecutionFailure(
+                "spawn_failed",
+                f"Check process could not be spawned: {process.spawn_error}",
+                None,
+            ),
+        )
+    if start is None:
+        return (
+            process,
+            None,
+            CheckExecutionFailure(
+                "check_start_evidence_invalid",
+                f"Check start evidence is invalid: {marker_error}",
+                "Retry after verifying the locked Repository Environment.",
+            ),
+        )
+    if process.returncode < 0:
+        return (
+            process,
+            start,
+            CheckExecutionFailure(
+                "terminated_by_signal",
+                f"Check process terminated by signal {-process.returncode}.",
+                None,
+            ),
+        )
+    return process, start, None
 
 
 def execute_pytest(
@@ -333,6 +754,7 @@ def execute_pytest(
                                 coverage_plan=coverage_plan,
                                 check=check,
                                 base_environment=coverage_env,
+                                python_prefix=locked_python_command(plan),
                                 force_fail_under_zero=policy.force_fail_under_zero,
                                 retain_threshold_exit_two=(
                                     policy.gate_eligible and policy.skipped_reason is None
@@ -486,6 +908,7 @@ def _generate_coverage_json(
     coverage_plan: CoverageExecutionPlan,
     check: CheckInvocation,
     base_environment: Mapping[str, str],
+    python_prefix: tuple[str, ...],
     force_fail_under_zero: bool,
     retain_threshold_exit_two: bool,
     runner: ProcessRunner | None,
@@ -522,7 +945,7 @@ def _generate_coverage_json(
             process = execute_process(
                 role="coverage_json",
                 command=coverage_json_command(
-                    python_prefix=locked_python_command(plan),
+                    python_prefix=python_prefix,
                     config_path=config_path,
                     data_path=snapshot.data_path,
                     output_path=verified_run.workspace.path / "coverage.json",

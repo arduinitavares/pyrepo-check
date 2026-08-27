@@ -389,6 +389,22 @@ def _with_document(check: ExecutedCheck, document: dict[str, object]) -> Execute
     return replace(check, pytest=replace(check.pytest, artifact=artifact))
 
 
+def test_pytest_result_uses_exact_repository_dependency_version() -> None:
+    check = _check()
+    document = _artifact_document(check)
+    document["pytest_version"] = "8.4.2.0"
+    changed = _with_document(check, document)
+
+    result = build_pytest_result(
+        _plan(changed),
+        changed,
+        dependency_version="8.4.2.0",
+    )
+
+    assert result.pytest_version == "8.4.2.0"
+    assert result.error is None
+
+
 @pytest.mark.parametrize(
     ("defect", "expected_code"),
     (
