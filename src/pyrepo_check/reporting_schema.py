@@ -1,4 +1,4 @@
-"""Immutable report models shared by schema v1 and internal schema v2."""
+"""Immutable public schema-v2 report models."""
 
 from __future__ import annotations
 
@@ -45,15 +45,6 @@ ProcessRole = Literal[
     "dependency_probe",
 ]
 ProcessOutcome = Literal["exited", "signaled", "spawn_failed"]
-CheckErrorCode = Literal[
-    "spawn_failed",
-    "terminated_by_signal",
-    "pytest_preflight_failed",
-    "pytest_evidence_error",
-    "coverage_preflight_failed",
-    "missing_primary_process",
-    "cleanup_failed",
-]
 CheckErrorCodeV2 = Literal[
     "spawn_failed",
     "terminated_by_signal",

@@ -169,7 +169,13 @@ def execute_invocation(
     module = CHECK_MODULE[invocation.name]
     process = execute_process(
         role="primary",
-        command=build_launcher_command(prepared, launcher, invocation, marker_path),
+        command=build_launcher_command(
+            prepared,
+            launcher,
+            invocation,
+            marker_path,
+            use_observed_python_executable=True,
+        ),
         cwd=prepared.root,
         capture_output=True,
         runner=runner,

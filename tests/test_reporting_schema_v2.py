@@ -65,6 +65,7 @@ from pyrepo_check.reporting_schema import (
     ToolEnvironmentEvidence,
     validate_report_structure_v2,
 )
+import pyrepo_check.reporting_schema as reporting_schema
 from pyrepo_check.repository_environment import (
     prepare_repository_environment,
     probe_repository_dependencies,
@@ -853,6 +854,13 @@ def test_schema_v2_planning_error_contains_tool_environment() -> None:
     assert payload["schema_version"] == 2
     assert payload["repository_environment"] is None
     assert payload["tool_environment"]["python"]["version"] == (3, 13, 15)
+
+
+def test_schema_v2_is_the_only_public_agent_report_generation() -> None:
+    assert not hasattr(reporting_schema, "AgentReportV1")
+    assert not hasattr(reporting_schema, "RunReportV1")
+    assert not hasattr(reporting_schema, "PlanningErrorReportV1")
+    assert not hasattr(reporting_schema, "CheckErrorCode")
 
 
 @pytest.mark.parametrize(

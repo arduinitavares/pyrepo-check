@@ -12,7 +12,12 @@ from pyrepo_check.config import (
     collect_existing_positionals,
     load_project_config,
 )
-from pyrepo_check.execution import ExecutionResult, ProcessRunner, execute_plan
+from pyrepo_check.execution import (
+    ProcessRunner,
+    ToolEnvironmentObservation,
+    execute_plan,
+    observe_tool_environment,
+)
 from pyrepo_check.planning import (
     OutputFormat,
     PlanningErrorCode,
@@ -27,7 +32,7 @@ from pyrepo_check.reporting import (
     render_terminal,
     select_exit_code,
     serialize_json,
-    validate_report_v1,
+    validate_report_v2,
 )
 
 
@@ -82,6 +87,7 @@ def main(
     runner: ProcessRunner | None = None,
 ) -> int:
     args = parse_args(argv)
+    tool_environment = observe_tool_environment()
     output_format = cast(OutputFormat, args.format)
     request = RunRequest(
         root=Path(args.root),
@@ -102,6 +108,7 @@ def main(
             str(error),
             hint="Fix native [tool.coverage] settings in pyproject.toml.",
             output_format=output_format,
+            tool_environment=tool_environment,
         )
     except InvalidTestShortcutError as error:
         return _write_planning_error(
@@ -109,6 +116,7 @@ def main(
             str(error),
             hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
             output_format=output_format,
+            tool_environment=tool_environment,
         )
     except ValueError as error:
         return _write_planning_error(
@@ -116,6 +124,7 @@ def main(
             str(error),
             hint=None,
             output_format=output_format,
+            tool_environment=tool_environment,
         )
     except Exception as error:
         return _write_planning_error(
@@ -123,6 +132,7 @@ def main(
             str(error),
             hint=None,
             output_format=output_format,
+            tool_environment=tool_environment,
         )
 
     try:
@@ -140,6 +150,7 @@ def main(
             str(error),
             hint=error.hint,
             output_format=output_format,
+            tool_environment=tool_environment,
         )
     except Exception as error:
         return _write_planning_error(
@@ -147,17 +158,18 @@ def main(
             str(error),
             hint=None,
             output_format=output_format,
+            tool_environment=tool_environment,
         )
 
-    execution = execute_plan(plan, runner=runner)
+    execution = execute_plan(plan, tool_environment=tool_environment, runner=runner)
     try:
         report = build_run_report(config.root, plan, execution)
-        validate_report_v1(report)
+        validate_report_v2(report)
         rendered = serialize_json(report) if output_format == "json" else render_terminal(report)
         exit_code = select_exit_code(report)
     except Exception as error:
         _write_reporting_fallback(error)
-        return _fallback_exit_code(execution)
+        return 2
 
     if output_format == "json":
         sys.stdout.buffer.write(cast(bytes, rendered))
@@ -172,10 +184,16 @@ def _write_planning_error(
     *,
     hint: str | None,
     output_format: OutputFormat,
+    tool_environment: ToolEnvironmentObservation,
 ) -> int:
     try:
-        report = build_planning_error_report(code, message, hint=hint)
-        validate_report_v1(report)
+        report = build_planning_error_report(
+            code,
+            message,
+            hint=hint,
+            tool_environment=tool_environment,
+        )
+        validate_report_v2(report)
         rendered = serialize_json(report) if output_format == "json" else render_terminal(report)
         exit_code = select_exit_code(report)
     except Exception as error:
@@ -191,19 +209,6 @@ def _write_planning_error(
 
 def _write_reporting_fallback(error: Exception) -> None:
     print(f"pyrepo-check: internal reporting error: {error}", file=sys.stderr)
-
-
-def _fallback_exit_code(execution: ExecutionResult) -> int:
-    first_positive = next(
-        (
-            process.returncode
-            for check in execution.checks
-            for process in check.processes
-            if process.returncode is not None and process.returncode > 0
-        ),
-        None,
-    )
-    return first_positive if first_positive is not None else 2
 
 
 if __name__ == "__main__":

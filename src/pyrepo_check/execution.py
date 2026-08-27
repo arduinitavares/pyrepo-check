@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import queue
-import shlex
 import subprocess  # nosec B404
 import sys
 import threading
@@ -15,7 +14,6 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 from pyrepo_check.planning import (
     CheckInvocation,
     CheckName,
-    DefaultRepositoryPython,
     RepositoryPythonSelection,
     RunPlan,
 )
@@ -248,6 +246,9 @@ class RepositoryExecutionResult:
     checks: tuple[RepositoryCheckObservation, ...]
 
 
+ExecutionResult = RepositoryExecutionResult
+
+
 def observe_tool_environment() -> ToolEnvironmentObservation:
     executable = Path(os.path.abspath(os.path.normpath(sys.executable)))
     return ToolEnvironmentObservation(
@@ -268,12 +269,6 @@ class ExecutedCheck:
     coverage: CoverageExecutionObservation | None = None
 
 
-@dataclass(frozen=True)
-class ExecutionResult:
-    checks: tuple[ExecutedCheck, ...]
-    exit_code: int
-
-
 CHECK_MODULES: Mapping[CheckName, str] = {
     "ruff": "ruff",
     "annotations": "ruff",
@@ -284,88 +279,21 @@ CHECK_MODULES: Mapping[CheckName, str] = {
 }
 
 
-def locked_python_command(plan: RunPlan) -> tuple[str, ...]:
-    selector = (
-        ()
-        if isinstance(plan.repository_python, DefaultRepositoryPython)
-        else ("--python", plan.repository_python.request)
-    )
-    return ("uv", "run", "--locked", *selector, "python")
-
-
-def locked_module_command(plan: RunPlan, check: CheckInvocation) -> tuple[str, ...]:
-    return (
-        *locked_python_command(plan),
-        "-m",
-        CHECK_MODULES[check.name],
-        *check.arguments,
-    )
-
-
 def execute_plan(
     plan: RunPlan,
     *,
+    tool_environment: ToolEnvironmentObservation | None = None,
     runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
 ) -> ExecutionResult:
-    executed: list[ExecutedCheck] = []
+    from pyrepo_check.repository_executor import execute_repository_plan
 
-    for check in plan.checks:
-        is_json = plan.output_format == "json"
-        command = locked_module_command(plan, check)
-        if not is_json:
-            print(f"\n==> {check.name}: {shlex.join(command)}", flush=True)
-        if check.pytest is not None:
-            from pyrepo_check.pytest_execution import execute_pytest
-
-            executed.append(
-                execute_pytest(
-                    check,
-                    plan=plan,
-                    output_format=plan.output_format,
-                    runner=runner,
-                    clock_ns=clock_ns,
-                )
-            )
-            continue
-
-        executed.append(
-            ExecutedCheck(
-                planned=check,
-                processes=(
-                    execute_process(
-                        role="primary",
-                        command=command,
-                        cwd=plan.root,
-                        capture_output=is_json,
-                        runner=runner,
-                        clock_ns=clock_ns,
-                    ),
-                ),
-            )
-        )
-
-    first_positive = next(
-        (
-            process.returncode
-            for check in executed
-            for process in check.processes
-            if process.returncode is not None and process.returncode > 0
-        ),
-        None,
+    return execute_repository_plan(
+        plan,
+        tool_environment=tool_environment,
+        runner=runner,
+        clock_ns=clock_ns,
     )
-    if first_positive is not None:
-        exit_code = first_positive
-    elif any(
-        process.returncode is None or process.returncode < 0
-        for check in executed
-        for process in check.processes
-    ):
-        exit_code = 2
-    else:
-        exit_code = 0
-
-    return ExecutionResult(checks=tuple(executed), exit_code=exit_code)
 
 
 def execute_legacy_commands(

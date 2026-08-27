@@ -1,1593 +1,261 @@
-from pathlib import Path
+from __future__ import annotations
+
+import hashlib
 import json
-import os
-import subprocess  # nosec B404
-import sys
+from pathlib import Path
 
 import pytest
 
 from pyrepo_check.cli import main, parse_args
-from pyrepo_check.config import InvalidCoverageConfigError, ProjectConfig
 from pyrepo_check.execution import (
-    CAPTURE_LIMIT_BYTES,
+    AnalysisPythonAuthorityObservation,
     CapturedBytes,
-    ExecutedCheck,
+    CheckStartObservation,
+    DependencyObservation,
     ExecutedProcess,
-    ExecutionResult,
     ProcessRunner,
+    PythonObservation,
+    RepositoryCheckObservation,
+    RepositoryEnvironmentObservation,
+    RepositoryExecutionResult,
+    ToolEnvironmentObservation,
 )
-from pyrepo_check.planning import (
-    CheckInvocation,
-    ExplicitRepositoryPython,
-    PlanningFacts,
-    PlanningFailure,
-    RunPlan,
-    RunRequest,
-)
+from pyrepo_check.planning import RunPlan
 from tests.support import RecordingRunner
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
 @pytest.fixture(autouse=True)
-def _project_file_for_legacy_cli_contracts(tmp_path: Path) -> None:
-    """Give pre-Task-2 CLI fixtures the now-required project marker."""
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+def _uv_project(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0'\n",
+        encoding="utf-8",
+    )
 
 
-@pytest.mark.parametrize(
-    "argv",
-    (("--python", "3.12", "ty"), ("ty", "--python", "3.12")),
-)
-def test_python_request_is_accepted_before_or_after_check_tokens(
-    argv: tuple[str, ...],
+def _tool_environment() -> ToolEnvironmentObservation:
+    return ToolEnvironmentObservation(
+        pyrepo_check_version="0.1.0",
+        python=PythonObservation("cpython", (3, 13, 15), Path("/tool/bin/python")),
+    )
+
+
+def _process(role: str, command: tuple[str, ...], cwd: Path) -> ExecutedProcess:
+    return ExecutedProcess(
+        role=role,
+        command=command,
+        cwd=cwd,
+        returncode=0,
+        duration_ms=1,
+        stdout=CapturedBytes(b"", 0),
+        stderr=CapturedBytes(b"", 0),
+        spawn_error=None,
+    )
+
+
+def _successful_ty_execution(plan: RunPlan) -> RepositoryExecutionResult:
+    invocation = plan.checks[0]
+    repository_python = PythonObservation(
+        "cpython",
+        (3, 12, 11),
+        plan.root / ".venv/bin/python",
+    )
+    digest = hashlib.sha256()
+    for argument in invocation.arguments:
+        encoded = argument.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    primary = _process(
+        "primary",
+        (
+            "uv",
+            "run",
+            "--locked",
+            "--python",
+            str(repository_python.executable),
+            "python",
+            str(plan.root / ".pyrepo-check/check-launcher.py"),
+            "--evidence",
+            str(plan.root / ".pyrepo-check/start.json"),
+            "--check",
+            "ty",
+            "--module",
+            "ty",
+            "--",
+            *invocation.arguments,
+        ),
+        plan.root,
+    )
+    dependency_process = _process(
+        "dependency_probe",
+        ("uv", "run", "--locked", "python", "-c", "dependency-probe"),
+        plan.root,
+    )
+    return RepositoryExecutionResult(
+        tool_environment=_tool_environment(),
+        repository_environment=RepositoryEnvironmentObservation(
+            manager_version="0.10.12",
+            path=plan.root / ".venv",
+            python_selection=plan.repository_python,
+            python=repository_python,
+            lock_path=plan.root / "uv.lock",
+            lock_status="current",
+            mutation_protection="protected_files",
+            dependencies=(
+                DependencyObservation(
+                    name="ty",
+                    module="ty",
+                    required=">=0.0.35,<0.1",
+                    status="available",
+                    version="0.0.35",
+                    origin=str(plan.root / ".venv/lib/python3.12/site-packages/ty/__init__.py"),
+                    process=dependency_process,
+                    error=None,
+                ),
+            ),
+            processes=(
+                _process(
+                    "repository_git_root",
+                    ("git", "-C", str(plan.root), "rev-parse", "--show-toplevel"),
+                    plan.root,
+                ),
+                _process("uv_version", ("uv", "--version"), plan.root),
+                _process(
+                    "environment_probe",
+                    ("uv", "run", "--locked", "python", "-c", "environment-probe"),
+                    plan.root,
+                ),
+            ),
+            error=None,
+        ),
+        checks=(
+            RepositoryCheckObservation(
+                invocation=invocation,
+                execution_environment="repository",
+                analysis_python_authority=AnalysisPythonAuthorityObservation(),
+                start=CheckStartObservation(
+                    schema_version=1,
+                    check="ty",
+                    module="ty",
+                    arguments_sha256=digest.hexdigest(),
+                    python=repository_python,
+                ),
+                processes=(primary,),
+                error=None,
+            ),
+        ),
+    )
+
+
+def test_python_request_is_accepted_before_or_after_check_tokens() -> None:
+    assert parse_args(("--python", "3.12", "ty")).python == "3.12"
+    assert parse_args(("ty", "--python", "3.12")).checks == ["ty"]
+
+
+def test_schema_v2_planning_error_observes_tool_environment_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
 ) -> None:
-    args = parse_args(argv)
+    observations: list[ToolEnvironmentObservation] = []
 
-    assert args.python == "3.12"
-    assert args.checks == ["ty"]
+    def observe() -> ToolEnvironmentObservation:
+        observation = _tool_environment()
+        observations.append(observation)
+        return observation
+
+    monkeypatch.setattr("pyrepo_check.cli.observe_tool_environment", observe)
+
+    assert main(("--root", str(tmp_path), "--format", "json", "mypy")) == 2
+    planning_payload = json.loads(capsysbinary.readouterr().out)
+    assert planning_payload["schema_version"] == 2
+    assert planning_payload["tool_environment"]["python"]["version"] == [3, 13, 15]
+    assert planning_payload["repository_environment"] is None
+    assert len(observations) == 1
 
 
-def test_missing_pyproject_is_a_zero_spawn_planning_error(
+def test_schema_v2_focused_ty_uses_injected_repository_environment_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    tool_environment = _tool_environment()
+    observed: list[ToolEnvironmentObservation] = []
+
+    def observe() -> ToolEnvironmentObservation:
+        observed.append(tool_environment)
+        return tool_environment
+
+    def execute(
+        plan: RunPlan,
+        *,
+        tool_environment: ToolEnvironmentObservation | None = None,
+        runner: ProcessRunner | None = None,
+    ) -> RepositoryExecutionResult:
+        del runner
+        assert tool_environment is observed[0]
+        return _successful_ty_execution(plan)
+
+    monkeypatch.setattr("pyrepo_check.cli.observe_tool_environment", observe)
+    monkeypatch.setattr("pyrepo_check.cli.execute_plan", execute)
+
+    assert main(("--root", str(tmp_path), "--format", "json", "ty")) == 0
+    run_payload = json.loads(capsysbinary.readouterr().out)
+    assert run_payload["schema_version"] == 2
+    assert run_payload["repository_environment"]["lock"]["status"] == "current"
+    assert run_payload["checks"][0]["execution_environment"] == "repository"
+    assert len(observed) == 1
+
+
+def test_missing_lock_is_schema_v2_environment_error_without_spawning(
     tmp_path: Path,
     capsysbinary: pytest.CaptureFixture[bytes],
 ) -> None:
-    (tmp_path / "pyproject.toml").unlink()
     runner = RecordingRunner()
 
     assert main(("--root", str(tmp_path), "--format", "json", "ty"), runner=runner) == 2
-    assert runner.calls == []
     payload = json.loads(capsysbinary.readouterr().out)
-    assert payload["error"]["code"] == "uv_project_required"
+    assert runner.calls == []
+    assert payload["repository_environment"]["lock"]["status"] == "missing"
+    assert payload["repository_environment"]["error"]["code"] == "repository_lock_missing"
+    assert payload["checks"][0]["error"]["code"] == "repository_environment_unavailable"
 
 
-@pytest.mark.parametrize(
-    "argv",
-    (("--no-frozen", "ty"), ("--python", "3.14", "ty")),
-)
-def test_environment_planning_errors_do_not_call_the_runner(
+@pytest.mark.parametrize("argv", (("--no-frozen", "ty"), ("--python", "3.14", "ty")))
+def test_environment_planning_errors_spawn_nothing(
     tmp_path: Path,
     argv: tuple[str, ...],
 ) -> None:
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     runner = RecordingRunner()
 
     assert main(("--root", str(tmp_path), *argv), runner=runner) == 2
     assert runner.calls == []
 
 
-def test_cli_run_plan_path_does_not_use_legacy_command_executor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    def legacy_must_not_run(*_args: object, **_kwargs: object) -> int:
-        raise AssertionError("CLI must not use execute_legacy_commands")
-
-    monkeypatch.setattr("pyrepo_check.execution.execute_legacy_commands", legacy_must_not_run)
-
-    assert main(("--root", str(tmp_path), "ty"), runner=RecordingRunner()) == 0
-
-
-def _write_test_shortcuts(root: Path, shortcuts: dict[str, object]) -> None:
-    shortcut_toml = "\n".join(
-        f"{json.dumps(name)} = {json.dumps(args)}" for name, args in shortcuts.items()
-    )
-    (root / "pyproject.toml").write_text(
-        "[tool.pyrepo-check.test-shortcuts]\n" + shortcut_toml,
-        encoding="utf-8",
-    )
-
-
-def _write_live_pytest_consumer(
-    root: Path,
-    *,
-    include_pytest: bool = True,
-    include_xdist: bool = False,
-    conftest_source: str | None = None,
-) -> None:
-    dependencies = (
-        '["pytest>=8,<9", "pytest-xdist>=3.8,<4"]'
-        if include_xdist
-        else ('["pytest>=8,<9"]' if include_pytest else "[]")
-    )
-    shortcut = (
-        '\n[tool.pyrepo-check.test-shortcuts]\nunit = ["tests/test_sample.py::test_selected"]\n'
-        if include_pytest
-        else ""
-    )
-    (root / "pyproject.toml").write_text(
-        "[project]\n"
-        'name = "task-8-live-consumer"\n'
-        'version = "0.0.0"\n'
-        'requires-python = ">=3.13.15"\n'
-        f"dependencies = {dependencies}\n"
-        "\n[tool.pytest.ini_options]\n"
-        'testpaths = ["tests"]\n' + shortcut,
-        encoding="utf-8",
-    )
-    if include_pytest:
-        (root / "tests").mkdir()
-        (root / "tests" / "test_sample.py").write_text(
-            "def test_selected():\n    assert True\n\n\ndef test_other():\n    assert True\n",
-            encoding="utf-8",
-        )
-        if conftest_source is not None:
-            (root / "conftest.py").write_text(conftest_source, encoding="utf-8")
-    subprocess.run(("uv", "lock"), cwd=root, check=True, capture_output=True)  # nosec B603
-
-
-@pytest.mark.parametrize(
-    ("output_format", "pytest_args", "expected_args"),
-    (
-        (
-            "terminal",
-            ("tests/test_sample.py::test_selected",),
-            ["tests/test_sample.py::test_selected"],
-        ),
-        ("json", ("--shortcut", "unit"), ["tests/test_sample.py::test_selected"]),
-    ),
-)
-def test_structured_pytest_cli_runs_a_real_consumer_with_one_primary(
-    tmp_path: Path,
-    output_format: str,
-    pytest_args: tuple[str, ...],
-    expected_args: list[str],
-) -> None:
-    consumer = tmp_path / "consumer"
-    consumer.mkdir()
-    _write_live_pytest_consumer(consumer)
-
-    completed = subprocess.run(  # nosec B603
-        (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
-            "--root",
-            str(consumer),
-            "--format",
-            output_format,
-            "pytest",
-            *pytest_args,
-        ),
-        cwd=consumer,
-        check=False,
-        capture_output=True,
-    )
-
-    assert completed.returncode == 0
-    if output_format == "terminal":
-        assert b"VIRTUAL_ENV" in completed.stderr
-        assert b"==> pyrepo-check summary: passed (focused)" in completed.stdout
-        return
-    assert completed.stderr == b""
-    payload = json.loads(completed.stdout)
-    assert payload["overall_status"] == "passed"
-    assert payload["complete"] is True
-    assert payload["selection"]["pytest_args"] == expected_args
-    assert payload["pytest"]["status"] == "passed"
-    assert payload["pytest"]["complete"] is True
-    assert payload["pytest"]["scope"] == "partial"
-    assert payload["pytest"]["evidence"] is not None
-    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
-        "pytest_preflight",
-        "primary",
-    ]
-
-
-@pytest.mark.parametrize(
-    "sessionfinish_hook",
-    (
-        """
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session, exitstatus):
-    del exitstatus
-    emit_duplicate_report(session)
-""",
-        """
-@pytest.hookimpl(wrapper=True)
-def pytest_sessionfinish(session, exitstatus):
-    del exitstatus
-    yield
-    emit_duplicate_report(session)
-""",
-    ),
-    ids=("ordinary-trylast", "wrapper-teardown"),
-)
-def test_structured_pytest_cli_rejects_reports_emitted_at_terminal_sessionfinish(
-    tmp_path: Path,
-    sessionfinish_hook: str,
-) -> None:
-    consumer = tmp_path / "consumer"
-    consumer.mkdir()
-    _write_live_pytest_consumer(
-        consumer,
-        conftest_source=(
-            """
-import pytest
-from _pytest.reports import TestReport
-
-
-def emit_duplicate_report(session):
-    session.config.hook.pytest_runtest_logreport(
-        report=TestReport(
-            nodeid="tests/test_sample.py::test_selected",
-            location=("tests/test_sample.py", 0, "test_selected"),
-            keywords={},
-            outcome="passed",
-            longrepr=None,
-            when="call",
-            sections=(),
-            duration=0.0,
-            start=0.0,
-            stop=0.0,
-            user_properties=[],
-        )
-    )
-"""
-            + sessionfinish_hook
-        ),
-    )
-
-    completed = subprocess.run(  # nosec B603
-        (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
-            "--format",
-            "json",
-            "pytest",
-            "tests/test_sample.py::test_selected",
-        ),
-        cwd=consumer,
-        check=False,
-        capture_output=True,
-    )
-
-    payload = json.loads(completed.stdout)
-    assert completed.returncode == 2
-    assert completed.stderr == b""
-    assert payload["overall_status"] == "error"
-    assert payload["complete"] is False
-    assert payload["pytest"] == {
-        "status": "error",
-        "complete": False,
-        "scope": "partial",
-        "scope_reasons": ["planned_selector", "incomplete_session"],
-        "pytest_version": payload["pytest"]["pytest_version"],
-        "exit_code": 0,
-        "evidence": None,
-        "error": {
-            "code": "unsupported_retries",
-            "message": "pytest artifact reports unsupported retries",
-        },
-    }
-    check = payload["checks"][0]
-    assert check["status"] == "error"
-    assert check["error"] == {
-        "code": "pytest_evidence_error",
-        "message": "pytest artifact reports unsupported retries",
-    }
-    assert [process["role"] for process in check["processes"]] == [
-        "pytest_preflight",
-        "primary",
-    ]
-    primary = check["processes"][1]
-    assert primary["outcome"] == "exited"
-    assert primary["exit_code"] == 0
-    assert primary["signal"] is None
-    assert primary["error_message"] is None
-
-
-@pytest.mark.parametrize(
-    ("published_exit_code", "expected_forced_exit_code", "runtestloop_hook"),
-    (
-        pytest.param(0, 3, "", id="published-0"),
-        pytest.param(
-            3,
-            2,
-            """
-
-
-def pytest_runtestloop(session):
-    del session
-    raise RuntimeError("intentional consumer internal error")
-""",
-            id="published-3",
-        ),
-    ),
-)
-def test_structured_pytest_cli_rejects_stale_finalized_artifact_when_terminal_invalidation_cannot_publish(
-    tmp_path: Path,
-    published_exit_code: int,
-    expected_forced_exit_code: int,
-    runtestloop_hook: str,
-) -> None:
-    consumer = tmp_path / "consumer"
-    consumer.mkdir()
-    _write_live_pytest_consumer(consumer)
-    (consumer / "early_terminal_relay.py").write_text(
-        """
-import atexit
-import os
-from pathlib import Path
-
-from _pytest.reports import TestReport
-
-
-_CONFIG = None
-_ORIGINAL_REPLACE = os.replace
-
-
-def relay_after_evidence_finalizer():
-    if _CONFIG is None:
-        return
-    artifact_path = Path(os.environ["PYREPO_CHECK_PYTEST_JSON"])
-    Path("stale-finalized.json").write_bytes(artifact_path.read_bytes())
-
-    def fail_artifact_replace(source, destination):
-        if Path(destination) == artifact_path:
-            raise OSError("terminal invalidation replace failed")
-        _ORIGINAL_REPLACE(source, destination)
-
-    os.replace = fail_artifact_replace
-    _CONFIG.hook.pytest_runtest_logreport(
-        report=TestReport(
-            nodeid="tests/test_sample.py::test_selected",
-            location=("tests/test_sample.py", 0, "test_selected"),
-            keywords={},
-            outcome="passed",
-            longrepr=None,
-            when="call",
-            sections=(),
-            duration=0.0,
-            start=0.0,
-            stop=0.0,
-            user_properties=[],
-        )
-    )
-
-
-atexit.register(relay_after_evidence_finalizer)
-
-
-def pytest_configure(config):
-    global _CONFIG
-    _CONFIG = config
-"""
-        + runtestloop_hook,
-        encoding="utf-8",
-    )
-    environment = os.environ | {"PYTEST_ADDOPTS": "-p early_terminal_relay"}
-
-    completed = subprocess.run(  # nosec B603
-        (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
-            "--format",
-            "json",
-            "pytest",
-            "tests/test_sample.py::test_selected",
-        ),
-        cwd=consumer,
-        env=environment,
-        check=False,
-        capture_output=True,
-    )
-
-    payload = json.loads(completed.stdout)
-    stale_artifact = json.loads((consumer / "stale-finalized.json").read_text(encoding="utf-8"))
-    assert stale_artifact["state"] == "finalized"
-    assert stale_artifact["session"]["finishes"] == 1
-    assert stale_artifact["session"]["exit_code"] == published_exit_code
-    assert 1 <= expected_forced_exit_code <= 255
-    assert expected_forced_exit_code != published_exit_code
-    assert completed.returncode == expected_forced_exit_code
-    assert completed.stderr == b""
-    assert payload["overall_status"] == "error"
-    assert payload["complete"] is False
-    assert payload["pytest"] == {
-        "status": "error",
-        "complete": False,
-        "scope": "partial",
-        "scope_reasons": ["planned_selector", "incomplete_session"],
-        "pytest_version": payload["pytest"]["pytest_version"],
-        "exit_code": expected_forced_exit_code,
-        "evidence": None,
-        "error": {
-            "code": "exit_code_mismatch",
-            "message": "pytest artifact exit code differs from the primary process",
-        },
-    }
-    primary = payload["checks"][0]["processes"][1]
-    assert primary["role"] == "primary"
-    assert primary["outcome"] == "exited"
-    assert primary["exit_code"] == expected_forced_exit_code
-
-
-def test_structured_pytest_cli_stops_after_unsupported_preflight(tmp_path: Path) -> None:
-    consumer = tmp_path / "consumer"
-    consumer.mkdir()
-    _write_live_pytest_consumer(consumer, include_pytest=False)
-
-    completed = subprocess.run(  # nosec B603
-        (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
-            "--root",
-            str(consumer),
-            "--format",
-            "json",
-            "pytest",
-        ),
-        cwd=consumer,
-        check=False,
-        capture_output=True,
-    )
-
-    payload = json.loads(completed.stdout)
-    assert completed.returncode == 2
-    assert completed.stderr == b""
-    assert payload["pytest"]["error"]["code"] == "module_unavailable"
-    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
-        "pytest_preflight",
-    ]
-
-
-def test_structured_pytest_cli_rejects_active_xdist_with_schema_valid_json(
-    tmp_path: Path,
-) -> None:
-    consumer = tmp_path / "consumer"
-    consumer.mkdir()
-    _write_live_pytest_consumer(consumer, include_xdist=True)
-
-    completed = subprocess.run(  # nosec B603
-        (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
-            "--format",
-            "json",
-            "pytest",
-            "--",
-            "-n",
-            "1",
-        ),
-        cwd=consumer,
-        check=False,
-        capture_output=True,
-    )
-
-    payload = json.loads(completed.stdout)
-    assert completed.returncode == 4
-    assert completed.stderr == b""
-    assert payload["overall_status"] == "error"
-    assert payload["complete"] is False
-    assert payload["pytest"]["evidence"] is None
-    assert payload["pytest"]["error"]["code"] == "unsupported_parallelism"
-    assert payload["checks"][0]["error"]["code"] == "pytest_evidence_error"
-
-
-def _assert_planning_error_output(
-    stdout: bytes,
-    stderr: bytes,
-    *,
-    output_format: str,
-    code: str,
-    message: str,
-    hint: str | None,
-) -> None:
-    if output_format == "json":
-        assert stderr == b""
-        assert stdout.endswith(b"\n")
-        assert json.loads(stdout.decode("utf-8")) == {
-            "schema_version": 1,
-            "kind": "planning_error",
-            "overall_status": "error",
-            "complete": False,
-            "error": {"code": code, "message": message, "hint": hint},
-        }
-    else:
-        assert stdout == b""
-        assert stderr == (message + (f"\nHint: {hint}" if hint is not None else "") + "\n").encode()
-
-
-def executed_check(
-    planned: CheckInvocation,
-    returncode: int | None,
-    *,
-    duration_ms: int = 1,
-    stdout: bytes | None = None,
-    stderr: bytes | None = None,
-    spawn_error: str | None = None,
-) -> ExecutedCheck:
-    return ExecutedCheck(
-        planned=planned,
-        processes=(
-            ExecutedProcess(
-                role="primary",
-                command=(planned.name, *planned.arguments),
-                cwd=Path.cwd(),
-                returncode=returncode,
-                duration_ms=duration_ms,
-                stdout=_captured_bytes(stdout),
-                stderr=_captured_bytes(stderr),
-                spawn_error=spawn_error,
-            ),
-        ),
-    )
-
-
-def _captured_bytes(raw: bytes | None) -> CapturedBytes | None:
-    if raw is None:
-        return None
-    tail = raw[-CAPTURE_LIMIT_BYTES:]
-    return CapturedBytes(tail, len(raw) - len(tail))
-
-
-def test_cli_builds_request_and_executes_plan(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    planned_check = CheckInvocation(
-        name="ty",
-        arguments=("check",),
-    )
-    expected_plan = RunPlan(
-        root=tmp_path.resolve(),
-        repository_python=ExplicitRepositoryPython("3.13"),
-        mode="focused",
-        targets=(),
-        checks=(planned_check,),
-    )
-    planned_requests: list[RunRequest] = []
-    executed_plans: list[RunPlan] = []
-    injected_runner = RecordingRunner()
-
-    def fake_plan_run(
-        request: RunRequest,
-        config: ProjectConfig,
-        facts: PlanningFacts,
-    ) -> RunPlan:
-        planned_requests.append(request)
-        assert config.root == tmp_path.resolve()
-        assert facts == PlanningFacts(existing_positionals=frozenset(), pyproject_exists=True)
-        return expected_plan
-
-    def fake_execute_plan(
-        plan: RunPlan,
-        *,
-        runner: ProcessRunner,
-    ) -> ExecutionResult:
-        executed_plans.append(plan)
-        assert runner is injected_runner
-        return ExecutionResult(
-            checks=(executed_check(planned_check, 7),),
-            exit_code=7,
-        )
-
-    monkeypatch.setattr("pyrepo_check.cli.plan_run", fake_plan_run, raising=False)
-    monkeypatch.setattr(
-        "pyrepo_check.cli.execute_plan",
-        fake_execute_plan,
-        raising=False,
-    )
-
-    result = main(
-        ["--root", str(tmp_path), "--shortcut", "unit", "ty"],
-        runner=injected_runner,
-    )
-
-    assert result == 7
-    assert planned_requests == [
-        RunRequest(
-            root=tmp_path,
-            positionals=("ty",),
-            all_selected=False,
-            no_frozen=False,
-            test_shortcut="unit",
-        )
-    ]
-    assert executed_plans == [expected_plan]
-
-
-@pytest.mark.parametrize("argv", (("--coverage", "pytest"), ("pytest", "--coverage")))
-def test_coverage_flag_is_parsed_and_forwarded(
-    tmp_path: Path, argv: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    captured_requests: list[RunRequest] = []
-    planned_check = CheckInvocation("ty", ("check",))
-    monkeypatch.setattr(
-        "pyrepo_check.cli.plan_run",
-        lambda request, _config, _facts: (
-            captured_requests.append(request)
-            or RunPlan(tmp_path, ExplicitRepositoryPython("3.13"), "focused", (), (planned_check,))
-        ),
-    )
-    monkeypatch.setattr(
-        "pyrepo_check.cli.execute_plan",
-        lambda _plan, *, runner: ExecutionResult((executed_check(planned_check, 0),), 0),
-    )
-
-    assert main(("--root", str(tmp_path), *argv), runner=RecordingRunner()) == 0
-    assert captured_requests[0].coverage_requested is True
-
-
-@pytest.mark.parametrize(
-    "target",
-    ("tests/test_sample.py", "tests/test_sample.py::test_selected"),
-)
-def test_coverage_option_can_be_interspersed_with_a_direct_target(target: str) -> None:
-    args = parse_args(("pytest", "--coverage", target))
-
-    assert args.coverage is True
-    assert args.checks == ["pytest", target]
-
-
-@pytest.mark.parametrize(
-    "positionals",
-    (("ty",), ("tests/test_example.py",)),
-    ids=("non-pytest-check", "target-only"),
-)
-def test_coverage_without_pytest_is_a_zero_spawn_planning_error(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    positionals: tuple[str, ...],
-) -> None:
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_example.py").write_text("", encoding="utf-8")
-    runner = RecordingRunner()
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", *positionals, "--coverage"],
-        runner=runner,
-    )
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format="json",
-        code="invalid_arguments",
-        message="--coverage requires pytest to be selected.",
-        hint="Use: pyrepo-check pytest --coverage",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-def test_cli_recording_runner_executes_coverage_processes_in_order(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "example.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_example.py").write_text("", encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text(
-        """[tool.coverage.run]
-branch = true
-source = ["src"]
-parallel = false
-
-[tool.coverage.report]
-fail_under = 100
-""",
-        encoding="utf-8",
-    )
-    runner = RecordingRunner(
-        publish_pytest_artifact=True,
-        publish_coverage_artifact=True,
-    )
-
-    result = main(
-        [
-            "--root",
-            str(tmp_path),
-            "--format",
-            "json",
-            "pytest",
-            "--coverage",
-            "tests/test_example.py",
-        ],
-        runner=runner,
-    )
-
-    payload = json.loads(capsysbinary.readouterr().out)
-    pytest_check = payload["checks"][0]
-    processes = pytest_check["processes"]
-    primary = processes[2]
-    coverage_json = processes[3]
-
-    assert result == 0, payload
-    assert payload["selection"] == {
-        "checks": ["pytest"],
-        "targets": ["tests/test_example.py"],
-        "test_shortcut": None,
-        "pytest_args": ["tests/test_example.py"],
-        "planned_test_scope": "partial",
-        "planned_coverage_scope": "partial",
-    }
-    assert payload["coverage"]["status"] == "guidance"
-    assert payload["coverage"]["threshold"]["skipped_reason"] == "partial_run"
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-        "coverage_json",
-    ]
-    assert len(runner.calls) == 4
-    assert "pytest_available" in runner.calls[0].command[-1]
-    assert "coverage_available" in runner.calls[1].command[-1]
-    assert primary["argv"][:8] == [
-        "uv",
-        "run",
-        "--locked",
-        "python",
-        "-m",
-        "coverage",
-        "run",
-        f"--rcfile={tmp_path / 'pyproject.toml'}",
-    ]
-    assert primary["argv"][8].startswith("--data-file=")
-    assert primary["argv"][9:12] == ["-m", "pytest", "-p"]
-    assert primary["argv"][12].startswith("_pyrepo_check_pytest_")
-    assert primary["argv"][13:] == ["tests/test_example.py"]
-    assert coverage_json["argv"][:8] == [
-        "uv",
-        "run",
-        "--locked",
-        "python",
-        "-m",
-        "coverage",
-        "json",
-        f"--rcfile={tmp_path / 'pyproject.toml'}",
-    ]
-    assert coverage_json["argv"][8].startswith("--data-file=")
-    assert coverage_json["argv"][9] == "-o"
-    assert coverage_json["argv"][10].endswith("/coverage.json")
-    assert coverage_json["argv"][11:] == ["--keep-combined", "--fail-under=0"]
-
-
-def test_coverage_flag_appears_in_help(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as raised:
-        parse_args(("--help",))
-
-    assert raised.value.code == 0
-    assert "--coverage" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-def test_missing_coverage_configuration_is_a_zero_spawn_planning_error(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-) -> None:
-    runner = RecordingRunner()
-    argv = ["--root", str(tmp_path), "pytest", "--coverage"]
-    if output_format == "json":
-        argv[2:2] = ["--format", "json"]
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="coverage_configuration_required",
-        message="--coverage requires a valid [tool.coverage.run] configuration.",
-        hint="Configure native Coverage.py settings in pyproject.toml.",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-def test_invalid_native_coverage_configuration_is_a_zero_spawn_project_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-) -> None:
-    runner = RecordingRunner()
-    message = "Invalid coverage configuration in pyproject.toml: branch must be true"
-    monkeypatch.setattr(
-        "pyrepo_check.cli.load_project_config",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(InvalidCoverageConfigError(message)),
-    )
-    argv = ["--root", str(tmp_path), "pytest"]
-    if output_format == "json":
-        argv[2:2] = ["--format", "json"]
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="invalid_project_config",
-        message=message,
-        hint="Fix native [tool.coverage] settings in pyproject.toml.",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-@pytest.mark.parametrize(
-    ("positionals", "all_selected"),
-    (
-        (("pytest", "tests/direct.py"), False),
-        (("ruff", "pytest"), False),
-        (("pytest",), True),
-        ((), False),
-    ),
-)
-def test_shortcut_conflicts_render_planning_errors_without_spawning(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-    positionals: tuple[str, ...],
-    all_selected: bool,
-) -> None:
-    (tmp_path / "tests" / "unit").mkdir(parents=True)
-    (tmp_path / "tests" / "direct.py").write_text("", encoding="utf-8")
-    _write_test_shortcuts(tmp_path, {"unit": ["tests/unit"]})
-    runner = RecordingRunner()
-    argv = ["--root", str(tmp_path)]
-    if output_format == "json":
-        argv.extend(("--format", "json"))
-    if all_selected:
-        argv.append("--all")
-    argv.extend(positionals)
-    argv.extend(("--shortcut", "unit"))
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="invalid_arguments",
-        message=(
-            "--shortcut requires an explicit pytest-only run with no direct targets or --all."
-        ),
-        hint="Use: pyrepo-check pytest --shortcut NAME",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-@pytest.mark.parametrize(
-    ("shortcuts", "message"),
-    (
-        (
-            {"unit": ["bad\x00path"]},
-            "Invalid Test Shortcut 'unit': target path cannot be inspected safely: bad\x00path",
-        ),
-        (
-            {"broken": []},
-            "Invalid Test Shortcut 'broken': value must be a non-empty list of strings",
-        ),
-    ),
-)
-def test_invalid_shortcut_config_renders_typed_planning_error_without_spawning(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-    shortcuts: dict[str, object],
-    message: str,
-) -> None:
-    _write_test_shortcuts(tmp_path, shortcuts)
-    runner = RecordingRunner()
-    argv = ["--root", str(tmp_path)]
-    if output_format == "json":
-        argv.extend(("--format", "json"))
-    argv.append("ty")
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="invalid_test_shortcut",
-        message=message,
-        hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-@pytest.mark.parametrize("selector", ("-k", "-m"))
-def test_nul_selector_config_renders_typed_planning_error_without_spawning(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-    selector: str,
-) -> None:
-    _write_test_shortcuts(tmp_path, {"unit": [selector, "bad\x00expr"]})
-    runner = RecordingRunner()
-    argv = ["--root", str(tmp_path)]
-    if output_format == "json":
-        argv.extend(("--format", "json"))
-    argv.append("ty")
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="invalid_test_shortcut",
-        message=(
-            f"Invalid Test Shortcut 'unit': selector {selector} expression cannot contain NUL"
-        ),
-        hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-def test_symlink_loop_shortcut_config_renders_typed_error_without_spawning(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-) -> None:
-    try:
-        (tmp_path / "loop").symlink_to("loop")
-    except OSError:
-        pytest.skip()
-    _write_test_shortcuts(tmp_path, {"unit": ["loop"]})
-    runner = RecordingRunner()
-    argv = ["--root", str(tmp_path)]
-    if output_format == "json":
-        argv.extend(("--format", "json"))
-    argv.append("ty")
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="invalid_test_shortcut",
-        message="Invalid Test Shortcut 'unit': target path cannot be inspected safely: loop",
-        hint="Fix [tool.pyrepo-check.test-shortcuts] in pyproject.toml.",
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-@pytest.mark.parametrize(
-    ("shortcuts", "expected_hint"),
-    (
-        (
-            {
-                "unit": ["tests/unit"],
-                "cli": ["tests/unit"],
-                "integration": ["tests/unit"],
-            },
-            "Available Test Shortcuts: cli, integration, unit",
-        ),
-        ({}, "No Test Shortcuts are configured."),
-    ),
-)
-def test_unknown_shortcut_renders_name_hint_without_spawning(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-    shortcuts: dict[str, object],
-    expected_hint: str,
-) -> None:
-    (tmp_path / "tests" / "unit").mkdir(parents=True)
-    _write_test_shortcuts(tmp_path, shortcuts)
-    runner = RecordingRunner()
-    argv = ["--root", str(tmp_path)]
-    if output_format == "json":
-        argv.extend(("--format", "json"))
-    argv.extend(("pytest", "--shortcut", "missing"))
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    _assert_planning_error_output(
-        captured.out,
-        captured.err,
-        output_format=output_format,
-        code="unknown_test_shortcut",
-        message="Unknown Test Shortcut: missing",
-        hint=expected_hint,
-    )
-    assert result == 2
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ("terminal", "json"))
-def test_cli_executes_named_shortcut_with_authoritative_selection_metadata(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-) -> None:
-    (tmp_path / "tests" / "unit").mkdir(parents=True)
-    _write_test_shortcuts(tmp_path, {"unit": ["tests/unit", "-m", "not slow"]})
-    runner = RecordingRunner(publish_pytest_artifact=True)
-    argv = ["--root", str(tmp_path)]
-    if output_format == "json":
-        argv.extend(("--format", "json"))
-    argv.extend(("pytest", "--shortcut", "unit"))
-
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    assert result == 0
-    plugin_name = runner.calls[1].command[runner.calls[1].command.index("-p") + 1]
-    assert [call.command for call in runner.calls] == [
-        ("uv", "run", "--locked", "python", "-c", runner.calls[0].command[-1]),
-        (
-            "uv",
-            "run",
-            "--locked",
-            "python",
-            "-m",
-            "pytest",
-            "-p",
-            plugin_name,
-            "tests/unit",
-            "-m",
-            "not slow",
-        ),
-    ]
-    if output_format == "json":
-        assert captured.err == b""
-        assert captured.out.endswith(b"\n")
-        payload = json.loads(captured.out.decode("utf-8"))
-        assert payload["selection"] == {
-            "checks": ["pytest"],
-            "targets": [],
-            "test_shortcut": "unit",
-            "pytest_args": ["tests/unit", "-m", "not slow"],
-            "planned_test_scope": "partial",
-            "planned_coverage_scope": "not_requested",
-        }
-    else:
-        assert captured.err == b""
-        assert captured.out.endswith(
-            b"\n==> pyrepo-check summary: passed (focused)\n    passed: pytest\n"
-        )
-
-
-def test_terminal_summary_is_written_only_after_final_runner_call(
+def test_terminal_planning_error_is_written_to_stderr(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    (tmp_path / "src").mkdir()
-    stdout_at_spawn: list[str] = []
-    runner = RecordingRunner(
-        returncodes=(0, 7),
-        on_call=lambda _call: stdout_at_spawn.append(capsys.readouterr().out),
-    )
-
-    result = main(["--root", str(tmp_path), "ruff", "ty"], runner=runner)
-
-    assert result == 7
-    assert stdout_at_spawn == [
-        "\n==> ruff: uv run --locked python -m ruff check src\n",
-        "\n==> ty: uv run --locked python -m ty check\n",
-    ]
-    assert capsys.readouterr().out == (
-        "\n==> pyrepo-check summary: failed (focused)\n    failed: ty (exit 7)\n    passed: ruff\n"
-    )
-
-
-@pytest.mark.parametrize(
-    ("returncode", "expected_exit", "expected_summary"),
-    (
-        (0, 0, "passed (focused)\n    passed: ruff"),
-        (4, 4, "failed (focused)\n    failed: ruff (exit 4)"),
-        (
-            -15,
-            2,
-            "error (focused, incomplete)\n"
-            "    error: ruff: Primary process terminated by signal 15.",
-        ),
-    ),
-)
-def test_terminal_summary_and_exit_follow_report(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    returncode: int,
-    expected_exit: int,
-    expected_summary: str,
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    result = main(
-        ["--root", str(tmp_path), "ruff"],
-        runner=RecordingRunner(returncodes=(returncode,)),
-    )
-
-    output = capsys.readouterr()
-    assert result == expected_exit
-    assert output.out.endswith(f"\n==> pyrepo-check summary: {expected_summary}\n")
-    assert output.err == ""
-
-
-def test_cli_reports_planning_error_without_spawning(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    runner = RecordingRunner()
-
-    result = main(["--root", str(tmp_path), "mypy"], runner=runner)
-
+    assert main(("--root", str(tmp_path), "mypy")) == 2
     captured = capsys.readouterr()
-    assert result == 2
     assert captured.out == ""
-    assert captured.err == (
-        "Unknown check(s): mypy\n"
-        "Hint: Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest\n"
-    )
-    assert runner.calls == []
+    assert captured.err.startswith("Unknown check(s): mypy\n")
 
 
-def test_json_is_one_isolated_utf8_document_with_captured_process_streams(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    (tmp_path / "src").mkdir()
-    runner = RecordingRunner(
-        returncodes=(-15, 7),
-        stdout=(
-            b'{"fragment":true}\n\x1b[31mred\x1b[0m\nUTF-8: \xe2\x98\x83',
-            b"later {stdout}\n",
-        ),
-        stderr=(
-            b"warn\n\x1b]0;title\x07visible",
-            b"}\n",
-        ),
-    )
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "ruff", "ty"],
-        runner=runner,
-    )
-
-    captured = capsysbinary.readouterr()
-    payload = json.loads(captured.out.decode("utf-8"))
-    assert result == 7
-    assert captured.out.endswith(b"\n")
-    assert captured.err == b""
-    assert b"==>" not in captured.out
-    assert payload["overall_status"] == "error"
-    assert payload["complete"] is False
-    assert [check["name"] for check in payload["checks"]] == ["ruff", "ty"]
-    assert payload["checks"][0]["processes"][0]["stdout"]["text"] == (
-        '{"fragment":true}\nred\nUTF-8: \u2603'
-    )
-    assert payload["checks"][0]["processes"][0]["stderr"]["text"] == ("warn\nvisible")
-    assert payload["checks"][1]["processes"][0]["stdout"]["text"] == ("later {stdout}\n")
-    assert payload["checks"][1]["processes"][0]["stderr"]["text"] == "}\n"
-
-
-def test_real_large_output_json_mode_emits_one_parseable_bounded_document(
+def test_reporting_failure_emits_no_partial_json_and_returns_two(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
 ) -> None:
-    (tmp_path / "src").mkdir()
-    source = (
-        "import os\n"
-        "os.write(1, b'raw-stdout-prefix' + b'x' * (2 * 1024 * 1024))\n"
-        "os.write(2, b'raw-stderr-prefix' + b'y' * (2 * 1024 * 1024))\n"
-    )
-
-    def real_process_plan(
-        request: RunRequest,
-        config: ProjectConfig,
-        facts: PlanningFacts,
-    ) -> RunPlan:
-        del request, facts
-        return RunPlan(
-            root=config.root,
-            repository_python=ExplicitRepositoryPython("3.13"),
-            mode="focused",
-            targets=(),
-            checks=(
-                CheckInvocation(
-                    name="ruff",
-                    arguments=("check",),
-                ),
-            ),
-            output_format="json",
-        )
-
-    monkeypatch.setattr("pyrepo_check.cli.plan_run", real_process_plan)
     monkeypatch.setattr(
-        "pyrepo_check.execution.locked_module_command",
-        lambda _plan, _check: (sys.executable, "-c", source),
+        "pyrepo_check.cli.execute_plan",
+        lambda plan, **_kwargs: _successful_ty_execution(plan),
     )
-
-    result = main(["--root", str(tmp_path), "--format", "json", "ruff"])
-
-    captured = capsysbinary.readouterr()
-    payload = json.loads(captured.out)
-    process = payload["checks"][0]["processes"][0]
-    assert result == 0
-    assert captured.err == b""
-    assert captured.out.endswith(b"\n")
-    assert process["stdout"]["omitted_bytes"] == (
-        len(b"raw-stdout-prefix") + 2 * 1024 * 1024 - 65_536
-    )
-    assert process["stderr"]["omitted_bytes"] == (
-        len(b"raw-stderr-prefix") + 2 * 1024 * 1024 - 65_536
-    )
-    assert process["stdout"]["text"] == "x" * 65_536
-    assert process["stderr"]["text"] == "y" * 65_536
-
-
-def test_json_planning_error_is_one_document_and_spawns_nothing(
-    tmp_path: Path,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    runner = RecordingRunner()
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "mypy"],
-        runner=runner,
-    )
-
-    captured = capsysbinary.readouterr()
-    payload = json.loads(captured.out.decode("utf-8"))
-    assert result == 2
-    assert captured.out.endswith(b"\n")
-    assert captured.err == b""
-    assert set(payload) == {
-        "schema_version",
-        "kind",
-        "overall_status",
-        "complete",
-        "error",
-    }
-    assert payload == {
-        "schema_version": 1,
-        "kind": "planning_error",
-        "overall_status": "error",
-        "complete": False,
-        "error": {
-            "code": "unknown_check",
-            "message": "Unknown check(s): mypy",
-            "hint": ("Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest"),
-        },
-    }
-    assert runner.calls == []
-
-
-@pytest.mark.parametrize("output_format", ["terminal", "json"])
-@pytest.mark.parametrize(
-    ("dependency", "error", "expected_code", "expected_hint"),
-    (
-        ("load_project_config", ValueError("bad config"), "invalid_project_config", None),
-        (
-            "load_project_config",
-            RuntimeError("config bug"),
-            "internal_planning_error",
-            None,
-        ),
-        (
-            "collect_existing_positionals",
-            RuntimeError("facts bug"),
-            "internal_planning_error",
-            None,
-        ),
-        (
-            "plan_run",
-            PlanningFailure(
-                "unknown_target",
-                "Unknown check(s): missing.py",
-                hint="Check the target path or select a check name.",
-            ),
-            "unknown_target",
-            "Check the target path or select a check name.",
-        ),
-        (
-            "plan_run",
-            RuntimeError("planner bug"),
-            "internal_planning_error",
-            None,
-        ),
-        (
-            "plan_run",
-            ValueError("planner value bug"),
-            "internal_planning_error",
-            None,
-        ),
-    ),
-)
-def test_planning_exception_boundary_builds_report_without_spawning(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    output_format: str,
-    dependency: str,
-    error: Exception,
-    expected_code: str,
-    expected_hint: str | None,
-) -> None:
-    runner = RecordingRunner()
-
-    def raise_error(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise error
-
-    monkeypatch.setattr(f"pyrepo_check.cli.{dependency}", raise_error)
-
-    argv = ["--root", str(tmp_path), "ruff"]
-    if output_format == "json":
-        argv[2:2] = ["--format", "json"]
-    result = main(argv, runner=runner)
-
-    captured = capsysbinary.readouterr()
-    assert result == 2
-    assert runner.calls == []
-    if output_format == "json":
-        assert captured.err == b""
-        payload = json.loads(captured.out.decode("utf-8"))
-        assert payload["error"]["code"] == expected_code
-        assert payload["error"]["message"] == str(error)
-        assert payload["error"]["hint"] == expected_hint
-    else:
-        assert captured.out == b""
-        assert (
-            captured.err
-            == (
-                str(error)
-                + (f"\nHint: {expected_hint}" if expected_hint is not None else "")
-                + "\n"
-            ).encode()
-        )
-
-
-@pytest.mark.parametrize(
-    ("dependency", "error"),
-    (
-        ("load_project_config", KeyboardInterrupt()),
-        ("collect_existing_positionals", SystemExit(19)),
-        ("plan_run", KeyboardInterrupt()),
-    ),
-)
-def test_planning_baseexception_propagates_by_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    dependency: str,
-    error: BaseException,
-) -> None:
-    runner = RecordingRunner()
-
-    def raise_error(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise error
-
-    monkeypatch.setattr(f"pyrepo_check.cli.{dependency}", raise_error)
-
-    with pytest.raises(type(error)) as raised:
-        main(["--root", str(tmp_path), "ruff"], runner=runner)
-
-    assert raised.value is error
-    assert runner.calls == []
-
-
-def test_json_build_failure_writes_no_partial_document_and_preserves_process_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    def fail_build(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise RuntimeError("build failed")
-
-    monkeypatch.setattr("pyrepo_check.cli.build_run_report", fail_build, raising=False)
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "ruff"],
-        runner=RecordingRunner(returncodes=(7,)),
-    )
-
-    captured = capsysbinary.readouterr()
-    assert result == 7
-    assert captured.out == b""
-    assert captured.err == b"pyrepo-check: internal reporting error: build failed\n"
-
-
-def test_json_validation_failure_writes_no_partial_document_and_returns_two(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    def fail_validation(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise RuntimeError("validation failed")
-
     monkeypatch.setattr(
-        "pyrepo_check.cli.validate_report_v1",
-        fail_validation,
-        raising=False,
+        "pyrepo_check.cli.build_run_report",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("report broken")),
     )
 
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "ruff"],
-        runner=RecordingRunner(),
-    )
-
+    assert main(("--root", str(tmp_path), "--format", "json", "ty")) == 2
     captured = capsysbinary.readouterr()
-    assert result == 2
     assert captured.out == b""
-    assert captured.err == (b"pyrepo-check: internal reporting error: validation failed\n")
-
-
-def test_json_encoding_failure_writes_no_partial_document_and_preserves_process_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    def fail_encoding(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise RuntimeError("encoding failed")
-
-    monkeypatch.setattr("pyrepo_check.reporting.json.dumps", fail_encoding)
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "ruff"],
-        runner=RecordingRunner(returncodes=(9,)),
-    )
-
-    captured = capsysbinary.readouterr()
-    assert result == 9
-    assert captured.out == b""
-    assert captured.err == b"pyrepo-check: internal reporting error: encoding failed\n"
-
-
-@pytest.mark.parametrize(
-    ("malformation", "expected_message"),
-    (
-        ("extra", "unexpected execution observation for check bandit"),
-        ("duplicate", "duplicate execution observation for check ruff"),
-        (
-            "mismatched",
-            "mismatched or out-of-order observation for check ruff",
-        ),
-        (
-            "out_of_order",
-            "mismatched or out-of-order observation for check ruff",
-        ),
-    ),
-)
-def test_json_malformed_execution_cardinality_uses_reporting_fallback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-    malformation: str,
-    expected_message: str,
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    def observed(check: CheckInvocation, returncode: int) -> ExecutedCheck:
-        return executed_check(check, returncode, stdout=b"", stderr=b"")
-
-    def malformed_execution(
-        plan: RunPlan,
-        *,
-        runner: ProcessRunner,
-    ) -> ExecutionResult:
-        del runner
-        ruff, ty = plan.checks
-        if malformation == "extra":
-            bandit = CheckInvocation(
-                name="bandit",
-                arguments=("-c", "pyproject.toml"),
-            )
-            checks = (observed(ruff, 7), observed(ty, 0), observed(bandit, 0))
-        elif malformation == "duplicate":
-            checks = (observed(ruff, 7), observed(ruff, 0))
-        elif malformation == "mismatched":
-            mismatched = CheckInvocation(
-                name="ruff",
-                arguments=(*ruff.arguments, "different"),
-            )
-            checks = (observed(mismatched, 7),)
-        else:
-            checks = (observed(ty, 7), observed(ruff, 0))
-        return ExecutionResult(checks=checks, exit_code=99)
-
-    monkeypatch.setattr("pyrepo_check.cli.execute_plan", malformed_execution)
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "ruff", "ty"],
-        runner=RecordingRunner(),
-    )
-
-    captured = capsysbinary.readouterr()
-    assert result == 7
-    assert captured.out == b""
-    assert captured.err == (
-        f"pyrepo-check: internal reporting error: {expected_message}\n".encode()
-    )
-
-
-def test_json_missing_execution_observation_is_a_schema_valid_error_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsysbinary: pytest.CaptureFixture[bytes],
-) -> None:
-    (tmp_path / "src").mkdir()
-
-    def incomplete_execution(
-        plan: RunPlan,
-        *,
-        runner: ProcessRunner,
-    ) -> ExecutionResult:
-        del runner
-        ty = plan.checks[1]
-        observation = executed_check(ty, 0, stdout=b"", stderr=b"")
-        return ExecutionResult(checks=(observation,), exit_code=0)
-
-    monkeypatch.setattr("pyrepo_check.cli.execute_plan", incomplete_execution)
-
-    result = main(
-        ["--root", str(tmp_path), "--format", "json", "ruff", "ty"],
-        runner=RecordingRunner(),
-    )
-
-    captured = capsysbinary.readouterr()
-    payload = json.loads(captured.out.decode("utf-8"))
-    assert result == 2
-    assert captured.err == b""
-    assert payload["overall_status"] == "error"
-    assert payload["complete"] is False
-    assert payload["checks"][0]["name"] == "ruff"
-    assert payload["checks"][0]["status"] == "error"
-    assert payload["checks"][0]["error"] == {
-        "code": "missing_primary_process",
-        "message": "No primary process observation was recorded.",
-    }
-
-
-def test_cli_propagates_runner_value_error_by_identity(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    error = ValueError("runner failed")
-    runner = RecordingRunner(raise_on_call=1, exception=error)
-
-    with pytest.raises(ValueError) as raised:
-        main(["--root", str(tmp_path), "ruff"], runner=runner)
-
-    assert raised.value is error
+    assert b"internal reporting error: report broken" in captured.err

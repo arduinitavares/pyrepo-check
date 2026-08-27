@@ -430,7 +430,15 @@ def test_execute_repository_plan_keeps_dependency_errors_local_and_continues(
     assert result.checks[0].processes == ()
     assert result.checks[0].error == missing_dependency("ruff").error
     assert all(check.start is not None for check in result.checks[1:])
+    assert result.checks[2].invocation.name == "bandit"
+    assert result.checks[2].processes[0].returncode == 1
+    assert result.checks[2].error is None
     primary_calls = [call for call in runner.calls if "--evidence" in call.command]
+    assert safe.preparation.prepared is not None
+    assert all(
+        call.command[5] == str(safe.preparation.prepared.python.executable)
+        for call in primary_calls
+    )
     assert tuple(call.command[call.command.index("--module") + 1] for call in primary_calls) == (
         "ty",
         "bandit",

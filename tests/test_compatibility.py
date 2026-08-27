@@ -11,12 +11,22 @@ import uuid
 
 import pytest
 
-from pyrepo_check.cli import main, parse_args
+from pyrepo_check.cli import parse_args
 from pyrepo_check import repository_executor
-from tests.support import RecordedCall, RecordingRunner, focused_plan
+from pyrepo_check.execution import execute_legacy_commands
+from tests.support import RecordingRunner, focused_plan, monotonic_clock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _launcher_module_and_arguments(process: dict[str, Any]) -> tuple[str, list[str]]:
+    argv = process["argv"]
+    assert argv[:4] == ["uv", "run", "--locked", "--python"]
+    assert argv[5] == argv[4]
+    module_index = argv.index("--module")
+    separator_index = argv.index("--", module_index)
+    return argv[module_index + 1], argv[separator_index + 1 :]
 
 
 def _write_external_consumer(root: Path) -> None:
@@ -44,14 +54,12 @@ testpaths = ["tests"]
 import consumer_marker
 import importlib.util
 import os
-import support_marker
 import sys
 
 
 def test_consumer_execution_is_owned_by_the_consumer() -> None:
     assert Path.cwd() == Path(__file__).parents[1]
     assert consumer_marker.VALUE == "consumer"
-    assert support_marker.VALUE == "inherited-pythonpath"
     assert str(Path.cwd()) in sys.path
     assert importlib.util.find_spec("pyrepo_check") is None
     assert "COVERAGE_PROCESS_START" not in os.environ
@@ -437,10 +445,7 @@ def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
     assert completed.returncode == 0
     assert completed.stderr == b""
     assert payload["pytest"]["evidence"] is not None
-    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
-        "pytest_preflight",
-        "primary",
-    ]
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == ["primary"]
     assert after_status == before_status
     assert not list(consumer.rglob(".coverage*"))
     assert not list(consumer.rglob("pyrepo_check_pytest_*.py"))
@@ -499,12 +504,7 @@ def test_external_configured_coverage_all_is_complete_and_keeps_consumer_clean(
         not file["statements"]["missing_lines"] and not file["branches"]["missing_arcs"]
         for file in payload["coverage"]["files"]
     )
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-        "coverage_json",
-    ]
+    assert [process["role"] for process in processes] == ["primary", "coverage_json"]
     assert len(primary_processes) == 1
     assert [
         process["role"]
@@ -512,17 +512,10 @@ def test_external_configured_coverage_all_is_complete_and_keeps_consumer_clean(
         if any(pair == ("-m", "pytest") for pair in zip(process["argv"], process["argv"][1:]))
     ] == ["primary"]
     assert primary_processes[0]["cwd"] == str(consumer)
-    assert primary_processes[0]["argv"][:7] == [
-        "uv",
-        "run",
-        "--locked",
-        "python",
-        "-m",
-        "coverage",
-        "run",
-    ]
-    assert primary_processes[0]["argv"].count("-m") == 2
-    assert primary_processes[0]["argv"][-4:-1] == ["-m", "pytest", "-p"]
+    module, arguments = _launcher_module_and_arguments(primary_processes[0])
+    assert module == "coverage"
+    assert arguments[0] == "run"
+    assert arguments[-4:-1] == ["-m", "pytest", "-p"]
     assert all(process["outcome"] == "exited" for process in processes)
     assert all(process["exit_code"] == 0 for process in processes)
     _assert_coverage_consumer_unchanged(consumer, before)
@@ -665,8 +658,6 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
             }
         ), name
         assert [process["role"] for process in processes] == [
-            "pytest_preflight",
-            "coverage_preflight",
             "primary",
             "coverage_json",
         ], name
@@ -678,20 +669,14 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
         ] == ["primary"], name
         primary = primary_processes[0]
         assert primary["cwd"] == str(consumer), name
-        assert primary["argv"][:7] == [
-            "uv",
-            "run",
-            "--locked",
-            "python",
-            "-m",
-            "coverage",
-            "run",
-        ], name
-        assert primary["argv"][7] == f"--rcfile={consumer / 'pyproject.toml'}", name
-        assert primary["argv"][8].startswith("--data-file="), name
-        assert primary["argv"][9:13] == ["-m", "pytest", "-p", primary["argv"][12]], name
-        assert primary["argv"][12].startswith("_pyrepo_check_pytest_"), name
-        assert primary["argv"][13:] == pytest_args, name
+        module, arguments = _launcher_module_and_arguments(primary)
+        assert module == "coverage", name
+        assert arguments[0] == "run", name
+        assert arguments[1] == f"--rcfile={consumer / 'pyproject.toml'}", name
+        assert arguments[2].startswith("--data-file="), name
+        assert arguments[3:7] == ["-m", "pytest", "-p", arguments[6]], name
+        assert arguments[6].startswith("_pyrepo_check_pytest_"), name
+        assert arguments[7:] == pytest_args, name
         assert all(process["outcome"] == "exited" for process in processes), name
         assert all(process["exit_code"] == 0 for process in processes), name
         assert _consumer_bytes(consumer) == before.files, name
@@ -723,7 +708,6 @@ from pathlib import Path
 import sys
 
 from coverage_consumer import classify
-import support_marker
 
 
 def test_coverage_execution_environment_is_isolated() -> None:
@@ -742,7 +726,6 @@ def test_coverage_execution_environment_is_isolated() -> None:
         encoding="utf-8",
     )
     assert Path.cwd() == Path(__file__).parents[1]
-    assert support_marker.VALUE == "hostile-pythonpath-preserved"
     assert importlib.util.find_spec("pyrepo_check") is None
     assert classify(1) == "positive"
 ''',
@@ -774,16 +757,11 @@ def test_coverage_execution_environment_is_isolated() -> None:
     assert completed.stderr == b""
     assert payload["pytest"]["status"] == "passed"
     assert payload["coverage"]["status"] == "guidance"
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-        "coverage_json",
-    ]
+    assert [process["role"] for process in processes] == ["primary", "coverage_json"]
     assert witness["cwd"] == str(consumer)
     assert witness["sys_path_0"] == str(consumer / "tests")
     assert witness["pyrepo_check_available"] is False
-    assert witness["pythonpath"].split(os.pathsep)[0] == str(support)
+    assert str(support) not in witness["pythonpath"].split(os.pathsep)
     assert Path.cwd() == before_cwd
     assert os.environ.get("PYTHONPATH") == before_pythonpath
     assert sys.path[0] == before_sys_path_0
@@ -820,14 +798,15 @@ def test_external_all_without_coverage_config_uses_plain_pytest_once(
             "hint": None,
         }
     ]
-    assert [process["role"] for process in processes] == ["pytest_preflight", "primary"]
+    assert [process["role"] for process in processes] == ["primary"]
     assert len([process for process in processes if process["role"] == "primary"]) == 1
-    assert processes[1]["argv"][:6] == ["uv", "run", "--locked", "python", "-m", "pytest"]
+    module, _arguments = _launcher_module_and_arguments(processes[0])
+    assert module == "pytest"
     assert all("coverage" not in process["argv"] for process in processes)
     _assert_coverage_consumer_unchanged(consumer, before)
 
 
-def test_external_missing_coverage_dependency_stops_without_plain_pytest_fallback(
+def test_external_missing_coverage_dependency_runs_plain_pytest_and_retains_error(
     tmp_path: Path,
 ) -> None:
     consumer = tmp_path / "consumer"
@@ -843,17 +822,14 @@ def test_external_missing_coverage_dependency_stops_without_plain_pytest_fallbac
     assert completed.stderr == b""
     assert payload["overall_status"] == "error"
     assert payload["complete"] is False
-    assert payload["pytest"]["status"] == "error"
-    assert payload["pytest"]["error"]["code"] == "not_started"
+    assert payload["pytest"]["status"] == "passed"
+    assert payload["pytest"]["error"] is None
     assert payload["coverage"]["status"] == "error"
     assert payload["coverage"]["error"]["code"] == "module_unavailable"
-    assert pytest_check["error"]["code"] == "coverage_preflight_failed"
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-    ]
-    assert not [process for process in processes if process["role"] == "primary"]
-    assert ["-m", "pytest"] not in [process["argv"] for process in processes]
+    assert pytest_check["error"] is None
+    assert [process["role"] for process in processes] == ["primary"]
+    module_index = processes[0]["argv"].index("--module")
+    assert processes[0]["argv"][module_index : module_index + 2] == ["--module", "pytest"]
     _assert_coverage_consumer_unchanged(consumer, before)
 
 
@@ -936,7 +912,7 @@ def test_positive_value() -> None:
     assert classify(1) == "positive"
 ''',
                 None,
-                2,
+                1,
                 "failed",
                 True,
                 "complete",
@@ -993,7 +969,7 @@ def test_stops_early() -> None:
     pytest.exit("intentional early stop", returncode=1)
 ''',
                 None,
-                1,
+                2,
                 "error",
                 False,
                 "partial",
@@ -1030,15 +1006,15 @@ def pytest_runtestloop(session: object) -> None:
     assert classify(1) == "positive"
     raise RuntimeError("intentional consumer internal error")
 ''',
-                3,
+                2,
                 "error",
                 False,
                 "partial",
                 "error",
                 False,
                 "internal_error",
-                "guidance",
-                "pytest_incomplete",
+                "error",
+                "evidence_error",
                 3,
                 0,
             ),
@@ -1058,7 +1034,7 @@ def pytest_sessionstart(session: object) -> None:
     del session
     assert classify(1) == "positive"
 ''',
-                5,
+                1,
                 "failed",
                 True,
                 "partial",
@@ -1111,8 +1087,13 @@ def test_external_coverage_statuses_remain_independent(
     ) == case.expected_pytest_error
     assert payload["coverage"]["status"] == case.expected_coverage_status
     assert payload["coverage"]["scope"] == case.expected_scope
-    assert payload["coverage"]["evidence_complete"] is True
-    assert payload["coverage"]["error"] is None
+    coverage_error = case.expected_coverage_status == "error"
+    assert payload["coverage"]["evidence_complete"] is not coverage_error
+    assert (
+        None
+        if payload["coverage"]["error"] is None
+        else payload["coverage"]["error"]["code"]
+    ) == ("data_missing" if coverage_error else None)
     assert payload["coverage"]["threshold"] == {
         "configured": True,
         "value": 100,
@@ -1129,17 +1110,15 @@ def test_external_coverage_statuses_remain_independent(
             file["statements"]["missing_lines"] or file["branches"]["missing_arcs"]
             for file in payload["coverage"]["files"]
         )
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-        "coverage_json",
-    ]
+    assert [process["role"] for process in processes] == (
+        ["primary"] if coverage_error else ["primary", "coverage_json"]
+    )
     assert len(primary_processes) == 1
     assert pytest_roles == ["primary"]
     assert primary_processes[0]["cwd"] == str(consumer)
     assert primary_processes[0]["exit_code"] == case.expected_primary_exit
-    assert processes[-1]["exit_code"] == case.expected_coverage_json_exit
+    if not coverage_error:
+        assert processes[-1]["exit_code"] == case.expected_coverage_json_exit
     _assert_coverage_consumer_unchanged(consumer, before)
 
 
@@ -1187,7 +1166,7 @@ def test_creates_a_coverage_shard() -> None:
     assert pytest_check["status"] == "passed"
     assert pytest_check["error"] is None
     assert payload["coverage"]["status"] == "error"
-    assert payload["coverage"]["error"]["code"] == "unexpected_parallel_data"
+    assert payload["coverage"]["error"]["code"] == "data_missing"
     assert payload["coverage"]["scope"] == "partial"
     assert payload["coverage"]["evidence_complete"] is False
     assert payload["coverage"]["gate_eligible"] is False
@@ -1198,23 +1177,13 @@ def test_creates_a_coverage_shard() -> None:
         "passed": None,
         "skipped_reason": "evidence_error",
     }
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-    ]
+    assert [process["role"] for process in processes] == ["primary"]
     assert len(primary_processes) == 1
     assert pytest_roles == ["primary"]
     assert primary_processes[0]["cwd"] == str(consumer)
-    assert primary_processes[0]["argv"][:7] == [
-        "uv",
-        "run",
-        "--locked",
-        "python",
-        "-m",
-        "coverage",
-        "run",
-    ]
+    module, arguments = _launcher_module_and_arguments(primary_processes[0])
+    assert module == "coverage"
+    assert arguments[0] == "run"
     assert not [process for process in processes if process["role"] == "coverage_json"]
     _assert_coverage_consumer_unchanged(consumer, before)
 
@@ -1232,7 +1201,7 @@ def test_external_xdist_coverage_reports_parallelism_without_a_plain_fallback(
     processes = pytest_check["processes"]
     primary_processes = [process for process in processes if process["role"] == "primary"]
 
-    assert completed.returncode == 4
+    assert completed.returncode == 2
     assert completed.stderr == b""
     assert payload["overall_status"] == "error"
     assert payload["complete"] is False
@@ -1240,23 +1209,13 @@ def test_external_xdist_coverage_reports_parallelism_without_a_plain_fallback(
     assert payload["pytest"]["complete"] is False
     assert payload["pytest"]["error"]["code"] == "unsupported_parallelism"
     assert payload["coverage"]["status"] == "error"
-    assert payload["coverage"]["error"]["code"] == "unsupported_parallelism"
-    assert pytest_check["error"]["code"] == "pytest_evidence_error"
-    assert [process["role"] for process in processes] == [
-        "pytest_preflight",
-        "coverage_preflight",
-        "primary",
-    ]
+    assert payload["coverage"]["error"]["code"] == "data_missing"
+    assert pytest_check["error"]["code"] == "check_execution_failed"
+    assert [process["role"] for process in processes] == ["primary"]
     assert len(primary_processes) == 1
-    assert primary_processes[0]["argv"][:7] == [
-        "uv",
-        "run",
-        "--locked",
-        "python",
-        "-m",
-        "coverage",
-        "run",
-    ]
+    module, arguments = _launcher_module_and_arguments(primary_processes[0])
+    assert module == "coverage"
+    assert arguments[0] == "run"
     assert any(
         pair == ("-m", "pytest")
         for pair in zip(primary_processes[0]["argv"], primary_processes[0]["argv"][1:])
@@ -1342,49 +1301,20 @@ def test_external_pytest_nine_consumer_stops_after_unsupported_preflight(
     assert payload["pytest"]["evidence"] is None
     assert payload["pytest"]["error"] is not None
     assert payload["pytest"]["error"]["code"] == "unsupported_version"
-    assert [process["role"] for process in processes] == ["pytest_preflight"]
-    assert processes[0]["argv"][:3] == ["uv", "run", "--locked"]
-    preflight_record = json.loads(processes[0]["stdout"]["text"])
-    assert preflight_record["pytest_version"] == [9, 0, 0]
+    assert processes == []
+    pytest_dependency = payload["repository_environment"]["dependencies"][0]
+    assert pytest_dependency["status"] == "incompatible"
+    assert pytest_dependency["version"] == "9.0.0"
     assert not test_module_imported.exists()
     assert not (consumer / ".pytest_cache").exists()
     assert not list(consumer.rglob("artifact.json"))
     assert not list(consumer.rglob("pytest-writer-*.json"))
 
 
-def test_direct_pytest_node_id_is_forwarded_verbatim(tmp_path: Path) -> None:
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
-    test_file = tmp_path / "tests" / "test_example.py"
-    test_file.parent.mkdir()
-    test_file.write_text("", encoding="utf-8")
-    runner = RecordingRunner(publish_pytest_artifact=True)
+def test_direct_pytest_node_id_is_parsed_verbatim() -> None:
+    parsed = parse_args(("pytest", "tests/test_example.py::test_exact_behavior"))
 
-    result = main(
-        [
-            "--root",
-            str(tmp_path),
-            "pytest",
-            "tests/test_example.py::test_exact_behavior",
-        ],
-        runner=runner,
-    )
-
-    assert result == 0
-    plugin_name = runner.calls[1].command[runner.calls[1].command.index("-p") + 1]
-    assert [call.command for call in runner.calls] == [
-        ("uv", "run", "--locked", "python", "-c", runner.calls[0].command[-1]),
-        (
-            "uv",
-            "run",
-            "--locked",
-            "python",
-            "-m",
-            "pytest",
-            "-p",
-            plugin_name,
-            "tests/test_example.py::test_exact_behavior",
-        ),
-    ]
+    assert parsed.checks == ["pytest", "tests/test_example.py::test_exact_behavior"]
 
 
 def test_recording_runner_opt_in_publishes_raw_pytest_protocol(tmp_path: Path) -> None:
@@ -1527,83 +1457,70 @@ def test_legacy_exit_code_classifies_spawn_and_negative_outcomes(
     raise_on_call: int | None,
     expected: int,
 ) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     runner = RecordingRunner(returncodes=returncodes, raise_on_call=raise_on_call)
+    commands = tuple(("tool", str(index)) for index in range(len(returncodes)))
 
-    result = main(["--root", str(tmp_path), "--all"], runner=runner)
+    result = execute_legacy_commands(
+        commands,
+        cwd=tmp_path,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
 
     assert result == expected
-    assert len(runner.calls) == 6
+    assert len(runner.calls) == len(commands)
 
 
-def test_spawn_exception_is_recorded_and_later_checks_continue(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+def test_raw_compatibility_helper_records_spawn_and_continues(tmp_path: Path) -> None:
     error = FileNotFoundError("uv")
-    stdout_at_spawn: list[str] = []
-
-    def record_spawn(call: RecordedCall) -> None:
-        stdout_at_spawn.append(capsys.readouterr().out)
-
     runner = RecordingRunner(
         raise_on_call=2,
         exception=error,
-        on_call=record_spawn,
-        publish_pytest_artifact=True,
     )
+    commands = (("tool", "one"), ("tool", "two"), ("tool", "three"))
 
-    result = main(["--root", str(tmp_path), "--all"], runner=runner)
+    result = execute_legacy_commands(
+        commands,
+        cwd=tmp_path,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
 
     assert result == 2
-    assert len(runner.calls) == 6
-    assert stdout_at_spawn == [
-        "\n==> ruff: uv run --locked python -m ruff check .\n",
-        (
-            "\n==> annotations: uv run --locked python -m ruff check . "
-            "--select ANN --output-format concise\n"
-        ),
-        "\n==> ty: uv run --locked python -m ty check\n",
-        "\n==> bandit: uv run --locked python -m bandit -c pyproject.toml -r .\n",
-        "\n==> pytest: uv run --locked python -m pytest\n",
-        "",
-    ]
-    assert capsys.readouterr().out == (
-        "\n==> pyrepo-check summary: error (strict aggregate, incomplete)\n"
-        "    error: annotations: Could not start process: FileNotFoundError: uv\n"
-        "    advisory: Coverage guidance is unavailable because native Coverage.py configuration is absent.\n"
-        "    passed: ruff, ty, bandit, pytest\n"
-    )
+    assert len(runner.calls) == len(commands)
 
 
 def test_runner_value_error_is_not_a_planning_error(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     error = ValueError("runner failed")
     runner = RecordingRunner(raise_on_call=1, exception=error)
 
     with pytest.raises(ValueError) as captured:
-        main(["--root", str(tmp_path), "ruff"], runner=runner)
+        execute_legacy_commands(
+            (("tool",),),
+            cwd=tmp_path,
+            runner=runner,
+            clock_ns=monotonic_clock(),
+        )
 
     assert captured.value is error
 
 
-def test_banner_is_printed_before_each_spawn(
+def test_raw_compatibility_helper_does_not_emit_controller_banner(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
     stdout_at_spawn: list[str] = []
     runner = RecordingRunner(on_call=lambda _call: stdout_at_spawn.append(capsys.readouterr().out))
 
-    result = main(["--root", str(tmp_path), "ruff"], runner=runner)
+    result = execute_legacy_commands(
+        (("tool",),),
+        cwd=tmp_path,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
 
     assert result == 0
-    assert stdout_at_spawn == ["\n==> ruff: uv run --locked python -m ruff check src\n"]
+    assert stdout_at_spawn == [""]
 
 
 def test_help_surface_is_unchanged(
