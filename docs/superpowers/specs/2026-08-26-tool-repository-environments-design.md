@@ -1,6 +1,6 @@
 # Separate Tool and Repository Environments
 
-**Status:** Approved in design dialogue; awaiting written-spec review
+**Status:** Approved
 **Date:** 2026-08-26
 **Issue:** [#1 — Global pyrepo-check cannot run the full gate for projects on older Python versions](https://github.com/arduinitavares/pyrepo-check/issues/1)
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
