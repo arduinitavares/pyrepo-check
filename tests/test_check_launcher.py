@@ -421,6 +421,55 @@ def test_marker_rejects_unknown_or_contradictory_fields(
             )
 
 
+@pytest.mark.parametrize(
+    ("remove", "diagnostic"),
+    (
+        (lambda payload: payload.pop("module"), "missing fields"),
+        (lambda payload: payload["python"].pop("executable"), "Python fields"),
+    ),
+)
+def test_marker_rejects_missing_outer_and_nested_fields(
+    tmp_path: Path,
+    remove: Callable[[dict[str, Any]], object],
+    diagnostic: str,
+) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ty", ("check",))
+    payload = _marker_payload(prepared, invocation, "ty")
+    removed = remove(payload)
+    assert removed is not None
+    with test_workspace(tmp_path) as workspace:
+        marker = workspace.workspace.path / "marker.json"
+        _write_marker(marker, payload)
+
+        with pytest.raises(OSError, match=diagnostic):
+            _launcher().validate_start_marker(
+                marker,
+                workspace=workspace,
+                invocation=invocation,
+                module="ty",
+                prepared=prepared,
+            )
+
+
+def test_marker_rejects_nesting_depth_nine(tmp_path: Path) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ruff", ("check", "."))
+    with test_workspace(tmp_path) as workspace:
+        marker = workspace.workspace.path / "nested.json"
+        marker.write_bytes(b"[" * 9 + b"0" + b"]" * 9)
+        marker.chmod(0o600)
+
+        with pytest.raises(OSError, match="nesting exceeds the 8-level limit"):
+            _launcher().validate_start_marker(
+                marker,
+                workspace=workspace,
+                invocation=invocation,
+                module="ruff",
+                prepared=prepared,
+            )
+
+
 def test_marker_rejects_duplicate_keys_and_4097_bytes(tmp_path: Path) -> None:
     prepared = prepared_repository(tmp_path, (3, 12, 11))
     invocation = CheckInvocation("ruff", ("check", "."))
@@ -481,6 +530,49 @@ def test_marker_rejects_symlink_and_broad_permissions(tmp_path: Path) -> None:
             )
 
 
+def test_marker_rejects_wrong_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ruff", ("check", "."))
+    with test_workspace(tmp_path) as workspace:
+        marker = workspace.workspace.path / "wrong-owner.json"
+        _write_marker(marker, _marker_payload(prepared, invocation, "ruff"))
+        actual_owner = marker.stat(follow_symlinks=False).st_uid
+        launcher = _launcher()
+        marker_os = ModuleType("marker_os")
+        marker_os.__dict__.update(os.__dict__)
+        setattr(marker_os, "geteuid", lambda: actual_owner + 1)
+        monkeypatch.setattr(launcher, "os", marker_os)
+
+        with pytest.raises(OSError, match="owner"):
+            launcher.validate_start_marker(
+                marker,
+                workspace=workspace,
+                invocation=invocation,
+                module="ruff",
+                prepared=prepared,
+            )
+
+
+def test_marker_rejects_hard_link_count_two(tmp_path: Path) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ruff", ("check", "."))
+    with test_workspace(tmp_path) as workspace:
+        marker = workspace.workspace.path / "linked.json"
+        other_link = workspace.workspace.path / "other-link.json"
+        _write_marker(marker, _marker_payload(prepared, invocation, "ruff"))
+        os.link(marker, other_link)
+        assert marker.stat(follow_symlinks=False).st_nlink == 2
+
+        with pytest.raises(OSError, match="link count"):
+            _launcher().validate_start_marker(
+                marker,
+                workspace=workspace,
+                invocation=invocation,
+                module="ruff",
+                prepared=prepared,
+            )
+
+
 def test_marker_open_closes_descriptor_when_inheritability_setup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -519,6 +611,77 @@ def test_marker_open_closes_descriptor_when_inheritability_setup_fails(
             assert len(closed) == 1
 
 
+def test_marker_in_place_mode_mutation_during_read_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ruff", ("check", "."))
+    with test_workspace(tmp_path) as workspace:
+        marker = workspace.workspace.path / "marker.json"
+        _write_marker(marker, _marker_payload(prepared, invocation, "ruff"))
+        launcher = _launcher()
+        original_read = launcher.os.read
+        mutated = False
+
+        def mutate_mode_after_read(descriptor: int, size: int) -> bytes:
+            nonlocal mutated
+            chunk = original_read(descriptor, size)
+            if chunk and not mutated:
+                mutated = True
+                os.fchmod(descriptor, 0o640)
+            return chunk
+
+        monkeypatch.setattr(launcher.os, "read", mutate_mode_after_read)
+        with pytest.raises(OSError, match="changed|metadata"):
+            launcher.validate_start_marker(
+                marker,
+                workspace=workspace,
+                invocation=invocation,
+                module="ruff",
+                prepared=prepared,
+            )
+        assert mutated
+
+
+def test_marker_in_place_size_mutation_during_read_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ruff", ("check", "."))
+    with test_workspace(tmp_path) as workspace:
+        marker = workspace.workspace.path / "marker.json"
+        _write_marker(marker, _marker_payload(prepared, invocation, "ruff"))
+        launcher = _launcher()
+        original_read = launcher.os.read
+        mutated = False
+
+        def mutate_size_after_read(descriptor: int, size: int) -> bytes:
+            nonlocal mutated
+            chunk = original_read(descriptor, size)
+            if chunk and not mutated:
+                mutated = True
+                writer = os.open(marker, os.O_WRONLY | os.O_APPEND)
+                try:
+                    os.write(writer, b" ")
+                    os.fsync(writer)
+                finally:
+                    os.close(writer)
+            return chunk
+
+        monkeypatch.setattr(launcher.os, "read", mutate_size_after_read)
+        with pytest.raises(OSError, match="changed|metadata"):
+            launcher.validate_start_marker(
+                marker,
+                workspace=workspace,
+                invocation=invocation,
+                module="ruff",
+                prepared=prepared,
+            )
+        assert mutated
+
+
 def test_marker_path_replacement_during_read_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -552,11 +715,13 @@ def test_marker_path_replacement_during_read_fails_closed(
             )
 
 
-def test_outer_uv_exit_one_without_marker_is_not_a_ruff_finding(
+@pytest.mark.parametrize("returncode", (0, 1, 2, 120, -9))
+def test_outer_uv_exit_without_marker_is_invalid_start_evidence(
     tmp_path: Path,
+    returncode: int,
 ) -> None:
     prepared = prepared_repository(tmp_path, (3, 12, 11))
-    runner = RecordingRunner(returncodes=(1,))
+    runner = RecordingRunner(returncodes=(returncode,))
 
     with test_workspace(tmp_path) as workspace:
         launcher = _launcher().stage_check_launcher(workspace)
@@ -568,8 +733,14 @@ def test_outer_uv_exit_one_without_marker_is_not_a_ruff_finding(
             runner=runner,
             clock_ns=monotonic_clock(),
         )
+        marker = Path(runner.calls[0].command[runner.calls[0].command.index("--evidence") + 1])
+        assert not marker.exists()
 
     assert observation.start is None
+    assert observation.execution_environment is None
+    assert observation.analysis_python_authority is None
+    assert len(observation.processes) == 1
+    assert observation.processes[0].returncode == returncode
     assert observation.error is not None
     assert observation.error.code == "check_start_evidence_invalid"
 
@@ -685,7 +856,7 @@ def test_preexisting_marker_stops_before_spawn(
 
 
 @pytest.mark.parametrize("publish_valid_marker", (False, True))
-def test_spawn_failure_retains_only_valid_start_evidence(
+def test_spawn_failure_discards_start_authority_but_retains_process(
     tmp_path: Path,
     publish_valid_marker: bool,
 ) -> None:
@@ -705,13 +876,16 @@ def test_spawn_failure_retains_only_valid_start_evidence(
             runner=runner,
             clock_ns=monotonic_clock(),
         )
+        marker = Path(runner.calls[0].command[runner.calls[0].command.index("--evidence") + 1])
+        assert not marker.exists()
 
     assert observation.error is not None
     assert observation.error.code == "spawn_failed"
-    assert (observation.start is not None) is publish_valid_marker
-    assert observation.execution_environment == (
-        "repository" if publish_valid_marker else None
-    )
+    assert observation.start is None
+    assert observation.execution_environment is None
+    assert observation.analysis_python_authority is None
+    assert len(observation.processes) == 1
+    assert observation.processes[0].spawn_error == "FileNotFoundError: uv"
 
 
 def test_malformed_launcher_syntax_exits_120_without_marker(tmp_path: Path) -> None:

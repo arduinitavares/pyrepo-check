@@ -437,6 +437,71 @@ def test_execute_repository_plan_keeps_dependency_errors_local_and_continues(
     )
 
 
+def test_missing_pytest_blocks_only_pytest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty", "pytest")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(
+            available_dependency("ty", "0.0.35"),
+            missing_dependency("pytest"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    ty_check, pytest_check = result.checks
+    assert ty_check.invocation.name == "ty"
+    assert ty_check.start is not None
+    assert pytest_check.invocation.name == "pytest"
+    assert pytest_check.error == missing_dependency("pytest").error
+    assert pytest_check.processes == ()
+    primary_calls = [call for call in runner.calls if "--evidence" in call.command]
+    assert len(primary_calls) == 1
+    assert primary_calls[0].command[primary_calls[0].command.index("--module") + 1] == "ty"
+
+
+def test_missing_coverage_is_retained_but_plain_pytest_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "pytest")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(
+            available_dependency("pytest", "8.4.2"),
+            missing_dependency("coverage"),
+        ),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    runner = launcher_aware_runner(returncode=0, publish_valid_marker=True)
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert tuple(
+        (dependency.name, dependency.status)
+        for dependency in result.repository_environment.dependencies
+    ) == (("pytest", "available"), ("coverage", "missing"))
+    check = result.checks[0]
+    assert check.invocation.name == "pytest"
+    assert check.start is not None
+    assert check.error is None
+    primary_calls = [call for call in runner.calls if "--evidence" in call.command]
+    assert len(primary_calls) == 1
+    command = primary_calls[0].command
+    assert command[command.index("--module") + 1] == "pytest"
+    assert "coverage" not in command
+
+
 def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -463,6 +528,91 @@ def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
     assert check.error is not None
     assert check.error.code == "cleanup_failed"
     assert check.processes == ()
+
+
+@pytest.mark.parametrize("failure_point", ("verified-open", "staging"))
+def test_verified_open_or_staging_failure_attaches_to_owning_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    if failure_point == "verified-open":
+        monkeypatch.setattr(
+            execution_workspace,
+            "open_verified_workspace",
+            lambda workspace: (_ for _ in ()).throw(OSError("verified open blocked")),
+        )
+    else:
+        monkeypatch.setattr(
+            repository_executor,
+            "stage_check_launcher",
+            lambda workspace: (_ for _ in ()).throw(OSError("staging blocked")),
+        )
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=RecordingRunner(),
+        clock_ns=monotonic_clock(),
+    )
+
+    check = result.checks[0]
+    assert check.invocation.name == "ty"
+    assert check.error is not None
+    assert check.error.code == "cleanup_failed"
+    assert failure_point.replace("-", " ") in check.error.message
+    assert check.processes == ()
+
+
+def test_cleanup_failure_after_missing_marker_retains_failed_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _internal_plan(tmp_path.resolve(), "ty")
+    safe = _safe_preparation(
+        plan,
+        dependencies=(available_dependency("ty", "0.0.35"),),
+    )
+    monkeypatch.setattr(repository_executor, "prepare_safe_repository", lambda *args, **kwargs: safe)
+    created: list[execution_workspace.RunWorkspace] = []
+    original_create = execution_workspace.create_run_workspace
+    original_remove = execution_workspace.remove_run_workspace
+
+    def record_create(root: Path) -> execution_workspace.RunWorkspace:
+        workspace = original_create(root)
+        created.append(workspace)
+        return workspace
+
+    monkeypatch.setattr(execution_workspace, "create_run_workspace", record_create)
+    monkeypatch.setattr(
+        execution_workspace,
+        "remove_run_workspace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup blocked")),
+    )
+    try:
+        result = repository_executor.execute_repository_plan(
+            plan,
+            runner=RecordingRunner(returncodes=(2,)),
+            clock_ns=monotonic_clock(),
+        )
+    finally:
+        if created:
+            observation = original_remove(created[0], repository_root=plan.root)
+            assert observation is None
+
+    check = result.checks[0]
+    assert check.error is not None
+    assert check.error.code == "cleanup_failed"
+    assert check.start is None
+    assert check.execution_environment is None
+    assert check.analysis_python_authority is None
+    assert len(check.processes) == 1
+    assert check.processes[0].returncode == 2
 
 
 def test_cleanup_failure_retains_real_primary_start_and_authority(

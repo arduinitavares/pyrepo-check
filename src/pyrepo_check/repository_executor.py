@@ -187,21 +187,26 @@ def execute_invocation(
     except OSError as error:
         marker_error = error
 
-    if start is None:
-        if process.spawn_error is not None and marker_error is not None and "missing" in str(
-            marker_error
-        ).lower():
-            error = CheckExecutionFailure(
+    if process.spawn_error is not None:
+        return RepositoryCheckObservation(
+            invocation,
+            None,
+            None,
+            None,
+            (process,),
+            CheckExecutionFailure(
                 "spawn_failed",
                 f"Check process could not be spawned: {process.spawn_error}",
                 None,
-            )
-        else:
-            error = CheckExecutionFailure(
-                "check_start_evidence_invalid",
-                f"Check start evidence is invalid: {marker_error}",
-                "Retry after verifying the locked Repository Environment.",
-            )
+            ),
+        )
+
+    if start is None:
+        error = CheckExecutionFailure(
+            "check_start_evidence_invalid",
+            f"Check start evidence is invalid: {marker_error}",
+            "Retry after verifying the locked Repository Environment.",
+        )
         return RepositoryCheckObservation(
             invocation,
             None,
