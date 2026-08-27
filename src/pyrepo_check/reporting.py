@@ -58,6 +58,7 @@ from pyrepo_check.reporting_schema import (
     ProcessOutcome,
     ProcessResult,
     ProcessRole,
+    PythonEvidence,
     ReportKind as ReportKind,
     RepositoryEnvironmentEvidence,
     ReportingError,
@@ -365,6 +366,14 @@ def _validate_environment_state_v2(
         _invalid("repository path and Python must be observed together")
     if observed and not _successful_process(probe):
         _invalid("observed repository environment requires a successful probe")
+    if observed:
+        python = environment.python
+        supported_python = _supported_repository_python_v2(python)
+        if environment.error is not None and environment.error.code == "repository_python_unsupported":
+            if supported_python:
+                _invalid("repository_python_unsupported contradicts supported Python")
+        elif not supported_python:
+            _invalid("observed Repository Python is outside the supported set")
     if environment.lock.status == "current":
         if not observed or not _successful_process(probe):
             _invalid("current lock requires successful environment evidence")
@@ -426,6 +435,14 @@ def _validate_pre_execution_stage_v2(
         for process in environment.processes
         if process.role != "repository_safety"
     )
+    uv_process = next(
+        (process for process in environment.processes if process.role == "uv_version"),
+        None,
+    )
+    probe = next(
+        (process for process in environment.processes if process.role == "environment_probe"),
+        None,
+    )
     if error.code == "repository_lock_missing":
         if (
             environment.lock.status != "missing"
@@ -440,6 +457,7 @@ def _validate_pre_execution_stage_v2(
     if error.code == "uv_unavailable":
         if (
             core_roles != ("uv_version",)
+            or not _failed_process(uv_process)
             or environment.lock.status != "unverified"
             or environment.manager_version is not None
             or environment.path is not None
@@ -449,6 +467,7 @@ def _validate_pre_execution_stage_v2(
         return
     if error.code == "repository_environment_failed" and (
         core_roles != ("uv_version", "environment_probe")
+        or not _failed_process(probe)
         or environment.lock.status != "unverified"
         or environment.manager_version is None
         or environment.path is not None
@@ -466,6 +485,7 @@ def _validate_pre_execution_stage_v2(
     if error.code == "environment_evidence_invalid":
         uv_evidence_failure = (
             core_roles == ("uv_version",)
+            and _zero_exit_process(uv_process)
             and environment.lock.status == "unverified"
             and environment.manager_version is None
             and environment.path is None
@@ -474,6 +494,7 @@ def _validate_pre_execution_stage_v2(
         probe_evidence_failure = (
             core_roles == ("uv_version", "environment_probe")
             and environment.manager_version is not None
+            and _zero_exit_process(probe)
             and (
                 environment.lock.status == "unverified"
                 and environment.path is None
@@ -685,11 +706,8 @@ def _validate_check_result_v2(
     elif (
         environment.error is not None
         and environment.error.code == "repository_state_changed"
-        and (
-            not check.processes
-            or check.error is not None
-            and check.error.code == "repository_environment_unavailable"
-        )
+        and check.error is not None
+        and check.error.code == "repository_environment_unavailable"
     ):
         _invalid("post-run repository change must preserve actual Check evidence")
     elif dependency.status != "available":
@@ -930,10 +948,18 @@ def _validate_pytest_check_v2(
             _invalid("pytest without a primary process requires a setup error")
         if result.exit_code is not None or result.evidence is not None or result.complete:
             _invalid("pytest setup error cannot claim primary evidence")
-        marker_preparation = (
-            check.error is not None
-            and check.error.code == "check_start_evidence_invalid"
-        )
+        marker_preparation = result.pytest_version == dependency.version
+        error = check.error
+        setup_error = "missing_primary_process" if error is None else error.code
+        if error is None:
+            _invalid("pytest setup error is unavailable")
+        if marker_preparation and setup_error not in {
+            "check_start_evidence_invalid",
+            "cleanup_failed",
+        }:
+            _invalid("pytest marker preparation contradicts its Check error")
+        if not marker_preparation and setup_error == "check_start_evidence_invalid":
+            _invalid("pytest setup error contradicts its observed phase")
         if (
             result.status != "error"
             or result.pytest_version
@@ -944,6 +970,7 @@ def _validate_pytest_check_v2(
             _invalid("pytest setup failure requires not_started evidence")
         _validate_unstarted_coverage_v2(
             check,
+            result,
             coverage,
             coverage_dependency,
             requested=coverage_requested,
@@ -1033,6 +1060,7 @@ def _validate_pytest_check_v2(
 
 def _validate_unstarted_coverage_v2(
     check: CheckResultV2,
+    pytest_result: PytestResult,
     coverage: CoverageResult | None,
     dependency: DependencyEvidence | None,
     *,
@@ -1046,21 +1074,32 @@ def _validate_unstarted_coverage_v2(
         _invalid("requested Coverage requires setup evidence")
     coverage = cast(CoverageResult, coverage)
     dependency = cast(DependencyEvidence, dependency)
-    expected_error = (
-        "preflight_invalid"
-        if dependency.status == "available"
-        else {
+    setup_failure_owns_coverage = (
+        check.error is not None
+        and (
+            check.error.code == "pytest_evidence_error"
+            or check.error.code == "cleanup_failed"
+            and pytest_result.pytest_version is None
+        )
+    )
+    if setup_failure_owns_coverage:
+        expected_error = "preflight_invalid"
+        expected_version = None
+    elif dependency.status == "available":
+        expected_error = "data_missing"
+        expected_version = dependency.version
+    else:
+        expected_error = {
             "missing": "module_unavailable",
             "incompatible": "unsupported_version",
             "shadowed": "preflight_invalid",
             "unusable": "preflight_invalid",
             "unobserved": "preflight_invalid",
         }[dependency.status]
-    )
+        expected_version = dependency.version if dependency.status == "incompatible" else None
     if (
         coverage.status != "error"
-        or coverage.coverage_version
-        != (dependency.version if dependency.status == "incompatible" else None)
+        or coverage.coverage_version != expected_version
         or coverage.error is None
         or coverage.error.code != expected_error
         or any(process.role == "coverage_json" for process in check.processes)
@@ -1205,6 +1244,27 @@ def _successful_process(process: ProcessResult | None) -> bool:
         and process.exit_code == 0
         and _complete_captured_output(process.stdout)
         and _complete_captured_output(process.stderr)
+    )
+
+
+def _zero_exit_process(process: ProcessResult | None) -> bool:
+    return process is not None and process.outcome == "exited" and process.exit_code == 0
+
+
+def _failed_process(process: ProcessResult | None) -> bool:
+    return process is not None and (
+        process.outcome in {"spawn_failed", "signaled"}
+        or process.outcome == "exited"
+        and process.exit_code is not None
+        and process.exit_code != 0
+    )
+
+
+def _supported_repository_python_v2(python: PythonEvidence) -> bool:
+    return (
+        python.implementation == "cpython"
+        and python.version[0] == 3
+        and 10 <= python.version[1] <= 13
     )
 
 

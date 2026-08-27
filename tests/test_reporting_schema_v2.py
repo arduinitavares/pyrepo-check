@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, fields, make_dataclass, replace
+import json
+from pathlib import Path
 from typing import Any, TypeVar, cast
 
 import pytest
 
+from pyrepo_check import execution_workspace, pytest_execution, repository_executor
+from pyrepo_check.check_launcher import stage_check_launcher
 from pyrepo_check.coverage_evidence import (
     CoverageCounts,
     CoverageError,
@@ -14,7 +18,20 @@ from pyrepo_check.coverage_evidence import (
     CoverageTotals,
     FileBranchCoverage,
     FileStatementCoverage,
+    build_coverage_result,
 )
+from pyrepo_check.execution import (
+    CapturedBytes,
+    CheckExecutionFailure,
+    DependencyObservation,
+    EnvironmentFailureObservation,
+    ExecutedCheck,
+    ExecutedProcess,
+    RepositoryEnvironmentObservation,
+    RepositoryLockPresence,
+    RepositoryPreparation,
+)
+from pyrepo_check.planning import CoverageExecutionPlan
 from pyrepo_check.pytest_evidence import (
     CollectionIssue,
     PytestCounts,
@@ -23,6 +40,7 @@ from pyrepo_check.pytest_evidence import (
     PytestResult,
     SlowTest,
     SpecialTestOutcome,
+    build_pytest_result,
 )
 from pyrepo_check.reporting import ReportingError, validate_report_v2
 from pyrepo_check.reporting_schema import (
@@ -45,6 +63,23 @@ from pyrepo_check.reporting_schema import (
     Selection,
     ToolEnvironmentEvidence,
     validate_report_structure_v2,
+)
+from pyrepo_check.repository_environment import prepare_repository_environment
+from pyrepo_check.repository_executor import SafeRepositoryPreparation
+from pyrepo_check.repository_safety import (
+    RepositoryStateSnapshot,
+    RepositoryVerificationResult,
+)
+from tests.support import (
+    RecordingRunner,
+    available_dependency,
+    environment_probe_bytes,
+    focused_plan,
+    missing_dependency,
+    monotonic_clock,
+    prepared_repository,
+    test_workspace,
+    write_minimal_uv_project,
 )
 
 
@@ -569,6 +604,106 @@ def process_result(
         stdout=captured_text(),
         stderr=captured_text(),
         error_message=None,
+    )
+
+
+def observed_process_result(process: ExecutedProcess) -> ProcessResult:
+    def stream(value: CapturedBytes | None) -> CapturedText:
+        if value is None:
+            return CapturedText(True, "", False, 0)
+        return CapturedText(
+            True,
+            value.tail.decode("utf-8", errors="replace"),
+            value.omitted_bytes > 0,
+            value.omitted_bytes,
+        )
+
+    if process.returncode is None:
+        outcome = "spawn_failed"
+        exit_code = None
+        signal = None
+        error_message = process.spawn_error or "process failed to spawn"
+    elif process.returncode < 0:
+        outcome = "signaled"
+        exit_code = None
+        signal = -process.returncode
+        error_message = f"process terminated by signal {signal}"
+    else:
+        outcome = "exited"
+        exit_code = process.returncode
+        signal = None
+        error_message = None
+    return ProcessResult(
+        role=cast(Any, process.role),
+        argv=process.command,
+        cwd=str(process.cwd),
+        outcome=cast(Any, outcome),
+        exit_code=exit_code,
+        signal=signal,
+        duration_ms=process.duration_ms,
+        stdout=stream(process.stdout),
+        stderr=stream(process.stderr),
+        error_message=error_message,
+    )
+
+
+def dependency_evidence_from_observation(
+    dependency: DependencyObservation,
+) -> DependencyEvidence:
+    error = dependency.error
+    return DependencyEvidence(
+        name=dependency.name,
+        module=dependency.module,
+        required=dependency.required,
+        status=dependency.status,
+        version=dependency.version,
+        origin=dependency.origin,
+        process=(
+            None
+            if dependency.process is None
+            else observed_process_result(dependency.process)
+        ),
+        error=(
+            None
+            if error is None
+            else CheckErrorV2(error.code, error.message, error.hint)
+        ),
+    )
+
+
+def environment_failure_from_observation(
+    observation: RepositoryEnvironmentObservation,
+    *,
+    project_root: Path,
+) -> RunReportV2:
+    report = environment_failure_report()
+    assert observation.error is not None
+    python = (
+        None
+        if observation.python is None
+        else PythonEvidence(
+            observation.python.implementation,
+            observation.python.version,
+            str(observation.python.executable),
+        )
+    )
+    return replace(
+        report,
+        project_root=str(project_root),
+        repository_environment=replace(
+            report.repository_environment,
+            manager_version=observation.manager_version,
+            path=None if observation.path is None else str(observation.path),
+            python=python,
+            lock=LockEvidence(str(observation.lock_path), observation.lock_status),
+            mutation_protection=observation.mutation_protection,
+            processes=tuple(observed_process_result(item) for item in observation.processes),
+            error=EnvironmentError(
+                observation.error.code,
+                observation.error.message,
+                observation.error.hint,
+            ),
+        ),
     )
 
 
@@ -1820,6 +1955,190 @@ def test_schema_v2_accepts_final_safety_after_uv_failure() -> None:
     validate_report_v2(replace(report, repository_environment=failed_environment))
 
 
+def observed_processless_repository_change_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    family: str,
+) -> RunReportV2:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    plan = focused_plan(tmp_path, "ruff")
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    dependency = (
+        missing_dependency("ruff")
+        if family == "dependency"
+        else available_dependency("ruff", "0.15.0")
+    )
+    observation = RepositoryEnvironmentObservation(
+        manager_version="0.10.12",
+        path=prepared.path,
+        python_selection=plan.repository_python,
+        python=prepared.python,
+        lock_path=plan.root / "uv.lock",
+        lock_status="current",
+        mutation_protection="unobserved",
+        dependencies=(dependency,),
+        processes=(),
+        error=None,
+    )
+    safe = SafeRepositoryPreparation(
+        RepositoryStateSnapshot(None, (), ()),
+        RepositoryPreparation(prepared, observation),
+    )
+    final_error = EnvironmentFailureObservation(
+        "repository_state_changed",
+        "Repository state changed after Check execution.",
+        "Restore the repository state, then retry.",
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            repository_executor,
+            "prepare_safe_repository",
+            lambda *args, **kwargs: safe,
+        )
+        patch.setattr(
+            repository_executor,
+            "verify_repository_state",
+            lambda *args, **kwargs: RepositoryVerificationResult(
+                (),
+                "protected_files",
+                final_error,
+            ),
+        )
+        if family == "workspace":
+            patch.setattr(
+                execution_workspace,
+                "create_run_workspace",
+                lambda *args, **kwargs: (_ for _ in ()).throw(OSError("setup blocked")),
+            )
+        result = repository_executor.execute_repository_plan(
+            plan,
+            runner=RecordingRunner(),
+            clock_ns=monotonic_clock(),
+        )
+    assert result.repository_environment.error == final_error
+    observed_check = result.checks[0]
+    assert observed_check.processes == ()
+    assert observed_check.error is not None
+    expected_check_error = (
+        "check_dependency_missing" if family == "dependency" else "cleanup_failed"
+    )
+    assert observed_check.error.code == expected_check_error
+
+    report = (
+        dependency_failure_report("missing")
+        if family == "dependency"
+        else valid_run_report()
+    )
+    environment = report.repository_environment
+    base_check = report.checks[0]
+    return replace(
+        report,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            environment,
+            mutation_protection="protected_files",
+            dependencies=(dependency_evidence_from_observation(dependency),),
+            processes=environment.processes[:-1],
+            error=EnvironmentError(
+                final_error.code,
+                final_error.message,
+                final_error.hint,
+            ),
+        ),
+        checks=(
+            replace(
+                base_check,
+                status="error",
+                execution_environment=None,
+                analysis_python_authority=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    observed_check.error.code,
+                    observed_check.error.message,
+                    observed_check.error.hint,
+                ),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("family", ("dependency", "workspace"))
+def test_schema_v2_repository_change_preserves_processless_producer_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+) -> None:
+    report = observed_processless_repository_change_report(
+        tmp_path,
+        monkeypatch,
+        family=family,
+    )
+    validate_report_v2(report)
+
+
+def test_schema_v2_repository_change_still_rejects_synthesized_unavailable_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = observed_processless_repository_change_report(
+        tmp_path,
+        monkeypatch,
+        family="workspace",
+    )
+    check = report.checks[0]
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                report,
+                checks=(
+                    replace(
+                        check,
+                        error=CheckErrorV2(
+                            "repository_environment_unavailable",
+                            "Repository Environment is unavailable.",
+                            None,
+                        ),
+                    ),
+                ),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage", "coverage_status"),
+    (("marker_preparation", "available"), ("reporter_staging", "missing")),
+)
+def test_schema_v2_repository_change_preserves_processless_pytest_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    coverage_status: str,
+) -> None:
+    report = observed_pytest_setup_failure_report(
+        tmp_path,
+        monkeypatch,
+        stage=stage,
+        coverage_status=coverage_status,
+    )
+    environment = report.repository_environment
+    validate_report_v2(
+        replace(
+            report,
+            repository_environment=replace(
+                environment,
+                error=EnvironmentError(
+                    "repository_state_changed",
+                    "Repository state changed after Check execution.",
+                    "Restore the repository state, then retry.",
+                ),
+            ),
+        )
+    )
+
+
 def test_schema_v2_repository_integrity_state_families_are_exact() -> None:
     tracked = valid_run_report()
     validate_report_v2(tracked)
@@ -2071,6 +2390,258 @@ def test_schema_v2_enforces_pre_execution_environment_stage_shapes() -> None:
             validate_report_v2(replace(missing, repository_environment=malformed))
 
 
+def observed_environment_report(tmp_path: Path, case: str) -> RunReportV2:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(
+        tmp_path,
+        "pytest",
+        repository_python="3.12.11" if case == "explicit_mismatch" else None,
+    )
+    valid_probe = environment_probe_bytes(
+        version=(3, 12, 11),
+        executable=plan.root / ".venv/bin/python",
+        environment_root=plan.root / ".venv",
+    )
+    returncodes: tuple[int, ...] = ()
+    stdout: tuple[bytes | str | None, ...] = (b"uv 0.10.12\n", valid_probe)
+    raise_on_call: int | None = None
+    lock_presence: RepositoryLockPresence | None = None
+    if case == "uv_exit":
+        returncodes = (1,)
+    elif case == "uv_signal":
+        returncodes = (-9,)
+    elif case == "uv_spawn":
+        raise_on_call = 1
+    elif case == "probe_exit":
+        returncodes = (0, 1)
+    elif case == "probe_signal":
+        returncodes = (0, -9)
+    elif case == "probe_spawn":
+        raise_on_call = 2
+    elif case == "invalid_uv":
+        stdout = (b"not uv\n",)
+    elif case == "invalid_probe":
+        stdout = (b"uv 0.10.12\n", b"not json")
+    elif case == "explicit_mismatch":
+        stdout = (
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 12, 12),
+                executable=plan.root / ".venv/bin/python",
+                environment_root=plan.root / ".venv",
+            ),
+        )
+    elif case == "unsupported_pypy":
+        document = json.loads(valid_probe)
+        document["implementation"] = "pypy"
+        stdout = (b"uv 0.10.12\n", json.dumps(document).encode())
+    elif case == "unsupported_314":
+        stdout = (
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 14, 0),
+                executable=plan.root / ".venv/bin/python",
+                environment_root=plan.root / ".venv",
+            ),
+        )
+    elif case == "unsupported_39":
+        stdout = (
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 9, 20),
+                executable=plan.root / ".venv/bin/python",
+                environment_root=plan.root / ".venv",
+            ),
+        )
+    elif case == "unsafe_lock":
+        lock_presence = RepositoryLockPresence(plan.root / "uv.lock", "unsafe", "unsafe")
+        stdout = ()
+    elif case == "unsafe_probe":
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        stdout = (
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 12, 11),
+                executable=outside / "bin/python",
+                environment_root=outside,
+            ),
+        )
+    runner = RecordingRunner(
+        returncodes=returncodes,
+        stdout=stdout,
+        raise_on_call=raise_on_call,
+    )
+    preparation = prepare_repository_environment(
+        plan,
+        lock_presence=lock_presence,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+    assert preparation.prepared is None
+    return environment_failure_from_observation(
+        preparation.observation,
+        project_root=plan.root,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "error_code", "roles"),
+    (
+        ("uv_exit", "uv_unavailable", ("uv_version",)),
+        ("uv_signal", "uv_unavailable", ("uv_version",)),
+        ("uv_spawn", "uv_unavailable", ("uv_version",)),
+        ("probe_exit", "repository_environment_failed", ("uv_version", "environment_probe")),
+        ("probe_signal", "repository_environment_failed", ("uv_version", "environment_probe")),
+        ("probe_spawn", "repository_environment_failed", ("uv_version", "environment_probe")),
+        ("invalid_uv", "environment_evidence_invalid", ("uv_version",)),
+        ("invalid_probe", "environment_evidence_invalid", ("uv_version", "environment_probe")),
+        ("explicit_mismatch", "environment_evidence_invalid", ("uv_version", "environment_probe")),
+        ("unsupported_pypy", "repository_python_unsupported", ("uv_version", "environment_probe")),
+        ("unsupported_39", "repository_python_unsupported", ("uv_version", "environment_probe")),
+        ("unsupported_314", "repository_python_unsupported", ("uv_version", "environment_probe")),
+        ("unsafe_lock", "unsafe_repository_environment", ()),
+        ("unsafe_probe", "unsafe_repository_environment", ("uv_version", "environment_probe")),
+    ),
+)
+def test_schema_v2_accepts_producer_environment_failure_classifiers(
+    tmp_path: Path,
+    case: str,
+    error_code: str,
+    roles: tuple[str, ...],
+) -> None:
+    report = observed_environment_report(tmp_path, case)
+    assert report.repository_environment.error is not None
+    assert report.repository_environment.error.code == error_code
+    assert tuple(item.role for item in report.repository_environment.processes) == roles
+    validate_report_v2(report)
+
+
+@pytest.mark.parametrize("minor", (10, 11, 12, 13))
+def test_schema_v2_accepts_only_producer_supported_repository_python(
+    tmp_path: Path,
+    minor: int,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    plan = focused_plan(tmp_path, "ruff")
+    preparation = prepare_repository_environment(
+        plan,
+        runner=RecordingRunner(
+            stdout=(
+                b"uv 0.10.12\n",
+                environment_probe_bytes(
+                    version=(3, minor, 0),
+                    executable=plan.root / ".venv/bin/python",
+                    environment_root=plan.root / ".venv",
+                ),
+            )
+        ),
+        clock_ns=monotonic_clock(),
+    )
+    assert preparation.prepared is not None
+    report = valid_run_report()
+    environment = report.repository_environment
+    python = cast(PythonEvidence, environment.python)
+    observed = preparation.prepared.python
+    derived_python = replace(
+        python,
+        implementation=observed.implementation,
+        version=observed.version,
+    )
+    check = report.checks[0]
+    start = cast(CheckStartEvidence, check.start_evidence)
+    validate_report_v2(
+        replace(
+            report,
+            repository_environment=replace(environment, python=derived_python),
+            checks=(replace(check, start_evidence=replace(start, python=derived_python)),),
+        )
+    )
+
+
+def test_schema_v2_rejects_environment_classifier_single_contradictions(
+    tmp_path: Path,
+) -> None:
+    successful = valid_run_report()
+    environment = successful.repository_environment
+    python = cast(PythonEvidence, environment.python)
+    check = successful.checks[0]
+    start = cast(CheckStartEvidence, check.start_evidence)
+    unsupported_successes = (
+        replace(python, implementation="pypy"),
+        replace(python, version=(3, 9, 20)),
+        replace(python, version=(3, 14, 0)),
+    )
+    for unsupported in unsupported_successes:
+        with pytest.raises(ReportingError):
+            validate_report_v2(
+                replace(
+                    successful,
+                    repository_environment=replace(environment, python=unsupported),
+                    checks=(replace(check, start_evidence=replace(start, python=unsupported)),),
+                )
+            )
+
+    unsupported = observed_environment_report(tmp_path / "unsupported", "unsupported_314")
+    unsupported_environment = unsupported.repository_environment
+    supported_python = replace(
+        cast(PythonEvidence, unsupported_environment.python),
+        version=(3, 12, 11),
+    )
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                unsupported,
+                repository_environment=replace(
+                    unsupported_environment,
+                    python=supported_python,
+                ),
+            )
+        )
+
+    uv_failure = observed_environment_report(tmp_path / "uv", "uv_exit")
+    uv_environment = uv_failure.repository_environment
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                uv_failure,
+                repository_environment=replace(
+                    uv_environment,
+                    processes=(replace(uv_environment.processes[0], exit_code=0),),
+                ),
+            )
+        )
+
+    probe_failure = observed_environment_report(tmp_path / "probe", "probe_exit")
+    probe_environment = probe_failure.repository_environment
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                probe_failure,
+                repository_environment=replace(
+                    probe_environment,
+                    processes=(
+                        probe_environment.processes[0],
+                        replace(probe_environment.processes[1], exit_code=0),
+                    ),
+                ),
+            )
+        )
+
+    invalid_uv = observed_environment_report(tmp_path / "invalid-uv", "invalid_uv")
+    invalid_environment = invalid_uv.repository_environment
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                invalid_uv,
+                repository_environment=replace(
+                    invalid_environment,
+                    processes=(replace(invalid_environment.processes[0], exit_code=1),),
+                ),
+            )
+        )
+
+
 def test_schema_v2_rejects_impossible_unsafe_and_invalid_evidence_stages() -> None:
     report = environment_failure_report()
     environment = report.repository_environment
@@ -2112,6 +2683,249 @@ def test_schema_v2_rejects_impossible_unsafe_and_invalid_evidence_stages() -> No
             validate_report_v2(
                 replace(report, repository_environment=invalid_environment)
             )
+
+
+def observed_pytest_setup_failure_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stage: str,
+    coverage_status: str,
+) -> RunReportV2:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+    plan = focused_plan(tmp_path, "pytest")
+    check = plan.checks[0]
+    assert check.pytest is not None
+    check = replace(
+        check,
+        pytest=replace(
+            check.pytest,
+            coverage=CoverageExecutionPlan(tmp_path / "pyproject.toml", None),
+        ),
+    )
+    plan = replace(
+        plan,
+        checks=(check,),
+        planned_coverage_scope="complete",
+    )
+    pytest_dependency = available_dependency("pytest", "8.4.2")
+    if coverage_status == "available":
+        coverage_dependency = available_dependency("coverage", "7.15.2")
+    elif coverage_status == "missing":
+        coverage_dependency = missing_dependency("coverage")
+    else:
+        available = available_dependency("coverage", "7.15.2")
+        coverage_dependency = replace(
+            available,
+            status="incompatible",
+            version="7.14.9",
+            error=CheckExecutionFailure(
+                "check_dependency_incompatible",
+                "Repository dependency coverage is incompatible.",
+                "Lock a supported Coverage version.",
+            ),
+        )
+    with monkeypatch.context() as patch:
+        if stage == "marker_preparation":
+            patch.setattr(
+                pytest_execution,
+                "ensure_start_marker_absent",
+                lambda *args, **kwargs: (_ for _ in ()).throw(OSError("marker blocked")),
+            )
+        else:
+            patch.setattr(
+                pytest_execution,
+                "_prepare_run_directory",
+                lambda *args, **kwargs: (_ for _ in ()).throw(OSError("reporter blocked")),
+            )
+        with test_workspace(tmp_path) as workspace:
+            result = pytest_execution.execute_prepared_pytest(
+                check,
+                plan=plan,
+                prepared=prepared,
+                pytest_dependency=pytest_dependency,
+                coverage_dependency=coverage_dependency,
+                workspace=workspace,
+                launcher=stage_check_launcher(workspace),
+                output_format="json",
+                runner=RecordingRunner(),
+                clock_ns=monotonic_clock(),
+            )
+    assert result.processes == ()
+    assert result.start is None
+    assert result.error is not None
+    executed = ExecutedCheck(
+        planned=check,
+        processes=result.processes,
+        pytest=result.pytest,
+        coverage=result.coverage,
+    )
+    pytest_result = build_pytest_result(
+        plan,
+        executed,
+        dependency_version=pytest_dependency.version,
+    )
+    coverage_result = build_coverage_result(
+        tmp_path,
+        plan,
+        pytest_result,
+        result.coverage,
+        dependency_version=coverage_dependency.version,
+    )
+    assert coverage_result is not None
+    report = pytest_run_report(coverage="available")
+    environment = report.repository_environment
+    base_check = report.checks[0]
+    return replace(
+        report,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            environment,
+            dependencies=(
+                dependency_evidence_from_observation(pytest_dependency),
+                dependency_evidence_from_observation(coverage_dependency),
+            ),
+        ),
+        checks=(
+            replace(
+                base_check,
+                status="error",
+                execution_environment=None,
+                start_evidence=None,
+                processes=(),
+                error=CheckErrorV2(
+                    result.error.code,
+                    result.error.message,
+                    result.error.hint,
+                ),
+            ),
+        ),
+        pytest=pytest_result,
+        coverage=coverage_result,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "coverage_status", "check_error", "coverage_error", "version"),
+    (
+        (
+            "marker_preparation",
+            "available",
+            "check_start_evidence_invalid",
+            "data_missing",
+            "7.15.2",
+        ),
+        (
+            "reporter_staging",
+            "missing",
+            "pytest_evidence_error",
+            "preflight_invalid",
+            None,
+        ),
+        (
+            "reporter_staging",
+            "incompatible",
+            "pytest_evidence_error",
+            "preflight_invalid",
+            None,
+        ),
+    ),
+)
+def test_schema_v2_accepts_producer_requested_coverage_setup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    coverage_status: str,
+    check_error: str,
+    coverage_error: str,
+    version: str | None,
+) -> None:
+    report = observed_pytest_setup_failure_report(
+        tmp_path,
+        monkeypatch,
+        stage=stage,
+        coverage_status=coverage_status,
+    )
+    assert report.checks[0].error is not None
+    assert report.checks[0].error.code == check_error
+    result = cast(CoverageResult, report.coverage)
+    assert result.error is not None
+    assert result.error.code == coverage_error
+    assert result.coverage_version == version
+    validate_report_v2(report)
+
+
+def test_schema_v2_rejects_requested_coverage_setup_single_contradictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = observed_pytest_setup_failure_report(
+        tmp_path / "marker",
+        monkeypatch,
+        stage="marker_preparation",
+        coverage_status="available",
+    )
+    marker_coverage = cast(CoverageResult, marker.coverage)
+    assert marker_coverage.error is not None
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                marker,
+                coverage=replace(
+                    marker_coverage,
+                    coverage_version=None,
+                    error=CoverageError("preflight_invalid", "wrong setup owner"),
+                ),
+            )
+        )
+
+    reporter = observed_pytest_setup_failure_report(
+        tmp_path / "reporter",
+        monkeypatch,
+        stage="reporter_staging",
+        coverage_status="missing",
+    )
+    reporter_coverage = cast(CoverageResult, reporter.coverage)
+    with pytest.raises(ReportingError):
+        validate_report_v2(
+            replace(
+                reporter,
+                coverage=replace(
+                    reporter_coverage,
+                    error=CoverageError("module_unavailable", "wrong dependency owner"),
+                ),
+            )
+        )
+
+
+def test_schema_v2_marker_setup_coverage_survives_later_cleanup_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = observed_pytest_setup_failure_report(
+        tmp_path,
+        monkeypatch,
+        stage="marker_preparation",
+        coverage_status="available",
+    )
+    check = report.checks[0]
+    validate_report_v2(
+        replace(
+            report,
+            checks=(
+                replace(
+                    check,
+                    error=CheckErrorV2(
+                        "cleanup_failed",
+                        "marker preparation and later workspace cleanup failed",
+                        None,
+                    ),
+                ),
+            ),
+        )
+    )
 
 
 def test_schema_v2_accepts_real_no_primary_producer_families() -> None:
