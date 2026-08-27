@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+import pyrepo_check.repository_environment as repository_environment
 from pyrepo_check.repository_environment import (
     ENVIRONMENT_PROBE_SOURCE,
     inspect_repository_lock,
@@ -326,6 +327,43 @@ def test_configuration_no_cache_cannot_be_disabled_by_false_environment_value(
     assert failure.code == "unsafe_repository_environment"
     assert "temporary" in failure.message.lower()
     assert not (root / "temporary-cache").exists()
+
+
+def test_windows_systemdrive_config_cache_stops_before_process_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_minimal_uv_project(tmp_path)
+    system_drive = tmp_path.parent / "windows-system-drive"
+    config_directory = system_drive / "ProgramData/uv"
+    config_directory.mkdir(parents=True)
+    (config_directory / "uv.toml").write_text(
+        f'cache-dir = "{tmp_path / "system-cache"}"\n',
+        encoding="utf-8",
+    )
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    _apply_external_storage_environment(monkeypatch, tmp_path.parent)
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("UV_NO_CACHE", raising=False)
+    monkeypatch.setenv("SYSTEMDRIVE", str(system_drive))
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path.parent / "ineffective-program-data"))
+    monkeypatch.setattr(repository_environment, "_WINDOWS", True, raising=False)
+    runner = RecordingRunner()
+
+    preparation = prepare_repository_environment(
+        focused_plan(tmp_path, "ty"),
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert len(runner.calls) == 0
+    assert preparation.prepared is None
+    assert preparation.observation.error is not None
+    assert preparation.observation.error.code == "unsafe_repository_environment"
+    assert "configuration cache" in preparation.observation.error.message.lower()
+    assert sentinel.read_bytes() == b"unchanged"
+    assert not (tmp_path / "system-cache").exists()
 
 
 @pytest.mark.parametrize(
@@ -788,11 +826,23 @@ def test_probe_evidence_at_exact_capture_limit_is_accepted(tmp_path: Path) -> No
 
 def test_probe_nesting_above_eight_is_rejected_as_malformed(tmp_path: Path) -> None:
     write_minimal_uv_project(tmp_path)
-    probe_output = b"[" * 9 + b"0" + b"]" * 9
+    plan = focused_plan(tmp_path, "ty")
+    document = json.loads(
+        environment_probe_bytes(
+            version=(3, 12, 1),
+            executable=plan.root / ".venv/bin/python",
+            environment_root=plan.root / ".venv",
+        )
+    )
+    nested_value: object = 0
+    for _ in range(8):
+        nested_value = [nested_value]
+    document["nested"] = nested_value
+    probe_output = json.dumps(document, separators=(",", ":")).encode()
     runner = RecordingRunner(stdout=(b"uv 0.10.12\n", probe_output))
 
     preparation = prepare_repository_environment(
-        focused_plan(tmp_path, "ty"),
+        plan,
         runner=runner,
         clock_ns=monotonic_clock(),
     )
@@ -803,6 +853,7 @@ def test_probe_nesting_above_eight_is_rejected_as_malformed(tmp_path: Path) -> N
     assert preparation.observation.lock_status == "unverified"
     assert preparation.observation.error is not None
     assert preparation.observation.error.code == "environment_evidence_invalid"
+    assert preparation.observation.error.message.endswith("invalid: ValueError.")
 
 
 @pytest.mark.parametrize(

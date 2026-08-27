@@ -97,6 +97,7 @@ _STORAGE_OVERRIDES = (
 _UV_CONFIG_LIMIT_BYTES = 1024 * 1024
 _BOOLISH_TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
 _BOOLISH_FALSE = frozenset({"0", "false", "f", "no", "n", "off"})
+_WINDOWS = os.name == "nt"
 _PROBE_KEYS = frozenset(
     {
         "schema_version",
@@ -494,13 +495,16 @@ def _user_uv_configuration_path(
 def _discover_system_uv_configuration(
     environment: Mapping[str, str],
 ) -> _UvCacheConfiguration | EnvironmentFailureObservation | None:
-    if os.name == "nt":
-        program_data = environment.get("PROGRAMDATA")
-        if program_data is not None:
-            invalid = _validate_absolute_base("PROGRAMDATA", program_data)
+    if _WINDOWS:
+        system_drive = environment.get("SYSTEMDRIVE")
+        if system_drive is None:
+            candidates = ()
+        else:
+            system_root = Path(f"{system_drive}{os.sep}")
+            invalid = _validate_absolute_base("SYSTEMDRIVE", str(system_root))
             if invalid is not None:
                 return invalid
-        candidates = () if program_data is None else (Path(program_data) / "uv/uv.toml",)
+            candidates = (system_root / "ProgramData/uv/uv.toml",)
     else:
         raw_directories = environment.get("XDG_CONFIG_DIRS", "/etc/xdg")
         directories = tuple(
