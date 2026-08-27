@@ -85,15 +85,23 @@ def test_workspace_cleanup_never_traverses_replaced_root(
     workspace.path.rename(original)
     workspace.path.symlink_to(outside, target_is_directory=True)
 
-    observation = remove_run_workspace(
-        workspace,
-        repository_root=repository,
-        clock_ns=lambda: 0,
-    )
+    try:
+        observation = remove_run_workspace(
+            workspace,
+            repository_root=repository,
+            clock_ns=lambda: 0,
+        )
 
-    assert observation is not None
-    assert observation.kind == "unsafe_tree"
-    assert protected.read_text(encoding="utf-8") == "keep"
+        assert observation is not None
+        assert observation.kind == "unsafe_tree"
+        assert protected.read_text(encoding="utf-8") == "keep"
+    finally:
+        workspace.path.unlink(missing_ok=True)
+        original.rmdir()
+    assert not original.exists()
+    assert not workspace.path.exists()
+
+
 def _cleanup_record(run_directory: Path) -> execution_workspace.RunWorkspace:
     return execution_workspace.RunWorkspace(
         run_directory,
