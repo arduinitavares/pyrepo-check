@@ -40,7 +40,10 @@ CHECK_HELP = "ruff, annotations, annotations-fix, ty, bandit, pytest"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Python repository quality checks.")
+    parser = argparse.ArgumentParser(
+        prog="pyrepo-check",
+        description="Run Python repository quality checks.",
+    )
     parser.add_argument("--all", action="store_true", help="Run all checks.")
     parser.add_argument(
         "--root",

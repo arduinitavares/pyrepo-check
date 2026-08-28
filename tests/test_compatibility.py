@@ -39,7 +39,7 @@ def _write_external_consumer(root: Path) -> None:
         """[project]
 name = "c2-external-consumer"
 version = "0.0.0"
-requires-python = ">=3.13.15"
+requires-python = ">=3.13,<3.14"
 dependencies = ["pytest>=8,<9"]
 
 [tool.pytest.ini_options]
@@ -86,7 +86,7 @@ def test_prepared_repository_pytest_cannot_import_controller_package(
         """[project]
 name = "prepared-consumer"
 version = "0.0.0"
-requires-python = ">=3.13.15"
+requires-python = ">=3.13,<3.14"
 dependencies = ["pytest>=8,<9"]
 
 [tool.pytest.ini_options]
@@ -173,7 +173,7 @@ fail_under = {fail_under}
         f"""[project]
 name = "c3-coverage-all-consumer"
 version = "0.0.0"
-requires-python = ">=3.13.15"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "bandit>=1.9,<2",
 {coverage_dependency}{xdist_dependency}    "pytest>=8,<9",
@@ -381,7 +381,7 @@ def _write_pytest_nine_consumer(root: Path) -> None:
         """[project]
 name = "c2-pytest-nine-consumer"
 version = "0.0.0"
-requires-python = ">=3.13.15"
+requires-python = ">=3.13,<3.14"
 dependencies = ["pytest==9.0.0"]
 
 [tool.pytest.ini_options]
@@ -839,14 +839,15 @@ def test_external_terminal_ordinary_orders_environment_banner_and_live_output(
     completed = _run_external_terminal(consumer, "ruff")
 
     tool_version = ".".join(str(piece) for piece in sys.version_info[:3])
-    environment = (
-        f"==> environment: tool Python {tool_version} -> "
-        f"repository Python {tool_version} (uv, locked)\n"
-    )
+    environment_line = completed.stdout.splitlines()[0]
+    environment = f"{environment_line}\n"
     banner = "==> ruff: python -m ruff check src tests\n"
     assert completed.returncode == expected_returncode
     assert completed.stderr == ""
-    assert completed.stdout.startswith(environment)
+    assert environment_line.startswith(
+        f"==> environment: tool Python {tool_version} -> repository Python 3.13."
+    )
+    assert environment_line.endswith(" (uv, locked)")
     environment_index = completed.stdout.index(environment)
     banner_index = completed.stdout.index(banner)
     summary_index = completed.stdout.index("==> pyrepo-check summary:")
@@ -875,14 +876,15 @@ def test_external_terminal_pytest_orders_environment_banner_and_live_output(
     completed = _run_external_terminal(consumer, "pytest")
 
     tool_version = ".".join(str(piece) for piece in sys.version_info[:3])
-    environment = (
-        f"==> environment: tool Python {tool_version} -> "
-        f"repository Python {tool_version} (uv, locked)\n"
-    )
+    environment_line = completed.stdout.splitlines()[0]
+    environment = f"{environment_line}\n"
     banner = "==> pytest: python -m pytest\n"
     assert completed.returncode == expected_returncode
     assert completed.stderr == ""
-    assert completed.stdout.startswith(environment)
+    assert environment_line.startswith(
+        f"==> environment: tool Python {tool_version} -> repository Python 3.13."
+    )
+    assert environment_line.endswith(" (uv, locked)")
     environment_index = completed.stdout.index(environment)
     banner_index = completed.stdout.index(banner)
     child_output_index = completed.stdout.index("test session starts")
@@ -1743,7 +1745,9 @@ def test_invalid_format_remains_argparse_owned(
     assert captured.value.code == 2
     assert output.out == ""
     assert "invalid choice: 'xml'" in output.err
-    assert "choose from 'terminal', 'json'" in output.err
+    assert "choose from" in output.err
+    assert "terminal" in output.err
+    assert "json" in output.err
 
 
 def test_python_requirement_is_consistent_across_active_contracts() -> None:

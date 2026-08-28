@@ -82,7 +82,9 @@ def test_global_controller_runs_complete_gate_on_selected_repository_python(
     assert report["kind"] == "run"
     assert report["complete"] is True
     assert report["overall_status"] == "passed"
-    assert report["tool_environment"]["python"]["version"] == [3, 13, 15]
+    tool_python_version = report["tool_environment"]["python"]["version"]
+    assert tool_python_version == list(sys.version_info[:3])
+    assert tuple(tool_python_version) >= (3, 13, 15)
     assert report["repository_environment"]["python"]["version"][:2] == [
         int(piece) for piece in request.split(".")
     ][:2]

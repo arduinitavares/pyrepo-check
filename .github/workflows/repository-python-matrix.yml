@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+env:
+  # uv's Linux catalog has no 3.13.15 build; 3.14.3 satisfies the project floor.
+  CONTROLLER_PYTHON: "3.14.3"
+
 jobs:
   controller-gate:
     runs-on: ubuntu-latest
@@ -14,12 +18,18 @@ jobs:
         with:
           version: "0.10.12"
           enable-cache: true
-      - name: Install controller Python
-        run: uv python install 3.13.15
+      - name: Install controller and fixture Pythons
+        run: uv python install "$CONTROLLER_PYTHON" 3.13
       - name: Synchronize controller environment
-        run: uv sync --locked --python 3.13.15
-      - name: Run strict gate including real uv integration
-        run: uv run --locked --python 3.13.15 pyrepo-check --all
+        run: uv sync --locked --python "$CONTROLLER_PYTHON"
+      - name: Run controller quality gate including real uv integration
+        run: |
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m ruff check .
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m ruff check . --select ANN --output-format concise
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m ty check
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m bandit -c pyproject.toml -r .
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m coverage run --rcfile=pyproject.toml -m pytest
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m coverage report --rcfile=pyproject.toml
 
   repository-python:
     runs-on: ubuntu-latest
@@ -34,13 +44,13 @@ jobs:
           version: "0.10.12"
           enable-cache: true
       - name: Install controller and repository Pythons
-        run: uv python install 3.13.15 ${{ matrix.repository-python }}
+        run: uv python install "$CONTROLLER_PYTHON" ${{ matrix.repository-python }}
       - name: Synchronize controller environment
-        run: uv sync --locked --python 3.13.15
+        run: uv sync --locked --python "$CONTROLLER_PYTHON"
       - name: Verify one Repository Python
         env:
           PYREPO_CHECK_REPOSITORY_PYTHON: ${{ matrix.repository-python }}
           UV_PYTHON_DOWNLOADS: never
         run: >-
-          uv run --locked --python 3.13.15 python -m pytest
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m pytest
           tests/test_repository_python_matrix.py -q
