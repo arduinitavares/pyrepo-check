@@ -408,6 +408,7 @@ def test_coverage_environments_scrub_ambient_hooks_and_set_owned_paths(
 ) -> None:
     base = {
         "PATH": "/bin",
+        "PYTHONPATH": "/run/reporter",
         "COVERAGE_PROCESS_START": "ambient.toml",
         "COVERAGE_PROCESS_CONFIG": "ambient",
         "COVERAGE_FILE": "ambient.data",
@@ -431,11 +432,13 @@ def test_coverage_environments_scrub_ambient_hooks_and_set_owned_paths(
 
     assert primary == {
         "PATH": "/bin",
+        "PYTHONPATH": "/run/reporter",
         "COVERAGE_FILE": str(run / ".coverage"),
         "COVERAGE_RCFILE": str(config),
     }
     assert helper == {
         "PATH": "/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "COVERAGE_FILE": str(data),
         "COVERAGE_RCFILE": str(config),
     }

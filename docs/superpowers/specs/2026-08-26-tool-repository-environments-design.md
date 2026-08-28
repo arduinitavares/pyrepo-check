@@ -302,10 +302,11 @@ executor, where a missing `uv.lock` is the environment-wide error
 Configuration is parsed only from a bounded, nonblocking, no-follow stable
 regular-file read. The exact parsed bytes are SHA-256-bound to the later repository
 baseline; malformed, oversized, non-UTF-8, non-regular, aliased, or replaced
-configuration is `invalid_project_config`. Configured and direct Check targets must
-be nonempty, NUL-free, non-option-like, project-relative, existing, free of `..`, and
-contained after resolution. For pytest node selectors, validation applies to the
-filesystem prefix before the first `::` while preserving the suffix.
+configuration is `invalid_project_config`. Configured, auto-detected default, and
+direct Check targets must be nonempty, NUL-free, non-option-like, project-relative,
+existing, free of `..`, and contained after resolution. For pytest node selectors,
+validation applies to the filesystem prefix before the first `::` while preserving
+the suffix.
 
 The executor checks for `uv.lock` directly before spawning any process. If it is
 missing, the run reports `repository_lock_missing` without trying `uv --version` or
@@ -315,7 +316,10 @@ When the lock exists, a safe `uv` executable must be available outside the selec
 project. Before any repository-cwd process, the controller resolves `uv` and Git once
 from absolute non-empty PATH entries, skips lexical or resolved project-contained
 candidates, and pins each canonical path and stable file identity for the run. Every
-recorded helper argv uses that exact absolute path. The executor captures and parses
+recorded helper argv uses that exact absolute path. Every construction and use
+revalidates the pinned identity. Identity loss is `unsafe_repository_environment`;
+already attempted dependency and Check evidence remains present, while only the
+unattempted suffix is synthesized as unavailable. The executor captures and parses
 `uv --version` before preparing the
 repository. A missing executable is `uv_unavailable`; malformed version output is
 `environment_evidence_invalid`. The exact uv version is part of Repository
@@ -614,8 +618,20 @@ Checks:
 For available Coverage, the executor boundedly copies the probed package tree into
 the held run workspace before pytest. The post-pytest JSON helper revalidates every
 staged file plus its standalone launcher and imports Coverage with that staged root
-ahead of the repository. A pytest-created repository shadow, mutation at the original
-`.venv` origin, or mutation of the staged copy cannot become trusted JSON execution.
+ahead of the repository. Its environment removes pytest's invocation-owned
+`PYTHONPATH` and disables bytecode writes. Before importing non-built-in modules, the
+launcher removes its writable workspace/script entry; it also excludes the repository
+and starts with `-S`, so repository-environment `sitecustomize` and `.pth` startup code
+cannot run. The launcher places the staged Coverage root first, retains stdlib paths,
+and appends the original validated import root only for Coverage's transitive modules
+(including Python 3.10 `tomli`) and normally installed Coverage plugins. It does not
+restore editable/project-local plugin roots that depend on `.pth` processing; such a
+configured plugin produces typed `generation_failed` Coverage evidence. The staged
+package and launcher are revalidated again after the helper returns and before
+`coverage.json` is parsed or trusted. A pytest-created repository shadow, mutation at
+the original Coverage package tree, or mutation of the staged copy cannot replace the
+staged Coverage producer. Installed transitive and plugin modules remain
+repository-owned and are not claimed byte-bound by this protocol.
 
 All other independent Checks continue in their established order.
 

@@ -23,6 +23,7 @@ from pyrepo_check.execution import (
     CheckExecutionFailure,
     CheckStartObservation,
     DependencyObservation,
+    EnvironmentFailureObservation,
     ExecutedProcess,
     PythonObservation,
     RepositoryCheckObservation,
@@ -30,7 +31,12 @@ from pyrepo_check.execution import (
     RepositoryExecutionResult,
     ToolEnvironmentObservation,
 )
-from pyrepo_check.planning import CheckInvocation, DefaultRepositoryPython, RunPlan
+from pyrepo_check.planning import (
+    CheckInvocation,
+    CoverageExecutionPlan,
+    DefaultRepositoryPython,
+    RunPlan,
+)
 from pyrepo_check.planning import PytestExecutionPlan
 from pyrepo_check.pytest_execution import PytestArtifactObservation, PytestExecutionObservation
 from pyrepo_check.pytest_evidence import (
@@ -48,6 +54,12 @@ from pyrepo_check.coverage_evidence import (
     CoverageTotals,
     FileBranchCoverage,
     FileStatementCoverage,
+)
+from pyrepo_check.coverage_execution import (
+    CoverageArtifactObservation,
+    CoverageExecutionObservation,
+    CoveragePreflightObservation,
+    CoveragePreflightRecord,
 )
 from pyrepo_check.reporting_schema import (
     AgentReportV2,
@@ -167,13 +179,27 @@ def _pytest_composition(
     *,
     primary_exit: int,
     observation_error: CheckExecutionFailure | None = None,
+    coverage_observation: CoverageExecutionObservation | None = None,
+    environment_error: EnvironmentFailureObservation | None = None,
+    include_coverage_json: bool = True,
 ) -> tuple[Path, RunPlan, RepositoryExecutionResult]:
-    expected = pytest_run_report(exit_code=primary_exit)
+    coverage_requested = coverage_observation is not None
+    expected = pytest_run_report(
+        exit_code=primary_exit,
+        coverage="available" if coverage_requested else "not_requested",
+    )
     root = Path(expected.project_root)
     planned = CheckInvocation(
         "pytest",
         (),
-        pytest=PytestExecutionPlan(pytest_args=()),
+        pytest=PytestExecutionPlan(
+            pytest_args=(),
+            coverage=(
+                CoverageExecutionPlan(Path("/repo/pyproject.toml"), None)
+                if coverage_requested
+                else None
+            ),
+        ),
     )
     plan = RunPlan(
         root=root,
@@ -184,7 +210,7 @@ def _pytest_composition(
         output_format="json",
         pytest_args=(),
         planned_test_scope="complete",
-        planned_coverage_scope="not_requested",
+        planned_coverage_scope="complete" if coverage_requested else "not_requested",
     )
     environment = expected.repository_environment
     python = environment.python
@@ -229,9 +255,12 @@ def _pytest_composition(
         mutation_protection=environment.mutation_protection,
         dependencies=dependencies,
         processes=tuple(_observed_process(process) for process in environment.processes),
-        error=None,
+        error=environment_error,
     )
     expected_check = expected.checks[0]
+    expected_processes = expected_check.processes
+    if coverage_requested and not include_coverage_json:
+        expected_processes = expected_processes[:-1]
     start = expected_check.start_evidence
     assert start is not None
     tool_python = expected.tool_environment.python
@@ -258,10 +287,11 @@ def _pytest_composition(
                     repository_python,
                 ),
                 processes=tuple(
-                    _observed_process(process) for process in expected_check.processes
+                    _observed_process(process) for process in expected_processes
                 ),
                 error=observation_error,
                 pytest=pytest_observation,
+                coverage=coverage_observation,
             ),
         ),
     )
@@ -275,6 +305,26 @@ def _exact_json(report: AgentReportV2) -> bytes:
         allow_nan=False,
         separators=(",", ":"),
     ).encode("utf-8") + b"\n"
+
+
+def _incomplete_coverage_observation(
+    state: str,
+    *,
+    json_exit_code: int | None,
+) -> CoverageExecutionObservation:
+    return CoverageExecutionObservation(
+        preflight=CoveragePreflightObservation(
+            "supported",
+            CoveragePreflightRecord((3, 12, 11), True, "7.15.0"),
+            None,
+        ),
+        artifact=CoverageArtifactObservation(
+            cast(Any, state),
+            None,
+            "Coverage integrity was lost.",
+        ),
+        json_exit_code=json_exit_code,
+    )
 
 
 def _dependency_error_with_independent_failure() -> RunReportV2:
@@ -756,6 +806,55 @@ def test_public_composition_keeps_session_incomplete_as_a_failed_check() -> None
     assert report.pytest.error.code == "session_incomplete"
     assert report.checks[0].status == "failed"
     assert report.checks[0].error is None
+
+
+def test_public_composition_serializes_post_helper_coverage_integrity_loss() -> None:
+    observed = pytest_evidence_check()
+    pytest_observation = observed.pytest
+    assert pytest_observation is not None
+    root, plan, execution = _pytest_composition(
+        pytest_observation,
+        primary_exit=0,
+        coverage_observation=_incomplete_coverage_observation(
+            "unexpected_parallel_data",
+            json_exit_code=0,
+        ),
+    )
+
+    payload = json.loads(serialize_json(build_run_report(root, plan, execution)))
+
+    assert payload["coverage"]["error"]["code"] == "unexpected_parallel_data"
+    assert payload["checks"][0]["processes"][-1]["exit_code"] == 0
+
+
+def test_public_composition_serializes_helper_identity_loss_after_pytest() -> None:
+    observed = pytest_evidence_check()
+    pytest_observation = observed.pytest
+    assert pytest_observation is not None
+    root, plan, execution = _pytest_composition(
+        pytest_observation,
+        primary_exit=0,
+        coverage_observation=_incomplete_coverage_observation(
+            "generation_failed",
+            json_exit_code=None,
+        ),
+        environment_error=EnvironmentFailureObservation(
+            "unsafe_repository_environment",
+            "A pinned controller helper changed during execution.",
+            "Restore the controller uv and Git installations, then retry.",
+        ),
+        include_coverage_json=False,
+    )
+
+    payload = json.loads(serialize_json(build_run_report(root, plan, execution)))
+
+    assert payload["repository_environment"]["error"]["code"] == (
+        "unsafe_repository_environment"
+    )
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
+        "primary"
+    ]
+    assert payload["coverage"]["error"]["code"] == "generation_failed"
 
 
 def test_authoritative_pytest_observation_error_precedes_nested_evidence_error() -> None:

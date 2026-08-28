@@ -455,6 +455,8 @@ def coverage_json_environment(
     config_path: Path,
 ) -> dict[str, str]:
     environment = _scrub_coverage_environment(base_environment)
+    environment.pop("PYTHONPATH", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["COVERAGE_FILE"] = str(data_path)
     environment["COVERAGE_RCFILE"] = str(config_path)
     return environment

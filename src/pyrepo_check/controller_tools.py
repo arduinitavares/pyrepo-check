@@ -17,6 +17,10 @@ class _ExecutableIdentity:
     modified_ns: int
 
 
+class ControllerHelperIdentityError(OSError):
+    """Raised when a pinned controller helper no longer has its original identity."""
+
+
 @dataclass(frozen=True)
 class ControllerExecutable:
     path: Path
@@ -27,9 +31,13 @@ class ControllerExecutable:
         try:
             current = _identity(self.path.stat())
         except OSError as error:
-            raise OSError(f"controller helper identity changed: {self.path}") from error
+            raise ControllerHelperIdentityError(
+                f"controller helper identity changed: {self.path}"
+            ) from error
         if current != self.identity:
-            raise OSError(f"controller helper identity changed: {self.path}")
+            raise ControllerHelperIdentityError(
+                f"controller helper identity changed: {self.path}"
+            )
         return self.path
 
 

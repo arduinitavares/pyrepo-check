@@ -14,7 +14,10 @@ from types import MappingProxyType
 from typing import Literal, cast
 
 from pyrepo_check.artifact_safety import load_bounded_json, read_regular_file
-from pyrepo_check.controller_tools import ControllerExecutable
+from pyrepo_check.controller_tools import (
+    ControllerExecutable,
+    ControllerHelperIdentityError,
+)
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CheckExecutionFailure,
@@ -525,17 +528,24 @@ def probe_repository_dependencies(
         coverage=_coverage_requested(plan),
     )
     observations: list[DependencyObservation] = []
-    for dependency in dependencies:
-        process = execute_process(
-            role="dependency_probe",
-            command=(
+    for index, dependency in enumerate(dependencies):
+        try:
+            command = (
                 *locked_repository_prefix(prepared),
                 "-c",
                 DEPENDENCY_PROBE_SOURCE,
                 dependency.name,
                 dependency.module,
                 str(prepared.path),
-            ),
+            )
+        except ControllerHelperIdentityError:
+            observations.extend(
+                _unattempted_dependency(item) for item in dependencies[index:]
+            )
+            break
+        process = execute_process(
+            role="dependency_probe",
+            command=command,
             cwd=plan.root,
             capture_output=True,
             runner=runner,
@@ -551,20 +561,24 @@ def unobserved_repository_dependencies(
 ) -> tuple[DependencyObservation, ...]:
     """Describe selected dependencies whose probes could not be attempted."""
     return tuple(
-        DependencyObservation(
-            name=dependency.name,
-            module=dependency.module,
-            required=_required_range(dependency),
-            status="unobserved",
-            version=None,
-            origin=None,
-            process=None,
-            error=None,
-        )
+        _unattempted_dependency(dependency)
         for dependency in required_dependencies(
             tuple(check.name for check in plan.checks),
             coverage=_coverage_requested(plan),
         )
+    )
+
+
+def _unattempted_dependency(dependency: CheckDependency) -> DependencyObservation:
+    return DependencyObservation(
+        name=dependency.name,
+        module=dependency.module,
+        required=_required_range(dependency),
+        status="unobserved",
+        version=None,
+        origin=None,
+        process=None,
+        error=None,
     )
 
 
@@ -716,12 +730,12 @@ def prepare_repository_environment(
         )
     try:
         uv_executable = _controller_executable_path(controller_uv)
-    except OSError:
+    except ControllerHelperIdentityError:
         return _failed_preparation(
             plan,
             lock_status="unverified",
             error=EnvironmentFailureObservation(
-                code="uv_unavailable",
+                code="unsafe_repository_environment",
                 message="The pinned controller-owned uv executable changed.",
                 hint="Restore the controller uv installation and retry.",
             ),

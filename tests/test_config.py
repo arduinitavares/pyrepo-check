@@ -206,7 +206,17 @@ def test_rejects_test_shortcut_symlink_to_outside_project(tmp_path: Path) -> Non
         link.symlink_to(outside, target_is_directory=True)
     except OSError:
         pytest.skip()
-    _write_test_shortcuts(tmp_path, {"unit": ["tests/test_outside.py"]})
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.pyrepo-check]
+ruff_targets = ["."]
+bandit_targets = ["."]
+
+[tool.pyrepo-check.test-shortcuts]
+unit = ["tests/test_outside.py"]
+""".strip(),
+        encoding="utf-8",
+    )
 
     with pytest.raises(InvalidTestShortcutError):
         load_project_config(tmp_path)
@@ -325,6 +335,18 @@ def test_falls_back_to_current_directory_when_no_targets_exist(tmp_path: Path) -
 
     assert config.ruff_targets == (".",)
     assert config.bandit_targets == (".",)
+
+
+def test_rejects_auto_detected_target_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-default-target"
+    outside.mkdir()
+    try:
+        (tmp_path / "src").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip()
+
+    with pytest.raises(ValueError, match="target must remain beneath the project root"):
+        load_project_config(tmp_path)
 
 
 def test_loading_configuration_does_not_depend_on_uv_lock(tmp_path: Path) -> None:

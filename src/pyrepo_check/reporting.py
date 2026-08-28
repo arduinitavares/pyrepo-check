@@ -239,6 +239,26 @@ def _validate_run_report_v2(report: RunReportV2) -> None:
         environment.error is not None
         and environment.error.code != "repository_state_changed"
     )
+    if _unsafe_after_preparation_v2(environment):
+        unattempted_dependency_seen = False
+        for dependency in environment.dependencies:
+            unattempted = dependency.status == "unobserved" and dependency.process is None
+            if unattempted:
+                unattempted_dependency_seen = True
+            elif unattempted_dependency_seen:
+                _invalid("unattempted dependencies must follow every attempted probe")
+        unavailable_check_seen = False
+        for check in report.checks:
+            unavailable = (
+                check.error is not None
+                and check.error.code == "repository_environment_unavailable"
+                and not check.processes
+                and check.start_evidence is None
+            )
+            if unavailable:
+                unavailable_check_seen = True
+            elif unavailable_check_seen:
+                _invalid("helper identity loss requires an unavailable Check suffix")
     for dependency in environment.dependencies:
         _validate_dependency_evidence_v2(
             dependency,
@@ -381,13 +401,6 @@ def _validate_pre_execution_stage_v2(
     error = environment.error
     if error is None or error.code == "repository_state_changed":
         return
-    if any(
-        dependency.status != "unobserved"
-        or dependency.process is not None
-        or dependency.error is not None
-        for dependency in environment.dependencies
-    ):
-        _invalid("environment-wide failure cannot claim dependency probe evidence")
     core_roles = tuple(
         process.role
         for process in environment.processes
@@ -401,6 +414,13 @@ def _validate_pre_execution_stage_v2(
         (process for process in environment.processes if process.role == "environment_probe"),
         None,
     )
+    if not _unsafe_after_preparation_v2(environment) and any(
+        dependency.status != "unobserved"
+        or dependency.process is not None
+        or dependency.error is not None
+        for dependency in environment.dependencies
+    ):
+        _invalid("environment-wide failure cannot claim dependency probe evidence")
     if error.code == "repository_lock_missing":
         if (
             environment.lock.status != "missing"
@@ -481,6 +501,26 @@ def _validate_pre_execution_stage_v2(
         )
         if not (before_process or after_probe):
             _invalid("unsafe_repository_environment contradicts preparation stage")
+
+
+def _unsafe_after_preparation_v2(
+    environment: RepositoryEnvironmentEvidence,
+) -> bool:
+    error = environment.error
+    core_roles = tuple(
+        process.role
+        for process in environment.processes
+        if process.role != "repository_safety"
+    )
+    return (
+        error is not None
+        and error.code == "unsafe_repository_environment"
+        and core_roles == ("uv_version", "environment_probe")
+        and environment.lock.status == "current"
+        and environment.manager_version is not None
+        and environment.path is not None
+        and environment.python is not None
+    )
 
 
 def _expected_dependency_names_v2(selection: Selection) -> tuple[str, ...]:
@@ -635,7 +675,16 @@ def _validate_check_result_v2(
         environment.error is not None
         and environment.error.code != "repository_state_changed"
     )
-    if pre_execution_error:
+    synthesized_environment_unavailable = (
+        check.error is not None
+        and check.error.code == "repository_environment_unavailable"
+        and not check.processes
+        and start is None
+        and check.execution_environment is None
+        and check.analysis_python_authority is None
+    )
+    helper_identity_loss_after_preparation = _unsafe_after_preparation_v2(environment)
+    if pre_execution_error and not helper_identity_loss_after_preparation:
         if (
             check.error is None
             or check.error.code != "repository_environment_unavailable"
@@ -645,6 +694,17 @@ def _validate_check_result_v2(
             or check.analysis_python_authority is not None
         ):
             _invalid("environment failure requires synthesized unavailable Checks")
+        _validate_synthesized_pytest_v2(
+            check,
+            pytest_result,
+            coverage_result,
+            environment_failure=True,
+            dependency=None,
+            coverage_dependency=coverage_dependency,
+            coverage_requested=coverage_requested,
+        )
+        return
+    if helper_identity_loss_after_preparation and synthesized_environment_unavailable:
         _validate_synthesized_pytest_v2(
             check,
             pytest_result,
@@ -677,6 +737,9 @@ def _validate_check_result_v2(
             coverage_result,
             coverage_dependency,
             coverage_requested=coverage_requested,
+            helper_identity_loss_after_preparation=(
+                helper_identity_loss_after_preparation
+            ),
         )
         return
     elif dependency.status != "available":
@@ -710,6 +773,9 @@ def _validate_check_result_v2(
             coverage_result,
             coverage_dependency,
             coverage_requested=coverage_requested,
+            helper_identity_loss_after_preparation=(
+                helper_identity_loss_after_preparation
+            ),
         )
     else:
         _validate_ordinary_check_v2(check, primary)
@@ -881,6 +947,7 @@ def _validate_pytest_check_v2(
     coverage_dependency: DependencyEvidence | None,
     *,
     coverage_requested: bool,
+    helper_identity_loss_after_preparation: bool,
 ) -> None:
     if result is None:
         _invalid("pytest Check requires nested pytest evidence")
@@ -978,6 +1045,9 @@ def _validate_pytest_check_v2(
             coverage_dependency,
             requested=coverage_requested,
             instrumented=expected_instrumented,
+            helper_identity_loss_after_preparation=(
+                helper_identity_loss_after_preparation
+            ),
         )
         return
     if primary.outcome == "signaled":
@@ -997,6 +1067,9 @@ def _validate_pytest_check_v2(
             coverage_dependency,
             requested=coverage_requested,
             instrumented=expected_instrumented,
+            helper_identity_loss_after_preparation=(
+                helper_identity_loss_after_preparation
+            ),
         )
         return
     exit_code = cast(int, primary.exit_code)
@@ -1036,6 +1109,9 @@ def _validate_pytest_check_v2(
         coverage_dependency,
         requested=coverage_requested,
         instrumented=expected_instrumented,
+        helper_identity_loss_after_preparation=(
+            helper_identity_loss_after_preparation
+        ),
     )
 
 
@@ -1132,6 +1208,7 @@ def _validate_coverage_correlation_v2(
     *,
     requested: bool,
     instrumented: bool,
+    helper_identity_loss_after_preparation: bool,
 ) -> None:
     coverage_json = (
         check.processes[-1]
@@ -1207,6 +1284,11 @@ def _validate_coverage_correlation_v2(
         _invalid("Coverage error result requires a typed error")
     coverage_error = cast(CoverageError, coverage.error)
     if coverage_json is None:
+        if (
+            helper_identity_loss_after_preparation
+            and coverage_error.code == "generation_failed"
+        ):
+            return
         if coverage_error.code not in {
             "data_missing",
             "unexpected_parallel_data",

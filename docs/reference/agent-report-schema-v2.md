@@ -372,9 +372,17 @@ can establish Coverage evidence.
 When Coverage is available, its probed package is copied through bounded no-follow
 reads into the held run workspace before pytest. The `coverage_json` argv truthfully
 records an absolute pinned uv path and a staged JSON launcher; the staged package and
-launcher digests are revalidated immediately before that helper starts. Repository
-Coverage shadows and later mutation at the original `.venv` origin cannot supply the
-trusted JSON producer.
+launcher digests are revalidated immediately before that helper starts and again
+after it exits, before JSON is parsed. The helper has no `PYTHONPATH`, starts with
+`-S`, and cannot write bytecode into the staged tree. It puts staged Coverage first,
+keeps stdlib ahead of the appended original dependency root, and therefore retains
+Python 3.10 `tomli` plus normally installed Coverage plugins without running
+`sitecustomize` or `.pth` files. Editable/project-local plugins that require `.pth`
+startup are unavailable and produce typed `generation_failed` evidence. Repository or
+workspace stdlib/Coverage shadows, mutation of the original Coverage package tree,
+and mutation of the staged package or launcher cannot replace the staged Coverage
+producer. Installed transitive and plugin modules remain repository-owned and are not
+claimed byte-bound.
 
 | Coverage status | Required correlation |
 | --- | --- |
@@ -447,8 +455,11 @@ otherwise yields `passed`, and non-eligible valid evidence yields `guidance`.
   Otherwise a complete clean run is `passed`/`true`.
 - Public exit priority is error `2`, complete failure `1`, pass `0`; a positive child
   exit remains process evidence and does not replace this result.
-- Environment-wide failure accounts for every selected check as an error with no
-  primary/start/execution evidence. Selected pytest/Coverage get typed nested errors.
+- Environment-wide failure before preparation accounts for every selected check as
+  an error with no primary/start/execution evidence. Pinned controller-helper identity
+  loss after preparation preserves attempted dependency and Check evidence, followed
+  only by unattempted dependency/Check suffixes; selected pytest/Coverage retain typed
+  nested evidence for the phase reached.
 - `repository_environment.python` and `path` stay null until syntactically valid
   environment-probe evidence exists. Once observed they remain present even if a
   later safety/version error occurs.

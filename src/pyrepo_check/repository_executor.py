@@ -7,7 +7,11 @@ from dataclasses import dataclass, replace
 import secrets
 import time
 
-from pyrepo_check.controller_tools import ControllerTools, resolve_controller_tools
+from pyrepo_check.controller_tools import (
+    ControllerHelperIdentityError,
+    ControllerTools,
+    resolve_controller_tools,
+)
 from pyrepo_check.check_launcher import (
     CHECK_MODULE,
     StagedCheckLauncher,
@@ -131,11 +135,21 @@ def prepare_safe_repository(
             runner=runner,
             clock_ns=clock_ns,
         )
+        helper_identity_lost = any(
+            dependency.status == "unobserved" and dependency.process is None
+            for dependency in dependencies
+        )
         preparation = replace(
             preparation,
+            prepared=None if helper_identity_lost else preparation.prepared,
             observation=replace(
                 preparation.observation,
                 dependencies=dependencies,
+                error=(
+                    _controller_helper_identity_failure()
+                    if helper_identity_lost
+                    else preparation.observation.error
+                ),
             ),
         )
     else:
@@ -306,11 +320,11 @@ def execute_repository_plan(
                 dependency.name: dependency
                 for dependency in preparation.observation.dependencies
             }
-            for invocation in plan.checks:
+            for index, invocation in enumerate(plan.checks):
                 dependency = dependencies[dependency_name_for_check(invocation.name)]
-                if invocation.name == "pytest":
-                    checks.append(
-                        _execute_in_workspace(
+                try:
+                    if invocation.name == "pytest":
+                        observation = _execute_in_workspace(
                             invocation,
                             plan=plan,
                             prepared=preparation.prepared,
@@ -320,37 +334,65 @@ def execute_repository_plan(
                             clock_ns=clock_ns,
                             terminal_writer=progress_writer,
                         )
-                    )
-                    continue
-                if dependency.status != "available":
+                        checks.append(observation)
+                        if observation.environment_error is not None:
+                            repository_observation = replace(
+                                repository_observation,
+                                error=observation.environment_error,
+                            )
+                            checks.extend(
+                                _check_failure(
+                                    remaining,
+                                    "repository_environment_unavailable",
+                                    "Repository Environment is unavailable for this Check.",
+                                )
+                                for remaining in plan.checks[index + 1 :]
+                            )
+                            break
+                        continue
+                    if dependency.status != "available":
+                        checks.append(
+                            RepositoryCheckObservation(
+                                invocation=invocation,
+                                execution_environment=None,
+                                analysis_python_authority=None,
+                                start=None,
+                                processes=(),
+                                error=dependency.error
+                                or CheckExecutionFailure(
+                                    "check_dependency_unusable",
+                                    f"Repository dependency {dependency.name} is unavailable.",
+                                    None,
+                                ),
+                            )
+                        )
+                        continue
                     checks.append(
-                        RepositoryCheckObservation(
-                            invocation=invocation,
-                            execution_environment=None,
-                            analysis_python_authority=None,
-                            start=None,
-                            processes=(),
-                            error=dependency.error
-                            or CheckExecutionFailure(
-                                "check_dependency_unusable",
-                                f"Repository dependency {dependency.name} is unavailable.",
-                                None,
-                            ),
+                        _execute_in_workspace(
+                            invocation,
+                            plan=plan,
+                            prepared=preparation.prepared,
+                            pytest_dependency=None,
+                            coverage_dependency=None,
+                            runner=runner,
+                            clock_ns=clock_ns,
+                            terminal_writer=progress_writer,
                         )
                     )
-                    continue
-                checks.append(
-                    _execute_in_workspace(
-                        invocation,
-                        plan=plan,
-                        prepared=preparation.prepared,
-                        pytest_dependency=None,
-                        coverage_dependency=None,
-                        runner=runner,
-                        clock_ns=clock_ns,
-                        terminal_writer=progress_writer,
+                except ControllerHelperIdentityError:
+                    repository_observation = replace(
+                        repository_observation,
+                        error=_controller_helper_identity_failure(),
                     )
-                )
+                    checks.extend(
+                        _check_failure(
+                            remaining,
+                            "repository_environment_unavailable",
+                            "Repository Environment is unavailable for this Check.",
+                        )
+                        for remaining in plan.checks[index:]
+                    )
+                    break
     finally:
         if safe.baseline is not None:
             annotations_fix = next(
@@ -377,11 +419,7 @@ def execute_repository_plan(
                 try:
                     helper.path_for_use()
                 except OSError:
-                    helper_error = EnvironmentFailureObservation(
-                        code="unsafe_repository_environment",
-                        message="A pinned controller helper changed during execution.",
-                        hint="Restore the controller uv and Git installations, then retry.",
-                    )
+                    helper_error = _controller_helper_identity_failure()
                     break
             repository_observation = replace(
                 repository_observation,
@@ -426,6 +464,8 @@ def _execute_in_workspace(
 ) -> RepositoryCheckObservation:
     try:
         run_workspace = execution_workspace.create_run_workspace(prepared.root)
+    except ControllerHelperIdentityError:
+        raise
     except OSError as error:
         return _check_failure(
             invocation,
@@ -477,7 +517,10 @@ def _execute_in_workspace(
                 error=prepared_pytest.error,
                 pytest=prepared_pytest.pytest,
                 coverage=prepared_pytest.coverage,
+                environment_error=prepared_pytest.environment_error,
             )
+    except ControllerHelperIdentityError:
+        raise
     except OSError as error:
         diagnostics.append(f"workspace setup failed: {type(error).__name__}: {error}")
     finally:
@@ -559,4 +602,12 @@ def _check_failure(
         None,
         (),
         CheckExecutionFailure(code, message, None),
+    )
+
+
+def _controller_helper_identity_failure() -> EnvironmentFailureObservation:
+    return EnvironmentFailureObservation(
+        code="unsafe_repository_environment",
+        message="A pinned controller helper changed during execution.",
+        hint="Restore the controller uv and Git installations, then retry.",
     )

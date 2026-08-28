@@ -241,6 +241,7 @@ class RepositoryCheckObservation:
     error: CheckExecutionFailure | None
     pytest: PytestExecutionObservation | None = None
     coverage: CoverageExecutionObservation | None = None
+    environment_error: EnvironmentFailureObservation | None = None
 
 
 @dataclass(frozen=True)

@@ -23,6 +23,7 @@ _MAX_LAUNCHER_BYTES = 65_536
 @dataclass(frozen=True)
 class StagedCoverageDependency:
     module_root: Path
+    dependency_root: Path
     module_root_identity: tuple[int, int]
     package_name: str
     files: tuple[tuple[Path, FileDigest], ...]
@@ -102,6 +103,7 @@ def stage_coverage_dependency(
         raise AssertionError("Coverage module-root identity is unavailable")
     staged = StagedCoverageDependency(
         module_root=module_root,
+        dependency_root=normalized_origin.parent.parent,
         module_root_identity=module_root_identity,
         package_name=package_name,
         files=tuple(files),
@@ -166,9 +168,12 @@ def coverage_json_staged_command(
 ) -> tuple[str, ...]:
     return (
         *python_prefix,
+        "-S",
         str(staged.launcher_path),
         "--module-root",
         str(staged.module_root),
+        "--dependency-root",
+        str(staged.dependency_root),
         "--",
         *coverage_arguments,
     )

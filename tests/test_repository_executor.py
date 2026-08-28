@@ -9,7 +9,7 @@ import subprocess  # nosec B404
 
 import pytest
 
-from pyrepo_check.controller_tools import resolve_controller_tools
+from pyrepo_check.controller_tools import ControllerTools, resolve_controller_tools
 from pyrepo_check.config import ProjectConfig, load_project_config
 from pyrepo_check.execution import (
     DependencyObservation,
@@ -31,6 +31,7 @@ from pyrepo_check.planning import (
     plan_run,
 )
 from pyrepo_check.repository_executor import SafeRepositoryPreparation, prepare_safe_repository
+from pyrepo_check.reporting import build_run_report, serialize_json
 from pyrepo_check.repository_safety import (
     RepositoryStateSnapshot,
     RepositoryVerificationResult,
@@ -110,27 +111,35 @@ def _successful_runner(root: Path) -> RecordingRunner:
     )
 
 
-def test_pinned_uv_identity_replacement_stops_before_environment_probe(
-    tmp_path: Path,
-) -> None:
-    root = _write_locked_project(tmp_path / "repository")
-    helper_bin = tmp_path / "controller-bin"
+def _controller_tools(root: Path, helper_bin: Path) -> ControllerTools:
     helper_bin.mkdir()
     for name in ("uv", "git"):
         helper = helper_bin / name
         helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         helper.chmod(0o755)
-    tools = resolve_controller_tools(root, path=str(helper_bin))
+    return resolve_controller_tools(root, path=str(helper_bin))
+
+
+def _replace_controller_helper(helper_bin: Path, name: str) -> None:
+    replacement = helper_bin / f"replacement-{name}"
+    replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    replacement.chmod(0o755)
+    (helper_bin / name).unlink()
+    replacement.rename(helper_bin / name)
+
+
+def test_pinned_uv_identity_replacement_stops_before_environment_probe(
+    tmp_path: Path,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
     runner = _successful_runner(root)
 
     def replace_uv_after_version(call: test_support.RecordedCall) -> None:
         if len(runner.calls) != 5:
             return
-        replacement = tmp_path / "replacement-uv"
-        replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-        replacement.chmod(0o755)
-        (helper_bin / "uv").unlink()
-        replacement.rename(helper_bin / "uv")
+        _replace_controller_helper(helper_bin, "uv")
 
     runner.on_call = replace_uv_after_version
     result = prepare_safe_repository(
@@ -144,6 +153,110 @@ def test_pinned_uv_identity_replacement_stops_before_environment_probe(
     assert result.preparation.observation.error is not None
     assert result.preparation.observation.error.code == "unsafe_repository_environment"
     assert len(runner.calls) == 5
+
+
+def test_pinned_uv_identity_loss_before_first_use_is_unsafe_environment(
+    tmp_path: Path,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
+    _replace_controller_helper(helper_bin, "uv")
+
+    result = prepare_safe_repository(
+        focused_plan(root, "ruff"),
+        runner=_successful_runner(root),
+        clock_ns=monotonic_clock(),
+        controller_tools=tools,
+    )
+
+    assert result.preparation.prepared is None
+    assert result.preparation.observation.error is not None
+    assert result.preparation.observation.error.code == "unsafe_repository_environment"
+
+
+def test_pinned_uv_identity_loss_after_environment_probe_types_unattempted_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
+    runner = _successful_runner(root)
+
+    def replace_uv_after_environment_probe(call: test_support.RecordedCall) -> None:
+        if len(runner.calls) == 6:
+            _replace_controller_helper(helper_bin, "uv")
+
+    runner.on_call = replace_uv_after_environment_probe
+    monkeypatch.setattr(repository_executor, "resolve_controller_tools", lambda _root: tools)
+    plan = focused_plan(root, "ruff")
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    observation = result.repository_environment
+    assert observation.error is not None
+    assert observation.error.code == "unsafe_repository_environment"
+    assert observation.lock_status == "current"
+    assert observation.python is not None
+    assert [(item.status, item.process) for item in observation.dependencies] == [
+        ("unobserved", None)
+    ]
+    assert len(runner.calls) == 7
+    assert observation.processes[-1].role == "repository_tracked_snapshot"
+    assert result.checks[0].error is not None
+    assert result.checks[0].error.code == "repository_environment_unavailable"
+    payload = json.loads(serialize_json(build_run_report(root, plan, result)))
+    assert payload["repository_environment"]["error"]["code"] == (
+        "unsafe_repository_environment"
+    )
+    assert payload["repository_environment"]["dependencies"][0]["process"] is None
+
+
+def test_pinned_uv_identity_loss_between_dependency_probes_preserves_attempted_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
+    plan = _internal_plan(root, "ruff", "ty")
+    runner = _successful_runner(root)
+
+    def replace_uv_after_first_dependency(call: test_support.RecordedCall) -> None:
+        if len(runner.calls) == 7:
+            _replace_controller_helper(helper_bin, "uv")
+
+    runner.on_call = replace_uv_after_first_dependency
+    monkeypatch.setattr(repository_executor, "resolve_controller_tools", lambda _root: tools)
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    observation = result.repository_environment
+    assert observation.error is not None
+    assert observation.error.code == "unsafe_repository_environment"
+    ruff, ty = observation.dependencies
+    assert ruff.status == "available"
+    assert ruff.process is not None
+    assert ty.status == "unobserved"
+    assert ty.process is None
+    assert len(runner.calls) == 8
+    assert observation.processes[-1].role == "repository_tracked_snapshot"
+    assert all(
+        check.error is not None
+        and check.error.code == "repository_environment_unavailable"
+        for check in result.checks
+    )
+    payload = json.loads(serialize_json(build_run_report(root, plan, result)))
+    dependencies = payload["repository_environment"]["dependencies"]
+    assert dependencies[0]["process"]["role"] == "dependency_probe"
+    assert dependencies[1]["process"] is None
 
 
 def test_missing_lock_returns_canonical_failure_before_git_or_uv(tmp_path: Path) -> None:
@@ -483,6 +596,192 @@ def _safe_preparation(
         baseline,
         RepositoryPreparation(selected, observation),
     )
+
+
+def test_pinned_uv_identity_loss_before_check_spawn_types_unattempted_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
+    runner = _successful_runner(root)
+
+    def replace_uv_after_dependency_probe(call: test_support.RecordedCall) -> None:
+        if len(runner.calls) == 7:
+            _replace_controller_helper(helper_bin, "uv")
+
+    runner.on_call = replace_uv_after_dependency_probe
+    monkeypatch.setattr(repository_executor, "resolve_controller_tools", lambda _root: tools)
+    plan = focused_plan(root, "ruff")
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    environment = result.repository_environment
+    assert environment.error is not None
+    assert environment.error.code == "unsafe_repository_environment"
+    assert environment.dependencies[0].status == "available"
+    assert environment.dependencies[0].process is not None
+    check = result.checks[0]
+    assert check.processes == ()
+    assert check.start is None
+    assert check.error is not None
+    assert check.error.code == "repository_environment_unavailable"
+    assert not [call for call in runner.calls if "--evidence" in call.command]
+    payload = json.loads(serialize_json(build_run_report(root, plan, result)))
+    assert payload["checks"][0]["processes"] == []
+
+
+def test_pinned_uv_identity_loss_between_checks_preserves_only_completed_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
+    stage = _run_git(root, "ls-files", "--stage", "-z", "--", ".").stdout
+    environment_root = root / ".venv"
+    repository_python = environment_root / "bin/python-3.13.15"
+    repository_python.write_bytes(b"")
+    runner = launcher_aware_runner(
+        publish_valid_marker=True,
+        returncodes=(0,) * 10,
+        stdout=(
+            str(root).encode() + b"\n",
+            b"",
+            b"",
+            stage,
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 13, 15),
+                executable=repository_python,
+                environment_root=environment_root,
+            ),
+            _dependency_payload(
+                "ruff",
+                version="0.15.1",
+                origin=environment_root / "lib/python3.13/site-packages/ruff/__init__.py",
+            ),
+            _dependency_payload(
+                "ty",
+                version="0.0.35",
+                origin=environment_root / "lib/python3.13/site-packages/ty/__init__.py",
+            ),
+            b"",
+            stage,
+        ),
+    )
+    publish_marker = runner.on_call
+
+    def replace_uv_after_first_primary(call: test_support.RecordedCall) -> None:
+        if publish_marker is not None:
+            publish_marker(call)
+        if len(runner.calls) == 9:
+            _replace_controller_helper(helper_bin, "uv")
+
+    runner.on_call = replace_uv_after_first_primary
+    monkeypatch.setattr(repository_executor, "resolve_controller_tools", lambda _root: tools)
+    plan = _internal_plan(root, "ruff", "ty")
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert result.repository_environment.error is not None
+    assert result.repository_environment.error.code == "unsafe_repository_environment"
+    completed, unattempted = result.checks
+    assert [process.role for process in completed.processes] == ["primary"]
+    assert completed.start is not None
+    assert unattempted.processes == ()
+    assert unattempted.error is not None
+    assert unattempted.error.code == "repository_environment_unavailable"
+    payload = json.loads(serialize_json(build_run_report(root, plan, result)))
+    assert payload["checks"][0]["processes"][0]["role"] == "primary"
+    assert payload["checks"][1]["processes"] == []
+
+
+@pytest.mark.parametrize("helper_name", ("uv", "git"))
+def test_pinned_helper_identity_loss_before_final_verification_preserves_check_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    helper_name: str,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    tools = _controller_tools(root, helper_bin)
+    stage = _run_git(root, "ls-files", "--stage", "-z", "--", ".").stdout
+    environment_root = root / ".venv"
+    repository_python = environment_root / "bin/python-3.13.15"
+    repository_python.write_bytes(b"")
+    runner = launcher_aware_runner(
+        publish_valid_marker=True,
+        returncodes=(0,) * 9,
+        stdout=(
+            str(root).encode() + b"\n",
+            b"",
+            b"",
+            stage,
+            b"uv 0.10.12\n",
+            environment_probe_bytes(
+                version=(3, 13, 15),
+                executable=repository_python,
+                environment_root=environment_root,
+            ),
+            _dependency_payload(
+                "ruff",
+                version="0.15.1",
+                origin=environment_root / "lib/python3.13/site-packages/ruff/__init__.py",
+            ),
+            b"",
+            stage,
+        ),
+    )
+    publish_marker = runner.on_call
+
+    def replace_helper_after_primary(call: test_support.RecordedCall) -> None:
+        if publish_marker is not None:
+            publish_marker(call)
+        if len(runner.calls) == 8:
+            _replace_controller_helper(helper_bin, helper_name)
+
+    runner.on_call = replace_helper_after_primary
+    monkeypatch.setattr(repository_executor, "resolve_controller_tools", lambda _root: tools)
+    plan = focused_plan(root, "ruff")
+
+    result = repository_executor.execute_repository_plan(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    environment = result.repository_environment
+    assert environment.error is not None
+    assert environment.error.code == "unsafe_repository_environment"
+    check = result.checks[0]
+    assert check.start is not None
+    assert len(check.processes) == 1
+    assert check.processes[0].returncode == 0
+    final_verification = environment.processes[-1]
+    assert final_verification.role == "repository_tracked_snapshot"
+    if helper_name == "uv":
+        assert final_verification.spawn_error is None
+        assert environment.mutation_protection == "tracked_files"
+    else:
+        assert final_verification.spawn_error is not None
+        assert environment.mutation_protection == "unobserved"
+    payload = json.loads(serialize_json(build_run_report(root, plan, result)))
+    assert payload["schema_version"] == 2
+    assert payload["repository_environment"]["error"]["code"] == (
+        "unsafe_repository_environment"
+    )
+    assert payload["checks"][0]["processes"][0]["role"] == "primary"
+    assert payload["checks"][0]["start_evidence"] is not None
 
 
 def test_execute_repository_plan_keeps_dependency_errors_local_and_continues(

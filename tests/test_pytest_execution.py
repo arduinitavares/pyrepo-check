@@ -13,6 +13,7 @@ from typing import Callable, TypeVar, cast
 import pytest
 
 from pyrepo_check.check_launcher import stage_check_launcher
+from pyrepo_check.controller_tools import resolve_controller_tools
 from pyrepo_check.coverage_evidence import build_coverage_result
 from pyrepo_check.execution import (
     DependencyObservation,
@@ -150,6 +151,7 @@ class PreparedPytestRunner:
         pytest_version: str = "8.4.2",
         coverage_version: str = "7.15.2",
         after_primary: Callable[[tuple[str, ...]], None] | None = None,
+        on_call_start: Callable[[tuple[str, ...]], None] | None = None,
     ) -> None:
         self._runner = launcher_aware_runner(
             returncodes=returncodes,
@@ -160,6 +162,7 @@ class PreparedPytestRunner:
         self.pytest_version = pytest_version
         self.coverage_version = coverage_version
         self.after_primary = after_primary
+        self.on_call_start = on_call_start
         self.calls = self._runner.calls
 
     def __call__(
@@ -171,6 +174,8 @@ class PreparedPytestRunner:
         capture_output: bool = False,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+        if self.on_call_start is not None:
+            self.on_call_start(command)
         completed_process = self._runner(
             command,
             cwd=cwd,
@@ -720,10 +725,19 @@ def test_prepared_coverage_primary_and_json_use_their_bound_launchers(
         str(prepared.python.executable),
         "python",
     )
-    assert "coverage-json-launcher-" in Path(helper.command[6]).name
-    assert helper.command[7] == "--module-root"
-    assert "coverage-dependency-" in Path(helper.command[8]).name
-    assert helper.command[9:12] == ("--", "json", f"--rcfile={tmp_path / 'pyproject.toml'}")
+    assert helper.command[6] == "-S"
+    assert "coverage-json-launcher-" in Path(helper.command[7]).name
+    assert helper.command[8] == "--module-root"
+    assert "coverage-dependency-" in Path(helper.command[9]).name
+    assert helper.command[10:12] == (
+        "--dependency-root",
+        str(prepared.path / "site-packages"),
+    )
+    assert helper.command[12:15] == (
+        "--",
+        "json",
+        f"--rcfile={tmp_path / 'pyproject.toml'}",
+    )
     assert "--evidence" not in helper.command
     assert result.start is not None
     assert result.start.module == "coverage"
@@ -731,6 +745,9 @@ def test_prepared_coverage_primary_and_json_use_their_bound_launchers(
     assert result.pytest.artifact.state == "snapshot"
     assert result.coverage is not None
     assert result.coverage.artifact.state == "snapshot"
+    helper_call = next(call for call in runner.calls if call.command == helper.command)
+    assert helper_call.env is not None
+    assert "PYTHONPATH" not in helper_call.env
 
 
 def test_staged_coverage_mutation_after_pytest_fails_without_json_spawn(
@@ -756,6 +773,87 @@ def test_staged_coverage_mutation_after_pytest_fails_without_json_spawn(
     assert result.coverage is not None
     assert result.coverage.artifact.state == "generation_failed"
     assert "staged Coverage dependency changed" in str(result.coverage.artifact.diagnostic)
+
+
+def test_pinned_uv_identity_loss_before_coverage_helper_preserves_primary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    helper_bin = tmp_path / "controller-bin"
+    helper_bin.mkdir()
+    for name in ("uv", "git"):
+        helper = helper_bin / name
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o755)
+    tools = resolve_controller_tools(root, path=str(helper_bin))
+    assert tools.uv is not None
+    prepared = replace(
+        prepared_repository(root, python=(3, 12, 11)),
+        controller_uv=tools.uv,
+    )
+
+    def replace_uv(_command: tuple[str, ...]) -> None:
+        replacement = tmp_path / "replacement-uv"
+        replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        replacement.chmod(0o755)
+        (helper_bin / "uv").unlink()
+        replacement.rename(helper_bin / "uv")
+
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=PreparedPytestRunner(after_primary=replace_uv),
+    )
+
+    assert [process.role for process in result.processes] == ["primary"]
+    assert result.start is not None
+    assert result.environment_error is not None
+    assert result.environment_error.code == "unsafe_repository_environment"
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "generation_failed"
+
+
+@pytest.mark.parametrize("mutated_entry", ("package", "launcher"))
+def test_staged_coverage_mutation_as_json_runner_starts_discards_generated_json(
+    tmp_path: Path,
+    mutated_entry: str,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+
+    def mutate_staged_dependency(command: tuple[str, ...]) -> None:
+        if not any("coverage-json-launcher-" in argument for argument in command):
+            return
+        launcher = next(
+            Path(argument)
+            for argument in command
+            if "coverage-json-launcher-" in argument
+        )
+        if mutated_entry == "launcher":
+            launcher.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            return
+        module_root = Path(command[command.index("--module-root") + 1])
+        (module_root / "coverage/__init__.py").write_text(
+            "mutated = True\n",
+            encoding="utf-8",
+        )
+
+    runner = PreparedPytestRunner(on_call_start=mutate_staged_dependency)
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert [process.role for process in result.processes] == ["primary", "coverage_json"]
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "unexpected_parallel_data"
+    assert result.coverage.artifact.content is None
+    assert "staged Coverage" in str(result.coverage.artifact.diagnostic)
 
 
 def test_missing_pytest_prevents_both_pytest_and_coverage(

@@ -26,6 +26,7 @@ from pyrepo_check.check_launcher import (
     ensure_start_marker_absent,
     validate_start_marker,
 )
+from pyrepo_check.controller_tools import ControllerHelperIdentityError
 from pyrepo_check.coverage_evidence import coverage_gate_policy
 from pyrepo_check.coverage_dependency import (
     StagedCoverageDependency,
@@ -38,6 +39,7 @@ from pyrepo_check.execution import (
     CheckModule,
     CheckStartObservation,
     DependencyObservation,
+    EnvironmentFailureObservation,
     ExecutedCheck,
     ExecutedProcess,
     PreparedRepositoryEnvironment,
@@ -133,6 +135,7 @@ class PreparedPytestExecution:
     error: CheckExecutionFailure | None
     pytest: PytestExecutionObservation | None
     coverage: CoverageExecutionObservation | None
+    environment_error: EnvironmentFailureObservation | None = None
 
 
 def execute_prepared_pytest(
@@ -333,13 +336,38 @@ def execute_prepared_pytest(
                 if staged_coverage is None:
                     raise AssertionError("Coverage dependency staging is unavailable")
                 policy = coverage_gate_policy(plan, pytest_result, True)
+                try:
+                    python_prefix = locked_repository_prefix(prepared)
+                except ControllerHelperIdentityError:
+                    return PreparedPytestExecution(
+                        processes=tuple(processes),
+                        start=start,
+                        error=execution_error,
+                        pytest=pytest_observation,
+                        coverage=replace(
+                            coverage,
+                            artifact=CoverageArtifactObservation(
+                                "generation_failed",
+                                None,
+                                "Coverage JSON was not attempted because the pinned "
+                                "controller uv executable changed.",
+                            ),
+                        ),
+                        environment_error=EnvironmentFailureObservation(
+                            code="unsafe_repository_environment",
+                            message="A pinned controller helper changed during execution.",
+                            hint=(
+                                "Restore the controller uv and Git installations, then retry."
+                            ),
+                        ),
+                    )
                 coverage_artifact, coverage_process, close_error = _generate_coverage_json(
                     verified_run=workspace,
                     plan=plan,
                     coverage_plan=coverage_plan,
                     check=check,
                     base_environment=primary_environment,
-                    python_prefix=locked_repository_prefix(prepared),
+                    python_prefix=python_prefix,
                     staged_coverage=staged_coverage,
                     force_fail_under_zero=(
                         policy.force_fail_under_zero or reserved_pytest_exit
@@ -458,6 +486,15 @@ def _generate_coverage_json(
                     ),
                 )
 
+                staged_dependency_error: str | None = None
+                try:
+                    ensure_staged_coverage_dependency(
+                        staged_coverage,
+                        workspace=verified_run,
+                    )
+                except OSError as error:
+                    staged_dependency_error = f"{type(error).__name__}: {error}"
+
                 endpoint_error: str | None = None
                 try:
                     verified_run.verify("after coverage JSON generation")
@@ -476,6 +513,13 @@ def _generate_coverage_json(
                         "terminated_by_signal",
                         None,
                         f"coverage JSON process terminated by signal {-process.returncode}",
+                    )
+                elif staged_dependency_error is not None:
+                    coverage_artifact = CoverageArtifactObservation(
+                        "unexpected_parallel_data",
+                        None,
+                        "Coverage dependency post-execution validation failed: "
+                        f"{staged_dependency_error}",
                     )
                 elif endpoint_error is not None:
                     coverage_artifact = CoverageArtifactObservation(

@@ -43,7 +43,7 @@ from pyrepo_check.pytest_evidence import (
     SpecialTestOutcome,
     build_pytest_result,
 )
-from pyrepo_check.reporting import ReportingError, validate_report_v2
+from pyrepo_check.reporting import ReportingError, serialize_json, validate_report_v2
 from pyrepo_check.reporting_schema import (
     Advisory,
     AnalysisPythonAuthorityEvidence,
@@ -2630,6 +2630,96 @@ def test_schema_v2_repository_integrity_state_families_are_exact() -> None:
     for invalid in malformed:
         with pytest.raises(ReportingError):
             validate_report_v2(invalid)
+
+
+def test_schema_v2_serializes_post_execution_helper_identity_loss_truthfully() -> None:
+    successful = valid_run_report()
+    unsafe = replace(
+        successful,
+        overall_status="error",
+        complete=False,
+        repository_environment=replace(
+            successful.repository_environment,
+            error=EnvironmentError(
+                "unsafe_repository_environment",
+                "A pinned controller helper changed during execution.",
+                "Restore the controller uv and Git installations, then retry.",
+            ),
+        ),
+    )
+
+    payload = json.loads(serialize_json(unsafe))
+
+    assert payload == json.loads(json.dumps(asdict(unsafe)))
+    assert payload["schema_version"] == 2
+    assert payload["repository_environment"]["error"]["code"] == (
+        "unsafe_repository_environment"
+    )
+    assert payload["repository_environment"]["dependencies"][0]["status"] == "available"
+    assert payload["checks"][0]["processes"][0]["role"] == "primary"
+    assert payload["checks"][0]["start_evidence"] is not None
+
+
+def test_schema_v2_accepts_zero_exit_coverage_helper_with_post_run_integrity_loss() -> None:
+    report = pytest_run_report(coverage="available")
+    coverage = report.coverage
+    assert coverage is not None
+    corrupted = replace(
+        report,
+        overall_status="error",
+        complete=False,
+        coverage=replace(
+            coverage,
+            status="error",
+            scope="partial",
+            evidence_complete=False,
+            gate_eligible=False,
+            threshold=replace(
+                coverage.threshold,
+                evaluated=False,
+                passed=None,
+                skipped_reason="evidence_error",
+            ),
+            totals=None,
+            files=(),
+            error=CoverageError(
+                "unexpected_parallel_data",
+                "staged Coverage dependency changed after helper execution",
+            ),
+        ),
+    )
+
+    payload = json.loads(serialize_json(corrupted))
+
+    assert payload["coverage"]["error"]["code"] == "unexpected_parallel_data"
+    assert payload["checks"][0]["processes"][-1]["exit_code"] == 0
+
+
+def test_schema_v2_accepts_unsafe_helper_loss_after_pytest_without_json_process() -> None:
+    report = pytest_run_report(coverage="helper_failure")
+    check = report.checks[0]
+    unsafe = replace(
+        report,
+        repository_environment=replace(
+            report.repository_environment,
+            error=EnvironmentError(
+                "unsafe_repository_environment",
+                "A pinned controller helper changed during execution.",
+                "Restore the controller uv and Git installations, then retry.",
+            ),
+        ),
+        checks=(replace(check, processes=check.processes[:-1]),),
+    )
+
+    payload = json.loads(serialize_json(unsafe))
+
+    assert payload["repository_environment"]["error"]["code"] == (
+        "unsafe_repository_environment"
+    )
+    assert [process["role"] for process in payload["checks"][0]["processes"]] == [
+        "primary"
+    ]
+    assert payload["coverage"]["error"]["code"] == "generation_failed"
 
 
 def test_schema_v2_successful_machine_evidence_requires_complete_capture() -> None:

@@ -262,8 +262,16 @@ def _configured_targets(
                 raise ValueError(f"{key} contains an invalid target {target!r}: {error}") from error
         return tuple(validated)
 
-    detected = tuple(path for path in default_candidates if (root / path).exists())
-    return detected or (".",)
+    detected: list[str] = []
+    for target in default_candidates:
+        try:
+            (root / target).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass
+        detected.append(validate_project_target(root, target))
+    return tuple(detected) or (validate_project_target(root, "."),)
 
 
 def _configured_test_shortcuts(
