@@ -650,15 +650,13 @@ def test_unsafe_storage_stops_before_uv_and_does_not_expose_secret(
     assert secret not in repr(preparation.observation)
 
 
-@pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="uv's legacy native storage path is platform-specific",
-)
 @pytest.mark.parametrize("storage_kind", ("cache", "python_install"))
 def test_existing_macos_legacy_uv_storage_alias_is_rejected(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     storage_kind: str,
 ) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
     root = tmp_path / "project"
     root.mkdir()
     home = tmp_path / "home"
