@@ -216,7 +216,7 @@ while time.monotonic() < deadline:
     elif mode == "truncate":
         artifact.write_bytes(b"{")
     else:
-        payload["session"]["exit_code"] = 99
+        payload["session"]["starts"] = 2
         artifact.write_text(json.dumps(payload), encoding="utf-8")
     break
 """
@@ -256,6 +256,16 @@ def test_missing_environment_is_rebuilt_from_the_current_lock(
     )
     assert all(check["execution_environment"] == "repository" for check in report["checks"])
     assert all(check["start_evidence"] is not None for check in report["checks"])
+    support.assert_repository_startup_parity(
+        repository,
+        workspace=tmp_path / "plain-pytest-startup",
+        coverage=False,
+    )
+    support.assert_repository_startup_parity(
+        repository,
+        workspace=tmp_path / "coverage-pytest-startup",
+        coverage=True,
+    )
 
 
 def test_missing_lock_stops_before_uv_or_any_check(tmp_path: Path) -> None:
@@ -441,13 +451,22 @@ def test_unmerged_index_stops_before_uv_without_a_merge_race(tmp_path: Path) -> 
         for stage, object_id in enumerate(object_ids, start=1)
     ).encode()
     _run_git(repository, "update-index", "--index-info", input_bytes=index_records)
-    assert _run_git(repository, "ls-files", "-u").stdout
+    unmerged_entries: dict[int, str] = {}
+    for line in _run_git(repository, "ls-files", "-u").stdout.decode().splitlines():
+        metadata, path = line.split("\t", maxsplit=1)
+        mode, object_id, stage = metadata.split()
+        assert mode == "100644"
+        assert path == "conflict.py"
+        unmerged_entries[int(stage)] = object_id
+    assert unmerged_entries == {
+        stage: object_id for stage, object_id in enumerate(object_ids, start=1)
+    }
 
     completed, report = _run_repository_json(repository, "ty")
 
     assert completed.returncode == 2
     assert report["repository_environment"]["error"]["code"] == "unsafe_repository_environment"
-    assert set(_repository_process_roles(report)) == {"repository_safety"}
+    assert _repository_process_roles(report) == ["repository_safety"] * 4
     _assert_no_uv_or_check_start(report)
 
 
@@ -642,14 +661,19 @@ def test_repository_controlled_pytest_artifact_attacks_are_rejected(
 
     completed, report = _run_repository_json(repository, "pytest", environment=environment)
 
+    repository_environment = report["repository_environment"]
     check = report["checks"][0]
     primary = check["processes"][0]
+    pytest_result = report["pytest"]
     assert completed.returncode == 2
+    assert repository_environment["error"] is None
     assert check["status"] == "error"
+    assert check["error"]["code"] == "pytest_evidence_error"
     assert check["execution_environment"] == "repository"
     assert check["start_evidence"] is not None
-    assert report["pytest"]["status"] == "error"
-    assert report["pytest"]["error"] is not None
+    assert primary["exit_code"] == 0
+    assert pytest_result["status"] == "error"
+    assert pytest_result["error"]["code"] == "artifact_invalid"
     assert primary["stdout"]["text"]
     assert len(primary["stdout"]["text"].encode()) <= 1_048_576
 

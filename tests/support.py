@@ -129,6 +129,7 @@ def classify(value: int) -> str:
         '''"""Repository-owned tests and environment assertions."""
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -154,6 +155,25 @@ def test_repository_process_has_native_isolated_startup() -> None:
     assert spec is not None
     assert sys.orig_argv[1] == "-m"
     assert sys.orig_argv[2] in {"coverage", "pytest"}
+    witness = os.environ.get("PYREPO_CHECK_NATIVE_STARTUP_WITNESS")
+    if witness is not None:
+        Path(witness).write_text(
+            json.dumps(
+                {
+                    "path0": sys.path[0],
+                    "argv": sys.argv,
+                    "orig_argv": sys.orig_argv,
+                    "spec": {
+                        "name": spec.name,
+                        "parent": spec.parent,
+                        "origin": spec.origin,
+                        "has_location": spec.has_location,
+                    },
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
 ''',
         encoding="utf-8",
     )
@@ -187,6 +207,75 @@ def test_repository_process_has_native_isolated_startup() -> None:
         check=True,
     )
     return repository
+
+
+def assert_repository_startup_parity(
+    repository: Path,
+    *,
+    workspace: Path,
+    coverage: bool,
+) -> None:
+    """Compare real native and standalone-launcher startup inside a repository."""
+    workspace.mkdir()
+    repository_python = repository / ".venv" / "bin" / "python"
+    launcher = Path(__file__).parents[1] / "src" / "pyrepo_check" / "_check_launcher.py"
+    coverage_data = workspace / ".coverage"
+    module = "coverage" if coverage else "pytest"
+    module_arguments = (
+        (
+            "run",
+            f"--rcfile={repository / 'pyproject.toml'}",
+            f"--data-file={coverage_data}",
+            "-m",
+            "pytest",
+            "-q",
+        )
+        if coverage
+        else ("-q",)
+    )
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment["PYREPO_CHECK_CONTROLLER_PATH_SENTINEL"] = str(
+        workspace / "controller-pythonpath"
+    )
+    snapshots: dict[str, dict[str, object]] = {}
+    for invocation in ("direct", "launched"):
+        witness = workspace / f"{invocation}.json"
+        environment["PYREPO_CHECK_NATIVE_STARTUP_WITNESS"] = str(witness)
+        if invocation == "direct":
+            command = (str(repository_python), "-m", module, *module_arguments)
+        else:
+            coverage_data.unlink(missing_ok=True)
+            command = (
+                str(repository_python),
+                str(launcher),
+                "--evidence",
+                str(workspace / "start.json"),
+                "--check",
+                "pytest",
+                "--module",
+                module,
+                "--",
+                *module_arguments,
+            )
+        completed = subprocess.run(  # nosec B603
+            command,
+            cwd=repository,
+            env=environment,
+            check=False,
+            capture_output=True,
+        )
+        assert completed.returncode == 0, completed.stderr.decode()
+        snapshots[invocation] = cast(
+            dict[str, object], json.loads(witness.read_text(encoding="utf-8"))
+        )
+
+    direct = snapshots["direct"]
+    launched = snapshots["launched"]
+    assert launched["path0"] == direct["path0"]
+    assert launched["argv"] == direct["argv"]
+    assert launched["orig_argv"] == direct["orig_argv"]
+    assert launched["spec"] == direct["spec"]
 
 
 @dataclass(frozen=True)
