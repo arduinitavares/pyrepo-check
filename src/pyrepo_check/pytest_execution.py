@@ -27,6 +27,12 @@ from pyrepo_check.check_launcher import (
     validate_start_marker,
 )
 from pyrepo_check.coverage_evidence import coverage_gate_policy
+from pyrepo_check.coverage_dependency import (
+    StagedCoverageDependency,
+    coverage_json_staged_command,
+    ensure_staged_coverage_dependency,
+    stage_coverage_dependency,
+)
 from pyrepo_check.execution import (
     CheckExecutionFailure,
     CheckModule,
@@ -204,6 +210,29 @@ def execute_prepared_pytest(
         and coverage is not None
         and coverage.preflight.classification == "supported"
     )
+    staged_coverage: StagedCoverageDependency | None = None
+    if instrumented:
+        if coverage_dependency is None or coverage_dependency.origin is None:
+            raise AssertionError("supported Coverage dependency has no origin")
+        try:
+            staged_coverage = stage_coverage_dependency(
+                origin=Path(coverage_dependency.origin),
+                environment_root=prepared.path,
+                workspace=workspace,
+            )
+        except OSError as error:
+            diagnostic = f"Coverage dependency staging failed: {type(error).__name__}: {error}"
+            return PreparedPytestExecution(
+                processes=(),
+                start=None,
+                error=CheckExecutionFailure("pytest_evidence_error", diagnostic, None),
+                pytest=PytestExecutionObservation(
+                    PytestPreflightObservation("not_started", None, diagnostic),
+                    artifact,
+                    None,
+                ),
+                coverage=invalid_coverage_observation(diagnostic),
+            )
     if instrumented:
         if coverage_plan is None:
             raise AssertionError("instrumented pytest requires a Coverage execution plan")
@@ -301,6 +330,8 @@ def execute_prepared_pytest(
             else:
                 if coverage_plan is None:
                     raise AssertionError("coverage plan is unavailable")
+                if staged_coverage is None:
+                    raise AssertionError("Coverage dependency staging is unavailable")
                 policy = coverage_gate_policy(plan, pytest_result, True)
                 coverage_artifact, coverage_process, close_error = _generate_coverage_json(
                     verified_run=workspace,
@@ -309,6 +340,7 @@ def execute_prepared_pytest(
                     check=check,
                     base_environment=primary_environment,
                     python_prefix=locked_repository_prefix(prepared),
+                    staged_coverage=staged_coverage,
                     force_fail_under_zero=(
                         policy.force_fail_under_zero or reserved_pytest_exit
                     ),
@@ -352,6 +384,7 @@ def _generate_coverage_json(
     check: CheckInvocation,
     base_environment: Mapping[str, str],
     python_prefix: tuple[str, ...],
+    staged_coverage: StagedCoverageDependency,
     force_fail_under_zero: bool,
     retain_threshold_exit_two: bool,
     runner: ProcessRunner | None,
@@ -386,61 +419,80 @@ def _generate_coverage_json(
             )
         else:
             config_path = coverage_plan.config_path.resolve()
-            process = execute_process(
-                role="coverage_json",
-                command=coverage_json_command(
-                    python_prefix=python_prefix,
-                    config_path=config_path,
-                    data_path=snapshot.data_path,
-                    output_path=verified_run.workspace.path / "coverage.json",
-                    force_fail_under_zero=force_fail_under_zero,
-                ),
-                cwd=plan.root,
-                capture_output=True,
-                runner=runner,
-                clock_ns=clock_ns,
-                environment=coverage_json_environment(
-                    base_environment,
-                    data_path=snapshot.data_path,
-                    config_path=config_path,
-                ),
+            raw_command = coverage_json_command(
+                python_prefix=(),
+                config_path=config_path,
+                data_path=snapshot.data_path,
+                output_path=verified_run.workspace.path / "coverage.json",
+                force_fail_under_zero=force_fail_under_zero,
             )
-
-            endpoint_error: str | None = None
+            if raw_command[:2] != ("-m", "coverage"):
+                raise AssertionError("Coverage JSON command prefix is invalid")
             try:
-                verified_run.verify("after coverage JSON generation")
-                verify_coverage_data_snapshot(snapshot)
-            except (CoverageDataError, OSError) as error:
-                endpoint_error = f"{type(error).__name__}: {error}"
-
-            if process.spawn_error is not None or process.returncode is None:
-                coverage_artifact = CoverageArtifactObservation(
-                    "spawn_failed",
-                    None,
-                    process.spawn_error or "coverage JSON process has no exit code",
+                ensure_staged_coverage_dependency(
+                    staged_coverage,
+                    workspace=verified_run,
                 )
-            elif process.returncode < 0:
-                coverage_artifact = CoverageArtifactObservation(
-                    "terminated_by_signal",
-                    None,
-                    f"coverage JSON process terminated by signal {-process.returncode}",
-                )
-            elif endpoint_error is not None:
-                coverage_artifact = CoverageArtifactObservation(
-                    "unexpected_parallel_data",
-                    None,
-                    endpoint_error,
-                )
-            elif process.returncode != 0 and not (
-                process.returncode == 2 and retain_threshold_exit_two
-            ):
+            except OSError as error:
                 coverage_artifact = CoverageArtifactObservation(
                     "generation_failed",
                     None,
-                    f"coverage JSON generation exited with code {process.returncode}",
+                    f"Coverage dependency validation failed: {type(error).__name__}: {error}",
                 )
             else:
-                coverage_artifact = snapshot_coverage_json(snapshot)
+                process = execute_process(
+                    role="coverage_json",
+                    command=coverage_json_staged_command(
+                        python_prefix=python_prefix,
+                        staged=staged_coverage,
+                        coverage_arguments=raw_command[2:],
+                    ),
+                    cwd=plan.root,
+                    capture_output=True,
+                    runner=runner,
+                    clock_ns=clock_ns,
+                    environment=coverage_json_environment(
+                        base_environment,
+                        data_path=snapshot.data_path,
+                        config_path=config_path,
+                    ),
+                )
+
+                endpoint_error: str | None = None
+                try:
+                    verified_run.verify("after coverage JSON generation")
+                    verify_coverage_data_snapshot(snapshot)
+                except (CoverageDataError, OSError) as error:
+                    endpoint_error = f"{type(error).__name__}: {error}"
+
+                if process.spawn_error is not None or process.returncode is None:
+                    coverage_artifact = CoverageArtifactObservation(
+                        "spawn_failed",
+                        None,
+                        process.spawn_error or "coverage JSON process has no exit code",
+                    )
+                elif process.returncode < 0:
+                    coverage_artifact = CoverageArtifactObservation(
+                        "terminated_by_signal",
+                        None,
+                        f"coverage JSON process terminated by signal {-process.returncode}",
+                    )
+                elif endpoint_error is not None:
+                    coverage_artifact = CoverageArtifactObservation(
+                        "unexpected_parallel_data",
+                        None,
+                        endpoint_error,
+                    )
+                elif process.returncode != 0 and not (
+                    process.returncode == 2 and retain_threshold_exit_two
+                ):
+                    coverage_artifact = CoverageArtifactObservation(
+                        "generation_failed",
+                        None,
+                        f"coverage JSON generation exited with code {process.returncode}",
+                    )
+                else:
+                    coverage_artifact = snapshot_coverage_json(snapshot)
     finally:
         if snapshot is not None:
             try:

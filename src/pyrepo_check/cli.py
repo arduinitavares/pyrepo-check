@@ -76,7 +76,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "checks",
         nargs="*",
-        help=f"Optional check names and target paths. Checks: {CHECK_HELP}.",
+        help=(
+            "Optional check names and existing project-relative target paths. "
+            f"Checks: {CHECK_HELP}. annotations-fix must be selected alone."
+        ),
     )
     return parser.parse_intermixed_args(argv)
 
@@ -141,7 +144,7 @@ def main(
                 config.root,
                 request.positionals,
             ),
-            pyproject_exists=(config.root / "pyproject.toml").is_file(),
+            pyproject_exists=config.pyproject_sha256 is not None,
         )
         plan = plan_run(request, config, facts)
     except PlanningFailure as error:

@@ -68,6 +68,9 @@ Canonical commands:
 - Mechanical annotation fixes, only when source mutation is authorized:
   `pyrepo-check annotations-fix src/`
 
+Select `annotations-fix` alone. All direct targets must be existing, relative paths
+contained by the project; pytest node selectors validate the path before `::`.
+
 JSON interpretation:
 - Require `schema_version == 2` for this release.
 - Inspect `tool_environment` and `repository_environment`, including exact Python,

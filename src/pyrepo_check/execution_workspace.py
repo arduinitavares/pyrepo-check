@@ -1022,7 +1022,7 @@ def _effective_uid() -> int:
     return cast(Callable[[], int], get_effective_uid)()
 
 
-def _cleanup_diagnostic(observation: CleanupObservation) -> str:
+def format_cleanup_diagnostic(observation: CleanupObservation) -> str:
     diagnostic = observation.message
     if observation.retained_run_path is not None:
         diagnostic = (

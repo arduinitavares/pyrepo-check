@@ -22,7 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def _launcher_module_and_arguments(process: dict[str, Any]) -> tuple[str, list[str]]:
     argv = process["argv"]
-    assert argv[:4] == ["uv", "run", "--locked", "--python"]
+    assert Path(argv[0]).is_absolute()
+    assert Path(argv[0]).name == "uv"
+    assert argv[1:4] == ["run", "--locked", "--python"]
     assert argv[5] == argv[4]
     module_index = argv.index("--module")
     separator_index = argv.index("--", module_index)
@@ -1629,8 +1631,10 @@ def test_help_surface_is_unchanged(
 Run Python repository quality checks.
 
 positional arguments:
-  checks                Optional check names and target paths. Checks: ruff,
-                        annotations, annotations-fix, ty, bandit, pytest.
+  checks                Optional check names and existing project-relative
+                        target paths. Checks: ruff, annotations, annotations-
+                        fix, ty, bandit, pytest. annotations-fix must be
+                        selected alone.
 
 options:
   -h, --help            show this help message and exit

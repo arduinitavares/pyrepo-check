@@ -9,7 +9,10 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Literal
+import subprocess  # nosec B404
+from typing import Literal, cast
+
+from pyrepo_check.controller_tools import ControllerExecutable
 
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
@@ -75,17 +78,39 @@ def capture_repository_baseline(
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
     controller_environment: Mapping[str, str] | None = None,
+    expected_pyproject_sha256: str | None = None,
+    git_executable: ControllerExecutable | str | None = "git",
 ) -> RepositoryBaselineResult:
     """Capture protected files and, for Git worktrees, every tracked entry."""
     project_root = _normalized_absolute(root)
     venv_error = _inspect_venv(project_root)
     if venv_error is not None:
         return RepositoryBaselineResult(None, (), venv_error)
+    try:
+        protected = _capture_protected_files(project_root)
+    except _SnapshotError:
+        return _baseline_failure([], "Protected files could not be safely captured.")
+    if expected_pyproject_sha256 is not None and (
+        protected[0].kind != "regular"
+        or protected[0].sha256 != expected_pyproject_sha256
+    ):
+        return _baseline_failure(
+            [],
+            "pyproject.toml changed after configuration was parsed.",
+        )
 
     environment = _sanitized_git_environment(
         os.environ if controller_environment is None else controller_environment
     )
     processes: list[ExecutedProcess] = []
+    git_marker = any(
+        _lexically_exists(directory / ".git")
+        for directory in (project_root, *project_root.parents)
+    )
+    if git_executable is None:
+        if git_marker:
+            return _baseline_failure([], "Git metadata exists but Git is unavailable.")
+        return _capture_non_git_baseline(project_root, [], protected=protected)
     root_process = _git_process(
         role="repository_git_root",
         root=project_root,
@@ -93,23 +118,20 @@ def capture_repository_baseline(
         environment=environment,
         runner=runner,
         clock_ns=clock_ns,
+        git_executable=git_executable,
     )
     processes.append(root_process)
-    git_marker = any(
-        _lexically_exists(directory / ".git")
-        for directory in (project_root, *project_root.parents)
-    )
     if root_process.spawn_error is not None or root_process.returncode is None:
         if git_marker:
             return _baseline_failure(processes, "Git metadata exists but Git is unavailable.")
-        return _capture_non_git_baseline(project_root, processes)
+        return _capture_non_git_baseline(project_root, processes, protected=protected)
     if root_process.returncode != 0:
         if git_marker:
             return _baseline_failure(
                 processes,
                 "Git metadata exists but the repository root could not be inspected.",
             )
-        return _capture_non_git_baseline(project_root, processes)
+        return _capture_non_git_baseline(project_root, processes, protected=protected)
 
     git_root = _parse_git_root(root_process)
     if git_root is None or not (
@@ -124,6 +146,7 @@ def capture_repository_baseline(
         environment=environment,
         runner=runner,
         clock_ns=clock_ns,
+        git_executable=git_executable,
     )
     processes.append(tracked_venv)
     tracked_output = _complete_stdout(tracked_venv)
@@ -145,6 +168,7 @@ def capture_repository_baseline(
         environment=environment,
         runner=runner,
         clock_ns=clock_ns,
+        git_executable=git_executable,
     )
     processes.append(ignored_venv)
     if ignored_venv.spawn_error is not None or ignored_venv.returncode != 0:
@@ -155,11 +179,11 @@ def capture_repository_baseline(
         environment=environment,
         runner=runner,
         clock_ns=clock_ns,
+        git_executable=git_executable,
     )
     processes.append(stage_process)
     try:
         entries, has_unmerged = _parse_tracked_entries(project_root, stage_process)
-        protected = _capture_protected_files(project_root)
     except _SnapshotError:
         return _baseline_failure(processes, "Repository state could not be safely captured.")
     if has_unmerged:
@@ -183,9 +207,10 @@ def capture_repository_baseline(
 def verify_repository_state(
     snapshot: RepositoryStateSnapshot,
     *,
-    annotations_fix_selected: bool,
+    annotations_fix_targets: tuple[str, ...] | None,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    git_executable: ControllerExecutable | str | None = "git",
 ) -> RepositoryVerificationResult:
     """Rebuild the observable state and report any post-baseline mutation."""
     project_root = _snapshot_project_root(snapshot)
@@ -222,12 +247,20 @@ def verify_repository_state(
         )
         return RepositoryVerificationResult((), "protected_files", error)
 
+    if git_executable is None:
+        return RepositoryVerificationResult(
+            (),
+            "unobserved",
+            _repository_changed("Pinned Git is unavailable for final verification."),
+        )
+
     environment = _sanitized_git_environment(os.environ)
     stage_process = _tracked_stage_process(
         project_root,
         environment=environment,
         runner=runner,
         clock_ns=clock_ns,
+        git_executable=git_executable,
     )
     processes = (stage_process,)
     try:
@@ -259,7 +292,7 @@ def verify_repository_state(
     if not _tracked_files_match(
         snapshot.tracked_files,
         tracked,
-        annotations_fix_selected=annotations_fix_selected,
+        annotations_fix_targets=annotations_fix_targets,
     ):
         return RepositoryVerificationResult(
             processes,
@@ -272,11 +305,14 @@ def verify_repository_state(
 def _capture_non_git_baseline(
     root: Path,
     processes: list[ExecutedProcess],
+    *,
+    protected: tuple[ProtectedFileSnapshot, ...] | None = None,
 ) -> RepositoryBaselineResult:
-    try:
-        protected = _capture_protected_files(root)
-    except _SnapshotError:
-        return _baseline_failure(processes, "Protected files could not be safely captured.")
+    if protected is None:
+        try:
+            protected = _capture_protected_files(root)
+        except _SnapshotError:
+            return _baseline_failure(processes, "Protected files could not be safely captured.")
     if any(entry.kind != "regular" for entry in protected):
         return _baseline_failure(
             processes,
@@ -314,7 +350,7 @@ def _tracked_files_match(
     baseline: tuple[TrackedFileSnapshot, ...],
     current: tuple[TrackedFileSnapshot, ...],
     *,
-    annotations_fix_selected: bool,
+    annotations_fix_targets: tuple[str, ...] | None,
 ) -> bool:
     if len(baseline) != len(current):
         return False
@@ -326,12 +362,18 @@ def _tracked_files_match(
             and before.index_mode == after.index_mode
             and before.index_object == after.index_object
             and before.working_tree_kind == after.working_tree_kind
-            and before.working_tree_kind in {"regular", "symlink"}
+            and before.working_tree_kind == "regular"
             and before.working_tree_mode == after.working_tree_mode
             and before.sha256 is not None
             and after.sha256 is not None
         )
-        if not annotations_fix_selected or not content_only_change:
+        target_scoped = annotations_fix_targets is not None and any(
+            target == "."
+            or before.path == target.rstrip("/")
+            or before.path.startswith(f"{target.rstrip('/')}/")
+            for target in annotations_fix_targets
+        )
+        if not target_scoped or not content_only_change:
             return False
     return True
 
@@ -364,13 +406,38 @@ def _git_process(
     environment: dict[str, str],
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    git_executable: ControllerExecutable | str,
 ) -> ExecutedProcess:
+    pinned_path = (
+        str(git_executable.path)
+        if isinstance(git_executable, ControllerExecutable)
+        else git_executable
+    )
+    try:
+        executable = (
+            str(git_executable.path_for_use())
+            if isinstance(git_executable, ControllerExecutable)
+            else git_executable
+        )
+    except OSError as error:
+        executable = pinned_path
+        failure = error
+
+        def failed_runner(
+            *args: object, **kwargs: object
+        ) -> subprocess.CompletedProcess[tuple[str, ...]]:
+            del args, kwargs
+            raise failure
+
+        selected_runner = cast(ProcessRunner, failed_runner)
+    else:
+        selected_runner = runner
     return execute_process(
         role=role,
-        command=("git", "-C", str(root), *arguments),
+        command=(executable, "-C", str(root), *arguments),
         cwd=root,
         capture_output=True,
-        runner=runner,
+        runner=selected_runner,  # type: ignore[arg-type]
         clock_ns=clock_ns,
         environment=environment,
     )
@@ -382,6 +449,7 @@ def _tracked_stage_process(
     environment: dict[str, str],
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    git_executable: ControllerExecutable | str = "git",
 ) -> ExecutedProcess:
     return _git_process(
         role="repository_tracked_snapshot",
@@ -390,6 +458,7 @@ def _tracked_stage_process(
         environment=environment,
         runner=runner,
         clock_ns=clock_ns,
+        git_executable=git_executable,
     )
 
 

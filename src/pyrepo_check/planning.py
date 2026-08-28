@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Literal, cast
 import re
 
-from pyrepo_check.config import CoverageConfig, ProjectConfig
+from pyrepo_check.config import (
+    CoverageConfig,
+    ProjectConfig,
+    validate_project_target_syntax,
+)
 
 
 CheckName = Literal[
@@ -118,6 +122,7 @@ class CheckInvocation:
     name: CheckName
     arguments: tuple[str, ...]
     pytest: PytestExecutionPlan | None = None
+    targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,7 @@ class RunPlan:
     pytest_args: tuple[str, ...] | None = None
     planned_test_scope: PlannedTestScope = "not_selected"
     planned_coverage_scope: PlannedCoverageScope = "not_requested"
+    pyproject_sha256: str | None = None
 
 
 def plan_run(
@@ -159,6 +165,7 @@ def plan_run(
         requested=requested,
         targets=targets,
     )
+    targets = _validate_direct_targets(targets, facts=facts)
     if targets and not requested and not request.all_selected:
         missing = tuple(target for target in targets if target not in facts.existing_positionals)
         if missing:
@@ -188,6 +195,12 @@ def plan_run(
         requested=requested,
         all_selected=request.all_selected,
     )
+    if any(check.name == "annotations-fix" for check in selected) and len(selected) != 1:
+        raise PlanningFailure(
+            "invalid_arguments",
+            "annotations-fix must be selected alone.",
+            hint="Run annotations-fix without --all or another check name.",
+        )
     pytest_selected = any(check.name == "pytest" for check in selected)
     if request.coverage_requested and not pytest_selected:
         raise PlanningFailure(
@@ -233,6 +246,7 @@ def plan_run(
         pytest_args=planned_pytest_args,
         planned_test_scope=planned_test_scope,
         planned_coverage_scope=planned_coverage_scope,
+        pyproject_sha256=config.pyproject_sha256,
     )
 
 
@@ -300,6 +314,38 @@ def _split_positionals(
     return requested, targets
 
 
+def _validate_direct_targets(
+    targets: tuple[str, ...],
+    *,
+    facts: PlanningFacts,
+) -> tuple[str, ...]:
+    invalid_syntax: set[str] = set()
+    for target in targets:
+        try:
+            validate_project_target_syntax(target)
+        except ValueError:
+            invalid_syntax.add(target)
+    missing = tuple(
+        target
+        for target in targets
+        if target in invalid_syntax or target not in facts.existing_positionals
+    )
+    if missing:
+        names = ", ".join(sorted(missing))
+        code: PlanningErrorCode = (
+            "unknown_target"
+            if all(_is_path_like(token) or token in invalid_syntax for token in missing)
+            else "unknown_check"
+        )
+        hint = (
+            "Check the target path or select a check name."
+            if code == "unknown_target"
+            else "Available checks: ruff, annotations, annotations-fix, ty, bandit, pytest"
+        )
+        raise PlanningFailure(code, f"Unknown check(s): {names}", hint=hint)
+    return targets
+
+
 def build_checks(
     config: ProjectConfig,
     *,
@@ -320,6 +366,7 @@ def build_checks(
         "ruff": CheckInvocation(
             name="ruff",
             arguments=("check", *ruff_targets),
+            targets=ruff_targets,
         ),
         "annotations": CheckInvocation(
             name="annotations",
@@ -331,6 +378,7 @@ def build_checks(
                 "--output-format",
                 "concise",
             ),
+            targets=ruff_targets,
         ),
         "annotations-fix": CheckInvocation(
             name="annotations-fix",
@@ -342,6 +390,7 @@ def build_checks(
                 "--fix",
                 "--unsafe-fixes",
             ),
+            targets=ruff_targets,
         ),
         "ty": CheckInvocation(
             name="ty",

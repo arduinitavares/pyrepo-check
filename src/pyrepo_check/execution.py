@@ -21,6 +21,7 @@ from pyrepo_check.planning import (
 from pyrepo_check import __version__
 
 if TYPE_CHECKING:
+    from pyrepo_check.controller_tools import ControllerExecutable
     from pyrepo_check.coverage_execution import CoverageExecutionObservation
     from pyrepo_check.pytest_execution import PytestExecutionObservation
 
@@ -200,6 +201,7 @@ class PreparedRepositoryEnvironment:
     python_selection: RepositoryPythonSelection
     manager_version: str
     child_environment: Mapping[str, str]
+    controller_uv: ControllerExecutable | None = None
 
 
 @dataclass(frozen=True)

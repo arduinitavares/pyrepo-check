@@ -299,12 +299,24 @@ error `uv_project_required`; no subprocess runs. A selected plan may then reach 
 executor, where a missing `uv.lock` is the environment-wide error
 `repository_lock_missing`.
 
+Configuration is parsed only from a bounded, nonblocking, no-follow stable
+regular-file read. The exact parsed bytes are SHA-256-bound to the later repository
+baseline; malformed, oversized, non-UTF-8, non-regular, aliased, or replaced
+configuration is `invalid_project_config`. Configured and direct Check targets must
+be nonempty, NUL-free, non-option-like, project-relative, existing, free of `..`, and
+contained after resolution. For pytest node selectors, validation applies to the
+filesystem prefix before the first `::` while preserving the suffix.
+
 The executor checks for `uv.lock` directly before spawning any process. If it is
 missing, the run reports `repository_lock_missing` without trying `uv --version` or
 preparing an environment.
 
-When the lock exists, the `uv` executable must be available to the Tool Environment
-process. The executor captures and parses `uv --version` before preparing the
+When the lock exists, a safe `uv` executable must be available outside the selected
+project. Before any repository-cwd process, the controller resolves `uv` and Git once
+from absolute non-empty PATH entries, skips lexical or resolved project-contained
+candidates, and pins each canonical path and stable file identity for the run. Every
+recorded helper argv uses that exact absolute path. The executor captures and parses
+`uv --version` before preparing the
 repository. A missing executable is `uv_unavailable`; malformed version output is
 `environment_evidence_invalid`. The exact uv version is part of Repository
 Environment evidence, but runtime compatibility is capability-based rather than a
@@ -350,8 +362,8 @@ and [the repository controls uv's default groups](https://docs.astral.sh/uv/conc
 ### Child-process environment
 
 Controller environment variables must not silently change Repository Environment
-selection. Before any uv or Check child, the executor removes `PYTHONHOME`,
-`PYTHONPATH`, `PYTHONEXECUTABLE`, `VIRTUAL_ENV`, `CONDA_PREFIX`, and
+selection. Before any uv or Check child, the executor removes every variable whose
+name begins with `PYTHON`, case-insensitively, plus `VIRTUAL_ENV`, `CONDA_PREFIX`, and
 `__PYVENV_LAUNCHER__`. It removes all `UV_*` variables, then restores only this exact
 allowlist:
 
@@ -508,9 +520,10 @@ their index object but are not dereferenced; nested submodule contents are outsi
 this mutation proof.
 
 Any snapshot or protected-file mismatch is `repository_state_changed`; pyrepo-check
-reports it but does not attempt an unsafe rollback. `annotations-fix` retains its
-existing explicit source-mutation contract and is exempt only from the tracked-file
-content equality check; the protected dependency-file fingerprints still must match.
+reports it but does not attempt an unsafe rollback. `annotations-fix` is explicit-only
+and exclusive. Its exemption covers only byte changes to tracked regular files
+lexically within its exact validated file/directory targets; kind, mode, symlink,
+unrelated-file, and protected dependency-file changes still fail.
 Because a non-Git project has no authoritative tracked-file set, it receives only the
 protected-file proof and must not be reported as having tracked-file protection.
 
@@ -597,6 +610,12 @@ Checks:
 - missing pytest prevents pytest and its Coverage run; and
 - missing Coverage does not suppress pytest. Pytest runs without instrumentation,
   Coverage reports an error, and the overall run remains an error.
+
+For available Coverage, the executor boundedly copies the probed package tree into
+the held run workspace before pytest. The post-pytest JSON helper revalidates every
+staged file plus its standalone launcher and imports Coverage with that staged root
+ahead of the repository. A pytest-created repository shadow, mutation at the original
+`.venv` origin, or mutation of the staged copy cannot become trusted JSON execution.
 
 All other independent Checks continue in their established order.
 

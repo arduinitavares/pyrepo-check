@@ -1,6 +1,11 @@
 import json
+import hashlib
+import os
 from pathlib import Path
 import re
+import subprocess  # nosec B404
+import sys
+from typing import Any, cast
 
 import pytest
 
@@ -8,7 +13,6 @@ from pyrepo_check.config import (
     CoverageConfig,
     InvalidCoverageConfigError,
     InvalidTestShortcutError,
-    ProjectConfig,
     TestShortcut as ConfigTestShortcut,
     collect_existing_positionals,
     load_project_config,
@@ -135,7 +139,6 @@ def test_accepts_test_shortcut_grammar_shapes(tmp_path: Path, args: tuple[str, .
         "tests/test_one.py::test_name",
         ".",
         "tests/test_one.py",
-        "tests/../tests/test_one.py",
     ),
 )
 def test_accepts_existing_contained_test_targets(tmp_path: Path, target: str) -> None:
@@ -226,6 +229,9 @@ def test_translates_unsafe_test_shortcut_path_inspection(tmp_path: Path, target:
 
 
 def test_loads_pyproject_targets(tmp_path: Path) -> None:
+    (tmp_path / "src/pkg").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "scripts").mkdir()
     (tmp_path / "pyproject.toml").write_text(
         """
 [tool.pyrepo-check]
@@ -238,11 +244,69 @@ bandit_targets = ["src/pkg"]
 
     config = load_project_config(tmp_path)
 
-    assert config == ProjectConfig(
-        root=tmp_path,
-        ruff_targets=("src/pkg", "tests", "scripts"),
-        bandit_targets=("src/pkg",),
+    assert config.root == tmp_path
+    assert config.ruff_targets == ("src/pkg", "tests", "scripts")
+    assert config.bandit_targets == ("src/pkg",)
+    assert config.pyproject_sha256 == hashlib.sha256(
+        (tmp_path / "pyproject.toml").read_bytes()
+    ).hexdigest()
+
+
+def test_rejects_symlinked_pyproject_before_parsing(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-pyproject.toml"
+    outside.write_text("[project]\nname='outside'\n", encoding="utf-8")
+    try:
+        (tmp_path / "pyproject.toml").symlink_to(outside)
+    except OSError:
+        pytest.skip()
+
+    with pytest.raises(ValueError, match="pyproject.toml.*regular"):
+        load_project_config(tmp_path)
+
+
+def test_rejects_oversized_pyproject_before_toml_parsing(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_bytes(b"#" * (1024 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="pyproject.toml.*1048576-byte limit"):
+        load_project_config(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        b"\xff",
+        b"[tool.pyrepo-check\n",
+    ),
+)
+def test_rejects_invalid_pyproject_encoding_or_toml(
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    (tmp_path / "pyproject.toml").write_bytes(content)
+
+    with pytest.raises(ValueError, match="pyproject.toml"):
+        load_project_config(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
+def test_rejects_fifo_pyproject_without_blocking(tmp_path: Path) -> None:
+    cast(Any, os).mkfifo(tmp_path / "pyproject.toml")
+    completed = subprocess.run(  # nosec B603
+        (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            "from pyrepo_check.config import load_project_config; "
+            f"load_project_config(Path({str(tmp_path)!r}))",
+        ),
+        check=False,
+        capture_output=True,
+        timeout=2,
     )
+
+    assert completed.returncode != 0
+    assert b"pyproject.toml" in completed.stderr
+    assert b"regular" in completed.stderr
 
 
 def test_detects_default_targets_without_config(tmp_path: Path) -> None:
@@ -284,18 +348,75 @@ ruff_targets = "src"
         load_project_config(tmp_path)
 
 
-def test_collects_existing_relative_and_absolute_positionals(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "target",
+    (
+        "--fix",
+        "--exit-zero",
+        "../outside.py",
+        "src/../src/example.py",
+        "bad\x00path",
+        "missing.py",
+    ),
+)
+def test_rejects_unsafe_or_missing_configured_targets(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/example.py").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pyrepo-check]\nruff_targets = " + json.dumps([target]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ruff_targets"):
+        load_project_config(tmp_path)
+
+
+def test_rejects_configured_absolute_and_symlink_escape_targets(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-target.py"
+    outside.write_text("", encoding="utf-8")
+    try:
+        (tmp_path / "escape.py").symlink_to(outside)
+    except OSError:
+        pytest.skip()
+
+    for target in (str(outside), "escape.py"):
+        (tmp_path / "pyproject.toml").write_text(
+            "[tool.pyrepo-check]\nruff_targets = " + json.dumps([target]),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="ruff_targets"):
+            load_project_config(tmp_path)
+
+
+def test_accepts_safe_configured_file_directory_and_dot_targets(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/example.py").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pyrepo-check]\n"
+        'ruff_targets = ["src", "src/example.py", "."]\n'
+        'bandit_targets = ["src/example.py"]\n',
+        encoding="utf-8",
+    )
+
+    config = load_project_config(tmp_path)
+
+    assert config.ruff_targets == ("src", "src/example.py", ".")
+    assert config.bandit_targets == ("src/example.py",)
+
+
+def test_collects_only_existing_contained_relative_positionals(tmp_path: Path) -> None:
     relative = tmp_path / "api.py"
     relative.write_text("", encoding="utf-8")
-    absolute = tmp_path / "outside.py"
-    absolute.write_text("", encoding="utf-8")
 
     result = collect_existing_positionals(
         tmp_path,
-        ("api.py", str(absolute), "missing.py", "tests/test_x.py::test_name"),
+        ("api.py", "missing.py", "tests/test_x.py::test_name"),
     )
 
-    assert result == frozenset(("api.py", str(absolute)))
+    assert result == frozenset(("api.py",))
 
 
 def _write_coverage_config(root: Path, coverage_toml: str) -> Path:

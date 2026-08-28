@@ -38,7 +38,9 @@ Omit `--python` for uv's repository-native selection. Use it only when the user 
 CI chooses one Python for that run. A matrix requires separate invocations.
 
 Run `annotations` and `ty` together for typing work. `annotations-fix` mutates files:
-use it only with source-change authority, inspect the diff, then rerun both checks.
+select it alone, use it only with source-change authority, inspect the diff, then rerun
+both checks. Use only existing project-relative targets; pytest node selectors remain
+valid after their filesystem prefix passes the same containment check.
 
 ## Repository ownership and remediation
 

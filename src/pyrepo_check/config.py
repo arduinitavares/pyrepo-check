@@ -2,17 +2,25 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, NoReturn
 import re
 import tomllib
 
+from pyrepo_check.artifact_safety import (
+    _BoundedReadError,
+    _UnsafePathError,
+    read_regular_file,
+)
+
 
 RUFF_DEFAULT_CANDIDATES = ("src", "tests", "scripts")
 BANDIT_DEFAULT_CANDIDATES = ("src",)
 TEST_SHORTCUT_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_-]*")
 TEST_SHORTCUT_SELECTORS = frozenset(("-m", "-k"))
+PYPROJECT_MAX_BYTES = 1024 * 1024
 
 
 class InvalidTestShortcutError(ValueError):
@@ -21,6 +29,10 @@ class InvalidTestShortcutError(ValueError):
 
 class InvalidCoverageConfigError(ValueError):
     """Raised when native Coverage.py configuration is incomplete or unsafe."""
+
+
+class InvalidProjectConfigError(ValueError):
+    """Raised when pyproject.toml cannot be read and parsed safely."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +54,7 @@ class ProjectConfig:
     bandit_targets: tuple[str, ...]
     test_shortcuts: tuple[TestShortcut, ...] = ()
     coverage: CoverageConfig | None = None
+    pyproject_sha256: str | None = None
 
 
 def collect_existing_positionals(
@@ -52,14 +65,53 @@ def collect_existing_positionals(
 
 
 def _target_exists(root: Path, target: str) -> bool:
-    path = Path(target)
-    return path.exists() if path.is_absolute() else (root / path).exists()
+    try:
+        validate_project_target(root, target)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_project_target(root: Path, target: str) -> str:
+    """Validate one path target and preserve an optional pytest node selector."""
+    path_text = validate_project_target_syntax(target)
+    separator = "::" if "::" in target else ""
+    selector = target.split("::", 1)[1] if separator else ""
+    path = Path(path_text)
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_target = (resolved_root / path).resolve(strict=True)
+        resolved_target.relative_to(resolved_root)
+    except FileNotFoundError as error:
+        raise ValueError("target must exist beneath the project root") from error
+    except ValueError as error:
+        raise ValueError("target must remain beneath the project root") from error
+    except (OSError, RuntimeError) as error:
+        raise ValueError("target path cannot be inspected safely") from error
+    return path_text + (separator + selector if separator else "")
+
+
+def validate_project_target_syntax(target: str) -> str:
+    """Validate target syntax without reading repository state."""
+    path_text = target.split("::", 1)[0]
+    if not target.strip() or not path_text:
+        raise ValueError("target must not be empty")
+    if "\x00" in target:
+        raise ValueError("target must not contain NUL")
+    if target.lstrip().startswith("-"):
+        raise ValueError("target must not begin like an option")
+    path = Path(path_text)
+    if path.is_absolute():
+        raise ValueError("target must be project-relative")
+    if ".." in path.parts:
+        raise ValueError("target must not contain '..'")
+    return path_text
 
 
 def load_project_config(root: Path) -> ProjectConfig:
     resolved_root = root.resolve()
     pyproject_path = resolved_root / "pyproject.toml"
-    table, coverage = _load_configuration_tables(pyproject_path)
+    table, coverage, pyproject_sha256 = _load_configuration_tables(pyproject_path)
     return ProjectConfig(
         root=resolved_root,
         ruff_targets=_configured_targets(
@@ -76,34 +128,50 @@ def load_project_config(root: Path) -> ProjectConfig:
         ),
         test_shortcuts=_configured_test_shortcuts(table, root=resolved_root),
         coverage=_configured_coverage(coverage, config_path=pyproject_path),
+        pyproject_sha256=pyproject_sha256,
     )
 
 
 def _load_configuration_tables(
     pyproject_path: Path,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    if not pyproject_path.exists():
-        return {}, None
-
-    with pyproject_path.open("rb") as file:
-        data = tomllib.load(file)
+) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+    try:
+        content = read_regular_file(
+            pyproject_path,
+            max_bytes=PYPROJECT_MAX_BYTES,
+        )
+    except FileNotFoundError:
+        return {}, None, None
+    except (_BoundedReadError, _UnsafePathError, OSError) as error:
+        raise InvalidProjectConfigError(
+            f"Invalid project configuration in {pyproject_path}: "
+            f"cannot read a stable regular file ({error})"
+        ) from error
+    try:
+        data = tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise InvalidProjectConfigError(
+            f"Invalid project configuration in {pyproject_path}: "
+            f"cannot parse UTF-8 TOML ({error})"
+        ) from error
+    pyproject_sha256 = hashlib.sha256(content).hexdigest()
 
     tool = data.get("tool", {})
     if not isinstance(tool, dict):
-        return {}, None
+        return {}, None, pyproject_sha256
 
     table = tool.get("pyrepo-check", {})
     if not isinstance(table, dict):
         raise ValueError("[tool.pyrepo-check] must be a TOML table")
     raw_coverage = tool.get("coverage")
     if raw_coverage is None:
-        return table, None
+        return table, None, pyproject_sha256
     if not isinstance(raw_coverage, dict):
         raise InvalidCoverageConfigError(
             f"Invalid coverage configuration in {pyproject_path}: "
             "[tool.coverage] must be a TOML table"
         )
-    return table, raw_coverage
+    return table, raw_coverage, pyproject_sha256
 
 
 def _configured_coverage(
@@ -186,7 +254,13 @@ def _configured_targets(
             raise ValueError(f"{key} must be a list of strings")
         if not raw_targets:
             raise ValueError(f"{key} must not be empty")
-        return tuple(raw_targets)
+        validated: list[str] = []
+        for target in raw_targets:
+            try:
+                validated.append(validate_project_target(root, target))
+            except ValueError as error:
+                raise ValueError(f"{key} contains an invalid target {target!r}: {error}") from error
+        return tuple(validated)
 
     detected = tuple(path for path in default_candidates if (root / path).exists())
     return detected or (".",)
@@ -270,39 +344,10 @@ def _validate_test_shortcut(
 
 
 def _validate_test_shortcut_target(name: str, token: str, *, root: Path) -> None:
-    path_text = token.split("::", 1)[0]
     try:
-        path = Path(path_text)
-        if not path_text or path.is_absolute():
-            raise InvalidTestShortcutError(
-                f"Invalid Test Shortcut {name!r}: target must be project-relative: {token}"
-            )
-        resolved_root = root.resolve()
-        resolved_target = (resolved_root / path).resolve(strict=False)
-    except InvalidTestShortcutError:
-        raise
-    except (ValueError, OSError, RuntimeError) as error:
-        raise InvalidTestShortcutError(
-            f"Invalid Test Shortcut {name!r}: target path cannot be inspected safely: {path_text}"
-        ) from error
-    try:
-        resolved_target.relative_to(resolved_root)
+        validate_project_target(root, token)
     except ValueError as error:
         raise InvalidTestShortcutError(
-            f"Invalid Test Shortcut {name!r}: target escapes project root: {token}"
+            f"Invalid Test Shortcut {name!r}: target path cannot be inspected safely: "
+            f"{token.split('::', 1)[0]}"
         ) from error
-    try:
-        resolved_target.stat()
-    except FileNotFoundError:
-        target_exists = False
-    except (ValueError, OSError, RuntimeError) as error:
-        raise InvalidTestShortcutError(
-            f"Invalid Test Shortcut {name!r}: target path cannot be inspected safely: {path_text}"
-        ) from error
-    else:
-        target_exists = True
-    if not target_exists:
-        raise InvalidTestShortcutError(
-            f"Invalid Test Shortcut {name!r}: "
-            f"target path does not exist beneath project root: {path_text}"
-        )

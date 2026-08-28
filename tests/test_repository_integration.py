@@ -433,8 +433,8 @@ def test_unavailable_git_is_bounded_and_stops_before_uv(tmp_path: Path) -> None:
     repository_environment = report["repository_environment"]
     assert completed.returncode == 2
     assert repository_environment["error"]["code"] == "unsafe_repository_environment"
-    assert _repository_process_roles(report) == ["repository_safety"]
-    assert repository_environment["processes"][0]["outcome"] == "spawn_failed"
+    assert _repository_process_roles(report) == []
+    assert repository_environment["processes"] == []
     _assert_no_uv_or_check_start(report)
 
 

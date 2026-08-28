@@ -96,7 +96,8 @@ pyrepo-check --format json ty
 A target-only command runs the file-oriented checks: Ruff, annotations, Ty, and
 Bandit. `annotations` explicitly enforces Ruff's `ANN` rules; `ty` checks type
 correctness. Use both for typing work. `annotations-fix` mutates source and must be
-explicitly authorized:
+explicitly authorized and selected alone. Its mutation allowance covers only tracked
+regular-file content under the exact requested targets:
 
 ```bash
 pyrepo-check annotations-fix src/package/
@@ -209,6 +210,11 @@ cli = ["tests/test_cli.py", "-k", "json"]
 Configured targets affect focused commands, not the target-free strict gate. A Test
 Shortcut is valid only for a pytest-only focused run and cannot be combined with
 `--all`, another check, or direct targets.
+
+Configured and direct targets must name existing project-contained relative paths;
+absolute, option-like, missing, `..`, NUL-containing, and symlink-escaping targets are
+rejected before execution. Pytest node selectors preserve their suffix after validating
+the filesystem path before the first `::`.
 
 ## Agent Skill
 

@@ -263,6 +263,23 @@ def test_environment_planning_errors_spawn_nothing(
     assert runner.calls == []
 
 
+def test_invalid_option_like_direct_target_is_typed_and_spawns_nothing(
+    tmp_path: Path,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    runner = RecordingRunner()
+
+    assert main(
+        ("--root", str(tmp_path), "--format", "json", "--", "--exit-zero"),
+        runner=runner,
+    ) == 2
+
+    payload = json.loads(capsysbinary.readouterr().out)
+    assert runner.calls == []
+    assert payload["kind"] == "planning_error"
+    assert payload["error"]["code"] == "unknown_target"
+
+
 def test_terminal_planning_error_is_written_to_stderr(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

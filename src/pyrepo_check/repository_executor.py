@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import secrets
 import time
 
+from pyrepo_check.controller_tools import ControllerTools, resolve_controller_tools
 from pyrepo_check.check_launcher import (
     CHECK_MODULE,
     StagedCheckLauncher,
@@ -21,6 +22,7 @@ from pyrepo_check.execution import (
     CheckExecutionFailure,
     CheckExecutionErrorCode,
     DependencyObservation,
+    EnvironmentFailureObservation,
     ExecutedProcess,
     PreparedRepositoryEnvironment,
     RepositoryCheckObservation,
@@ -40,7 +42,7 @@ from pyrepo_check.execution_workspace import VerifiedRunWorkspace
 from pyrepo_check.planning import CheckInvocation, RunPlan
 from pyrepo_check.pytest_execution import execute_prepared_pytest
 from pyrepo_check.repository_environment import (
-    DependencyName,
+    dependency_name_for_check,
     inspect_repository_lock,
     prepare_repository_environment,
     probe_repository_dependencies,
@@ -64,8 +66,10 @@ def prepare_safe_repository(
     *,
     runner: ProcessRunner | None = None,
     clock_ns: Callable[[], int] = time.monotonic_ns,
+    controller_tools: ControllerTools | None = None,
 ) -> SafeRepositoryPreparation:
     """Inspect the lock, capture safety state, then prepare without a Check."""
+    tools = controller_tools or resolve_controller_tools(plan.root)
     lock_presence = inspect_repository_lock(plan.root)
     if lock_presence.state != "present":
         preparation = prepare_repository_environment(
@@ -73,6 +77,7 @@ def prepare_safe_repository(
             lock_presence=lock_presence,
             runner=runner,
             clock_ns=clock_ns,
+            controller_uv=tools.uv,
         )
         return SafeRepositoryPreparation(
             baseline=None,
@@ -89,6 +94,8 @@ def prepare_safe_repository(
         plan.root,
         runner=runner,
         clock_ns=clock_ns,
+        expected_pyproject_sha256=plan.pyproject_sha256,
+        git_executable=tools.git,
     )
     if baseline.error is not None:
         observation = RepositoryEnvironmentObservation(
@@ -115,6 +122,7 @@ def prepare_safe_repository(
         lock_presence=lock_presence,
         runner=runner,
         clock_ns=clock_ns,
+        controller_uv=tools.uv,
     )
     if preparation.prepared is not None:
         dependencies = probe_repository_dependencies(
@@ -261,12 +269,18 @@ def execute_repository_plan(
 ) -> RepositoryExecutionResult:
     """Compose preparation, dependencies, per-Check workspaces, and verification."""
     observed_tool_environment = tool_environment or observe_tool_environment()
+    controller_tools = resolve_controller_tools(plan.root)
     progress_writer = (
         _nonthrowing_progress_writer(terminal_writer)
         if terminal_writer is not None and plan.output_format == "terminal"
         else None
     )
-    safe = prepare_safe_repository(plan, runner=runner, clock_ns=clock_ns)
+    safe = prepare_safe_repository(
+        plan,
+        runner=runner,
+        clock_ns=clock_ns,
+        controller_tools=controller_tools,
+    )
     preparation = safe.preparation
     checks: list[RepositoryCheckObservation] = []
     repository_observation = preparation.observation
@@ -293,7 +307,7 @@ def execute_repository_plan(
                 for dependency in preparation.observation.dependencies
             }
             for invocation in plan.checks:
-                dependency = dependencies[_dependency_name(invocation)]
+                dependency = dependencies[dependency_name_for_check(invocation.name)]
                 if invocation.name == "pytest":
                     checks.append(
                         _execute_in_workspace(
@@ -339,19 +353,43 @@ def execute_repository_plan(
                 )
     finally:
         if safe.baseline is not None:
+            annotations_fix = next(
+                (
+                    invocation
+                    for invocation in plan.checks
+                    if invocation.name == "annotations-fix"
+                ),
+                None,
+            )
             verification = verify_repository_state(
                 safe.baseline,
-                annotations_fix_selected=any(
-                    invocation.name == "annotations-fix" for invocation in plan.checks
+                annotations_fix_targets=(
+                    annotations_fix.targets if annotations_fix is not None else None
                 ),
                 runner=runner,
                 clock_ns=clock_ns,
+                git_executable=controller_tools.git,
             )
+            helper_error: EnvironmentFailureObservation | None = None
+            for helper in (controller_tools.uv, controller_tools.git):
+                if helper is None:
+                    continue
+                try:
+                    helper.path_for_use()
+                except OSError:
+                    helper_error = EnvironmentFailureObservation(
+                        code="unsafe_repository_environment",
+                        message="A pinned controller helper changed during execution.",
+                        hint="Restore the controller uv and Git installations, then retry.",
+                    )
+                    break
             repository_observation = replace(
                 repository_observation,
                 processes=repository_observation.processes + verification.processes,
                 mutation_protection=verification.mutation_protection,
-                error=verification.error or repository_observation.error,
+                error=(
+                    helper_error or verification.error or repository_observation.error
+                ),
             )
     return RepositoryExecutionResult(
         tool_environment=observed_tool_environment,
@@ -460,7 +498,7 @@ def _execute_in_workspace(
             diagnostics.append(f"workspace cleanup failed: {type(error).__name__}: {error}")
         else:
             if cleanup is not None:
-                diagnostics.append(execution_workspace._cleanup_diagnostic(cleanup))
+                diagnostics.append(execution_workspace.format_cleanup_diagnostic(cleanup))
 
     if diagnostics:
         failure = CheckExecutionFailure(
@@ -485,12 +523,6 @@ def _execute_in_workspace(
             "workspace execution produced no observation",
         )
     return observation
-
-
-def _dependency_name(invocation: CheckInvocation) -> DependencyName:
-    if invocation.name in {"ruff", "annotations", "annotations-fix"}:
-        return "ruff"
-    return invocation.name
 
 
 def _classify_primary_error(process: ExecutedProcess) -> CheckExecutionFailure | None:

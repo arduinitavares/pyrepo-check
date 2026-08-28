@@ -58,6 +58,12 @@ def run_prepared_pytest_fixture(
     runner: ProcessRunner,
     coverage_requested: bool = False,
 ) -> pytest_execution.PreparedPytestExecution:
+    if coverage_dependency is not None and coverage_dependency.status == "available":
+        package = prepared.path / "site-packages/coverage"
+        package.mkdir(parents=True, exist_ok=True)
+        origin = package / "__init__.py"
+        origin.write_text("__version__ = 'test-fixture'\n", encoding="utf-8")
+        coverage_dependency = replace(coverage_dependency, origin=str(origin))
     coverage = (
         CoverageExecutionPlan(
             config_path=prepared.root / "pyproject.toml",
@@ -143,6 +149,7 @@ class PreparedPytestRunner:
         exception: Exception | None = None,
         pytest_version: str = "8.4.2",
         coverage_version: str = "7.15.2",
+        after_primary: Callable[[tuple[str, ...]], None] | None = None,
     ) -> None:
         self._runner = launcher_aware_runner(
             returncodes=returncodes,
@@ -152,6 +159,7 @@ class PreparedPytestRunner:
         )
         self.pytest_version = pytest_version
         self.coverage_version = coverage_version
+        self.after_primary = after_primary
         self.calls = self._runner.calls
 
     def __call__(
@@ -179,6 +187,8 @@ class PreparedPytestRunner:
             )
             test_support._publish_coverage_artifact(logical)  # noqa: SLF001
             self._replace_artifact_versions(logical, env)
+        if len(self.calls) == 1 and self.after_primary is not None:
+            self.after_primary(command)
         return completed_process
 
     def _replace_artifact_versions(
@@ -199,6 +209,9 @@ class PreparedPytestRunner:
 
     @staticmethod
     def _logical_module_command(command: tuple[str, ...]) -> tuple[str, ...] | None:
+        if any("coverage-json-launcher-" in argument for argument in command):
+            separator_index = command.index("--")
+            return ("python", "-m", "coverage", *command[separator_index + 1 :])
         if "--module" not in command:
             return command if "-m" in command else None
         module_index = command.index("--module")
@@ -666,7 +679,7 @@ def test_prepared_pytest_pythonpath_contains_only_the_reporter_directory(
     assert result.start.module == "pytest"
 
 
-def test_prepared_coverage_primary_uses_launcher_but_json_helper_does_not(
+def test_prepared_coverage_primary_and_json_use_their_bound_launchers(
     tmp_path: Path,
 ) -> None:
     prepared = prepared_repository(tmp_path, python=(3, 12, 11))
@@ -707,7 +720,10 @@ def test_prepared_coverage_primary_uses_launcher_but_json_helper_does_not(
         str(prepared.python.executable),
         "python",
     )
-    assert helper.command[6:9] == ("-m", "coverage", "json")
+    assert "coverage-json-launcher-" in Path(helper.command[6]).name
+    assert helper.command[7] == "--module-root"
+    assert "coverage-dependency-" in Path(helper.command[8]).name
+    assert helper.command[9:12] == ("--", "json", f"--rcfile={tmp_path / 'pyproject.toml'}")
     assert "--evidence" not in helper.command
     assert result.start is not None
     assert result.start.module == "coverage"
@@ -715,6 +731,31 @@ def test_prepared_coverage_primary_uses_launcher_but_json_helper_does_not(
     assert result.pytest.artifact.state == "snapshot"
     assert result.coverage is not None
     assert result.coverage.artifact.state == "snapshot"
+
+
+def test_staged_coverage_mutation_after_pytest_fails_without_json_spawn(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_repository(tmp_path, python=(3, 12, 11))
+
+    def mutate_staged_dependency(command: tuple[str, ...]) -> None:
+        marker = Path(command[command.index("--evidence") + 1])
+        staged_file = next(marker.parent.glob("coverage-dependency-*/coverage/__init__.py"))
+        staged_file.write_text("mutated = True\n", encoding="utf-8")
+
+    runner = PreparedPytestRunner(after_primary=mutate_staged_dependency)
+    result = run_prepared_pytest_fixture(
+        prepared=prepared,
+        pytest_dependency=available_dependency("pytest", "8.4.2"),
+        coverage_dependency=available_dependency("coverage", "7.15.2"),
+        coverage_requested=True,
+        runner=runner,
+    )
+
+    assert len(result.processes) == 1
+    assert result.coverage is not None
+    assert result.coverage.artifact.state == "generation_failed"
+    assert "staged Coverage dependency changed" in str(result.coverage.artifact.diagnostic)
 
 
 def test_missing_pytest_prevents_both_pytest_and_coverage(

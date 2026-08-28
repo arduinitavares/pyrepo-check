@@ -421,7 +421,7 @@ def test_workspace(root: Path) -> Iterator[execution_workspace.VerifiedRunWorksp
             repository_root=root.resolve(),
         )
         if observation is not None:
-            raise OSError(execution_workspace._cleanup_diagnostic(observation))
+            raise OSError(execution_workspace.format_cleanup_diagnostic(observation))
 
 
 setattr(test_workspace, "__test__", False)

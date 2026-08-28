@@ -369,6 +369,13 @@ Thus unavailable Coverage never starts the JSON helper. A pytest preparation own
 supersedes the Coverage-dependency mapping because no instrumentable pytest primary
 can establish Coverage evidence.
 
+When Coverage is available, its probed package is copied through bounded no-follow
+reads into the held run workspace before pytest. The `coverage_json` argv truthfully
+records an absolute pinned uv path and a staged JSON launcher; the staged package and
+launcher digests are revalidated immediately before that helper starts. Repository
+Coverage shadows and later mutation at the original `.venv` origin cannot supply the
+trusted JSON producer.
+
 | Coverage status | Required correlation |
 | --- | --- |
 | `passed` | Complete scope/evidence and eligible; a configured threshold is evaluated and true, or an unconfigured threshold is skipped as `not_configured`. |

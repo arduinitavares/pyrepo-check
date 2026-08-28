@@ -52,6 +52,10 @@ def _run_fifo_call_with_watchdog(call: Callable[[], _T], fifo: Path) -> _T:
     return result[0]
 
 
+def test_cleanup_diagnostic_formatter_is_public() -> None:
+    assert callable(execution_workspace.format_cleanup_diagnostic)
+
+
 def test_workspace_is_exclusive_and_outside_repository(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()

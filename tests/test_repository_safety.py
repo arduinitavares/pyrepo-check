@@ -14,6 +14,46 @@ from pyrepo_check.repository_safety import (
 from tests.support import RecordingRunner, monotonic_clock
 
 
+def test_missing_safe_git_preserves_non_git_protected_file_fallback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    (root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    (root / "uv.lock").write_text("version = 1\nrevision = 3\n", encoding="utf-8")
+
+    result = capture_repository_baseline(
+        root,
+        runner=RecordingRunner(),
+        clock_ns=monotonic_clock(),
+        git_executable=None,
+    )
+
+    assert result.error is None
+    assert result.snapshot is not None and result.snapshot.git_root is None
+    assert result.processes == ()
+
+
+def test_missing_safe_git_rejects_existing_git_metadata_without_spawn(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    (root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    (root / "uv.lock").write_text("version = 1\nrevision = 3\n", encoding="utf-8")
+    (root / ".git").mkdir()
+
+    result = capture_repository_baseline(
+        root,
+        runner=RecordingRunner(),
+        clock_ns=monotonic_clock(),
+        git_executable=None,
+    )
+
+    assert result.snapshot is None
+    assert result.error is not None
+    assert result.error.code == "unsafe_repository_environment"
+    assert result.processes == ()
+
+
 def _run_git(
     root: Path,
     *arguments: str,
@@ -373,7 +413,7 @@ def test_unchanged_clean_git_state_is_verified(tmp_path: Path) -> None:
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=False,
+        annotations_fix_targets=None,
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -402,7 +442,7 @@ def test_unchanged_already_dirty_state_is_verified(tmp_path: Path) -> None:
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=False,
+        annotations_fix_targets=None,
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -425,7 +465,7 @@ def test_initially_dirty_file_changed_again_is_rejected(tmp_path: Path) -> None:
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=False,
+        annotations_fix_targets=None,
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -461,7 +501,7 @@ def test_tracked_file_cannot_be_read_through_an_external_symlink_ancestor(
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=False,
+        annotations_fix_targets=None,
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -486,7 +526,7 @@ def test_non_git_protected_file_change_is_rejected(
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=False,
+        annotations_fix_targets=None,
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -514,7 +554,7 @@ def test_gitlink_contents_are_not_descended_into(tmp_path: Path) -> None:
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=False,
+        annotations_fix_targets=None,
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -533,7 +573,7 @@ def test_annotations_fix_exempts_source_bytes_but_never_dependency_files(
 
     allowed = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=True,
+        annotations_fix_targets=("src",),
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -542,7 +582,7 @@ def test_annotations_fix_exempts_source_bytes_but_never_dependency_files(
     (root / "uv.lock").write_text("changed\n", encoding="utf-8")
     rejected = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=True,
+        annotations_fix_targets=("src",),
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -621,7 +661,7 @@ def test_annotations_fix_never_exempts_structural_or_dependency_changes(
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=True,
+        annotations_fix_targets=("src",),
         runner=None,
         clock_ns=monotonic_clock(),
     )
@@ -638,7 +678,7 @@ def test_annotations_fix_never_exempts_structural_or_dependency_changes(
     assert result.error.code == "repository_state_changed"
 
 
-def test_annotations_fix_allows_existing_symlink_target_content_change(
+def test_annotations_fix_rejects_existing_symlink_target_content_change(
     tmp_path: Path,
 ) -> None:
     root = initialize_git_fixture(tmp_path)
@@ -658,10 +698,30 @@ def test_annotations_fix_allows_existing_symlink_target_content_change(
 
     result = verify_repository_state(
         baseline.snapshot,
-        annotations_fix_selected=True,
+        annotations_fix_targets=("src",),
         runner=None,
         clock_ns=monotonic_clock(),
     )
 
-    assert result.error is None
+    assert result.error is not None
+    assert result.error.code == "repository_state_changed"
     assert result.mutation_protection == "tracked_files"
+
+
+def test_annotations_fix_rejects_regular_content_outside_exact_target(
+    tmp_path: Path,
+) -> None:
+    root = initialize_git_fixture(tmp_path)
+    baseline = capture_repository_baseline(root, runner=None, clock_ns=monotonic_clock())
+    assert baseline.snapshot is not None
+    (root / ".gitignore").write_text(".venv/\nchanged\n", encoding="utf-8")
+
+    result = verify_repository_state(
+        baseline.snapshot,
+        annotations_fix_targets=("src/example.py",),
+        runner=None,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert result.error is not None
+    assert result.error.code == "repository_state_changed"

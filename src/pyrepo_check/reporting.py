@@ -46,6 +46,7 @@ from pyrepo_check.pytest_evidence import (
     SpecialTestOutcome,
     build_pytest_result,
 )
+from pyrepo_check.repository_environment import dependency_name_for_check
 from pyrepo_check.reporting_schema import (
     Advisory,
     AdvisoryCode as AdvisoryCode,
@@ -246,7 +247,7 @@ def _validate_run_report_v2(report: RunReportV2) -> None:
 
     dependencies = {dependency.name: dependency for dependency in environment.dependencies}
     for check in report.checks:
-        dependency = dependencies[_dependency_for_check_v2(check.name)]
+        dependency = dependencies[dependency_name_for_check(check.name)]
         _validate_check_result_v2(
             check,
             environment,
@@ -353,8 +354,7 @@ def _validate_environment_state_v2(
     if environment.error is None and environment.mutation_protection == "unobserved":
         _invalid("successful repository environment requires mutation protection")
     if environment.mutation_protection == "tracked_files":
-        expected_final_argv = (
-            "git",
+        expected_final_tail = (
             "-C",
             project_root,
             "ls-files",
@@ -367,7 +367,9 @@ def _validate_environment_state_v2(
             not environment.processes
             or environment.processes[-1].role != "repository_safety"
             or not _successful_process(environment.processes[-1])
-            or environment.processes[-1].argv != expected_final_argv
+            or len(environment.processes[-1].argv) != len(expected_final_tail) + 1
+            or not Path(environment.processes[-1].argv[0]).is_absolute()
+            or environment.processes[-1].argv[1:] != expected_final_tail
             or environment.processes[-1].cwd != project_root
         ):
             _invalid("tracked_files requires canonical successful final safety evidence")
@@ -484,7 +486,7 @@ def _validate_pre_execution_stage_v2(
 def _expected_dependency_names_v2(selection: Selection) -> tuple[str, ...]:
     names: list[str] = []
     for check in selection.checks:
-        name = _dependency_for_check_v2(check)
+        name = dependency_name_for_check(check)
         if name not in names:
             names.append(name)
     if selection.planned_coverage_scope in {"partial", "complete"}:
@@ -533,14 +535,6 @@ def _validate_coverage_context_v2(report: RunReportV2) -> None:
     )
     if coverage.status != expected_status:
         _invalid("Coverage status contradicts report context")
-
-
-def _dependency_for_check_v2(
-    check: CheckName,
-) -> Literal["ruff", "ty", "bandit", "pytest"]:
-    if check in {"ruff", "annotations", "annotations-fix"}:
-        return "ruff"
-    return check
 
 
 def _validate_dependency_evidence_v2(
@@ -734,7 +728,7 @@ def _expected_check_module_v2(
         and coverage_dependency.status == "available"
     ):
         return "coverage"
-    return _dependency_for_check_v2(check.name)
+    return dependency_name_for_check(check.name)
 
 
 def _validate_synthesized_pytest_v2(

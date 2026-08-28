@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Literal, cast
 
 from pyrepo_check.artifact_safety import load_bounded_json, read_regular_file
+from pyrepo_check.controller_tools import ControllerExecutable
 from pyrepo_check.execution import (
     CAPTURE_LIMIT_BYTES,
     CheckExecutionFailure,
@@ -476,10 +477,7 @@ def required_dependencies(
     selected: list[CheckDependency] = []
     seen: set[DependencyName] = set()
     for check in checks:
-        try:
-            name = cast(DependencyName, _CHECK_DEPENDENCIES[check])
-        except KeyError as error:
-            raise ValueError(f"unsupported Check dependency selection: {check}") from error
+        name = dependency_name_for_check(check)
         if name not in seen:
             selected.append(SUPPORTED_DEPENDENCIES[name])
             seen.add(name)
@@ -488,6 +486,14 @@ def required_dependencies(
             raise ValueError("Coverage dependency requires a selected pytest Check")
         selected.append(SUPPORTED_DEPENDENCIES["coverage"])
     return tuple(selected)
+
+
+def dependency_name_for_check(check: str) -> DependencyName:
+    """Return the repository dependency that owns one selectable Check."""
+    try:
+        return cast(DependencyName, _CHECK_DEPENDENCIES[check])
+    except KeyError as error:
+        raise ValueError(f"unsupported Check dependency selection: {check}") from error
 
 
 def dependency_version_supported(
@@ -576,7 +582,9 @@ def sanitized_repository_environment(
     cleaned = {
         name: value
         for name, value in source.items()
-        if name not in _REMOVED_ENVIRONMENT_VARIABLES and not name.startswith("UV_")
+        if name not in _REMOVED_ENVIRONMENT_VARIABLES
+        and not name.upper().startswith("PYTHON")
+        and not name.startswith("UV_")
     }
     cleaned.update(
         {
@@ -654,6 +662,7 @@ def prepare_repository_environment(
     lock_presence: RepositoryLockPresence | None = None,
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
+    controller_uv: ControllerExecutable | str | None = "uv",
 ) -> RepositoryPreparation:
     """Prepare and validate one locked Repository Environment."""
     expected_lock = _normalized_absolute(plan.root / "uv.lock")
@@ -695,9 +704,31 @@ def prepare_repository_environment(
             error=storage_error,
         )
 
+    if controller_uv is None:
+        return _failed_preparation(
+            plan,
+            lock_status="unverified",
+            error=EnvironmentFailureObservation(
+                code="uv_unavailable",
+                message="A safe controller-owned uv executable is unavailable.",
+                hint="Install uv outside the selected repository and add it to PATH.",
+            ),
+        )
+    try:
+        uv_executable = _controller_executable_path(controller_uv)
+    except OSError:
+        return _failed_preparation(
+            plan,
+            lock_status="unverified",
+            error=EnvironmentFailureObservation(
+                code="uv_unavailable",
+                message="The pinned controller-owned uv executable changed.",
+                hint="Restore the controller uv installation and retry.",
+            ),
+        )
     uv_process = execute_process(
         role="uv_version",
-        command=("uv", "--version"),
+        command=(uv_executable, "--version"),
         cwd=plan.root,
         capture_output=True,
         runner=runner,
@@ -718,10 +749,24 @@ def prepare_repository_environment(
         if not isinstance(plan.repository_python, ExplicitRepositoryPython)
         else ("--python", plan.repository_python.request)
     )
+    try:
+        uv_executable = _controller_executable_path(controller_uv)
+    except OSError:
+        return _failed_preparation(
+            plan,
+            lock_status="unverified",
+            manager_version=manager_version,
+            error=EnvironmentFailureObservation(
+                code="unsafe_repository_environment",
+                message="The pinned controller-owned uv executable changed.",
+                hint="Restore the controller uv installation and retry.",
+            ),
+            processes=(uv_process,),
+        )
     probe_process = execute_process(
         role="environment_probe",
         command=(
-            "uv",
+            uv_executable,
             "run",
             "--locked",
             *selector,
@@ -788,6 +833,9 @@ def prepare_repository_environment(
         python_selection=plan.repository_python,
         manager_version=manager_version,
         child_environment=child_environment,
+        controller_uv=(
+            controller_uv if isinstance(controller_uv, ControllerExecutable) else None
+        ),
     )
     return RepositoryPreparation(
         prepared=prepared,
@@ -809,14 +857,25 @@ def prepare_repository_environment(
 def locked_repository_prefix(
     prepared: PreparedRepositoryEnvironment,
 ) -> tuple[str, ...]:
+    uv_executable = (
+        str(prepared.controller_uv.path_for_use())
+        if prepared.controller_uv is not None
+        else "uv"
+    )
     return (
-        "uv",
+        uv_executable,
         "run",
         "--locked",
         "--python",
         str(prepared.python.executable),
         "python",
     )
+
+
+def _controller_executable_path(executable: ControllerExecutable | str) -> str:
+    if isinstance(executable, ControllerExecutable):
+        return str(executable.path_for_use())
+    return executable
 
 
 def _effective_cache_destination(

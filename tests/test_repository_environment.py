@@ -88,6 +88,8 @@ def test_sanitized_environment_keeps_only_approved_uv_controls() -> None:
         "PYTHONHOME": "/controller",
         "PYTHONPATH": "/controller/src",
         "PYTHONEXECUTABLE": "/controller/python",
+        "PythonWarnings": "error::repository_shadow.Warning",
+        "pythonstartup": "/controller/startup.py",
         "VIRTUAL_ENV": "/controller/.venv",
         "CONDA_PREFIX": "/controller/conda",
         "__PYVENV_LAUNCHER__": "/controller/launcher",
@@ -119,6 +121,46 @@ def test_sanitized_environment_keeps_only_approved_uv_controls() -> None:
     assert set(cleaned) == {"PATH", "APP_TOKEN", *allowed}
     with pytest.raises(TypeError):
         cast(dict[str, str], cleaned)["PATH"] = "/changed"
+
+
+def test_dependency_name_for_check_is_the_single_exported_owner() -> None:
+    assert repository_environment.dependency_name_for_check("ruff") == "ruff"
+    assert repository_environment.dependency_name_for_check("annotations") == "ruff"
+    assert repository_environment.dependency_name_for_check("annotations-fix") == "ruff"
+    assert repository_environment.dependency_name_for_check("pytest") == "pytest"
+    with pytest.raises(ValueError, match="unsupported Check"):
+        repository_environment.dependency_name_for_check("unknown")
+
+
+def test_sanitized_pythonwarnings_cannot_import_repository_shadow_before_probe(
+    tmp_path: Path,
+) -> None:
+    witness = tmp_path / "warning-shadow-ran"
+    (tmp_path / "repository_shadow.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(witness)!r}).write_text('ran')\n"
+        "class Warning(UserWarning):\n    pass\n",
+        encoding="utf-8",
+    )
+    environment = sanitized_repository_environment(
+        {
+            **os.environ,
+            "PYTHONWARNINGS": "error::repository_shadow.Warning",
+            "PYTHONPATH": str(tmp_path),
+        }
+    )
+
+    completed = subprocess.run(  # nosec B603
+        (sys.executable, "-c", "print('probe')"),
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == b"probe\n"
+    assert not witness.exists()
 
 
 @pytest.mark.parametrize(

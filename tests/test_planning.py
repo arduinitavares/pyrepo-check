@@ -65,6 +65,68 @@ def test_no_frozen_is_a_stable_zero_process_planning_error(tmp_path: Path) -> No
     assert raised.value.hint == ("Update uv.lock explicitly, then rerun without --no-frozen.")
 
 
+@pytest.mark.parametrize(
+    "target",
+    (
+        "--exit-zero",
+        "../outside.py",
+        "tests/../tests/test_safe.py",
+        "bad\x00path",
+        "missing.py",
+    ),
+)
+def test_rejects_invalid_direct_targets_with_typed_planning_evidence(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_safe.py").write_text("", encoding="utf-8")
+
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, ("pytest", target), False, False),
+            make_config(tmp_path),
+            PlanningFacts(frozenset(), pyproject_exists=True),
+        )
+
+    assert raised.value.code == "unknown_target"
+
+
+def test_rejects_absolute_and_symlink_escape_direct_targets(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-direct.py"
+    outside.write_text("", encoding="utf-8")
+    try:
+        (tmp_path / "escape.py").symlink_to(outside)
+    except OSError:
+        pytest.skip()
+
+    for target in (str(outside), "escape.py"):
+        with pytest.raises(PlanningFailure) as raised:
+            plan_run(
+                RunRequest(tmp_path, ("ruff", target), False, False),
+                make_config(tmp_path),
+                PlanningFacts(frozenset(), pyproject_exists=True),
+            )
+        assert raised.value.code == "unknown_target"
+
+
+def test_preserves_valid_pytest_node_selector_after_target_validation(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_safe.py").write_text("", encoding="utf-8")
+    selector = "tests/test_safe.py::TestGroup::test_case"
+
+    plan = plan_run(
+        RunRequest(tmp_path, ("pytest", selector), False, False),
+        make_config(tmp_path),
+        PlanningFacts(frozenset((selector,)), pyproject_exists=True),
+    )
+
+    assert plan.targets == (selector,)
+    assert plan.checks[0].arguments == (selector,)
+
+
 def test_carries_internal_output_intent(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     facts = PlanningFacts(frozenset(), pyproject_exists=True)
@@ -115,7 +177,7 @@ def test_plans_coverage_matrix_without_changing_plain_pytest_commands(tmp_path: 
             False,
             True,
             True,
-            (),
+            ("tests/unit.py",),
             None,
             ("tests/unit.py",),
             "focused",
@@ -327,7 +389,7 @@ def test_plans_authoritative_pytest_scope_metadata(
     plan = plan_run(
         RunRequest(tmp_path, positionals, False, False, test_shortcut=shortcut),
         make_config(tmp_path, test_shortcuts=(ConfigTestShortcut("unit", ("tests/unit",)),)),
-        PlanningFacts(frozenset(), pyproject_exists=True),
+        PlanningFacts(frozenset(positionals[1:]), pyproject_exists=True),
     )
 
     assert plan.pytest_args == expected_args
@@ -353,7 +415,7 @@ def test_pytest_execution_plan_exposes_consumer_command_and_pytest_args(
             tmp_path,
             test_shortcuts=(ConfigTestShortcut("unit", ("tests/unit", "-m", "not slow")),),
         ),
-        PlanningFacts(frozenset(), pyproject_exists=True),
+        PlanningFacts(frozenset(positionals[1:]), pyproject_exists=True),
     )
     pytest_check = plan.checks[0]
 
@@ -433,6 +495,18 @@ def test_selects_legacy_names_in_canonical_order() -> None:
     assert str(raised.value) == "Unknown check(s): mypy"
 
 
+def test_annotations_fix_cannot_be_combined_with_pytest(tmp_path: Path) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, ("pytest", "annotations-fix"), False, False),
+            make_config(tmp_path),
+            PlanningFacts(frozenset(), pyproject_exists=True),
+        )
+
+    assert raised.value.code == "invalid_arguments"
+    assert "annotations-fix must be selected alone" in str(raised.value)
+
+
 @pytest.mark.parametrize(
     (
         "positionals",
@@ -501,7 +575,7 @@ def test_selects_legacy_names_in_canonical_order() -> None:
         pytest.param(
             ("ruff", "api.py"),
             False,
-            frozenset(),
+            frozenset(("api.py",)),
             ("src",),
             ("src",),
             (("uv", "run", "python", "-m", "ruff", "check", "api.py"),),
@@ -510,7 +584,7 @@ def test_selects_legacy_names_in_canonical_order() -> None:
         pytest.param(
             ("annotations", "api.py"),
             False,
-            frozenset(),
+            frozenset(("api.py",)),
             ("src",),
             ("src",),
             (
@@ -533,7 +607,7 @@ def test_selects_legacy_names_in_canonical_order() -> None:
         pytest.param(
             ("annotations-fix", "api.py"),
             False,
-            frozenset(),
+            frozenset(("api.py",)),
             ("src",),
             ("src",),
             (
@@ -719,15 +793,12 @@ def test_preserves_legacy_cli_command_contracts(
             ("ruff", "annotations", "ty", "bandit", "pytest"),
         ),
         (("annotations-fix",), False, frozenset(), "focused", ("annotations-fix",)),
-        (("pytest", "tests/test_cli.py::test_name"), False, frozenset(), "focused", ("pytest",)),
-        (("pytest", "missing.py"), False, frozenset(), "focused", ("pytest",)),
-        (("ruff", "missing.py"), False, frozenset(), "focused", ("ruff",)),
         (
-            ("missing.py",),
-            True,
-            frozenset(),
+            ("pytest", "tests/test_cli.py::test_name"),
+            False,
+            frozenset(("tests/test_cli.py::test_name",)),
             "focused",
-            ("ruff", "annotations", "ty", "bandit", "pytest"),
+            ("pytest",),
         ),
         (
             ("ty",),
@@ -770,19 +841,18 @@ def test_plans_requested_checks(
     assert command_names(plan) == expected
 
 
-def test_preserves_existing_absolute_target(tmp_path: Path) -> None:
+def test_rejects_existing_absolute_target(tmp_path: Path) -> None:
     target = tmp_path / "outside.py"
     token = str(target)
 
-    plan = plan_run(
-        RunRequest(tmp_path, (token,), all_selected=False, no_frozen=False),
-        make_config(tmp_path),
-        PlanningFacts(frozenset((token,)), pyproject_exists=True),
-    )
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, (token,), all_selected=False, no_frozen=False),
+            make_config(tmp_path),
+            PlanningFacts(frozenset((token,)), pyproject_exists=True),
+        )
 
-    assert plan.mode == "focused"
-    assert plan.targets == (token,)
-    assert command_names(plan) == ("ruff", "annotations", "ty", "bandit")
+    assert raised.value.code == "unknown_target"
 
 
 def test_preserves_direct_target_order_and_duplicates(tmp_path: Path) -> None:
@@ -858,14 +928,15 @@ def test_mixed_unknown_tokens_choose_check_code() -> None:
     assert raised.value.code == "unknown_check"
 
 
-def test_known_check_with_missing_target_remains_allowed(tmp_path: Path) -> None:
-    plan = plan_run(
-        RunRequest(tmp_path, ("ruff", "missing.py"), False, False),
-        make_config(tmp_path),
-        PlanningFacts(frozenset(), pyproject_exists=True),
-    )
+def test_known_check_with_missing_target_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(PlanningFailure) as raised:
+        plan_run(
+            RunRequest(tmp_path, ("ruff", "missing.py"), False, False),
+            make_config(tmp_path),
+            PlanningFacts(frozenset(), pyproject_exists=True),
+        )
 
-    assert command_names(plan) == ("ruff",)
+    assert raised.value.code == "unknown_target"
 
 
 def test_plans_default_repository_python_without_execution_details(tmp_path: Path) -> None:
@@ -913,7 +984,7 @@ def test_direct_targets_override_configured_targets_and_bandit_is_not_recursive(
     plan = plan_run(
         RunRequest(tmp_path, ("bandit", "ruff", "api.py"), False, no_frozen=False),
         make_config(tmp_path),
-        PlanningFacts(frozenset(), pyproject_exists=True),
+        PlanningFacts(frozenset(("api.py",)), pyproject_exists=True),
     )
     checks: dict[str, CheckInvocation] = {check.name: check for check in plan.checks}
 

@@ -9,7 +9,8 @@ import subprocess  # nosec B404
 
 import pytest
 
-from pyrepo_check.config import ProjectConfig
+from pyrepo_check.controller_tools import resolve_controller_tools
+from pyrepo_check.config import ProjectConfig, load_project_config
 from pyrepo_check.execution import (
     DependencyObservation,
     EnvironmentFailureObservation,
@@ -20,7 +21,15 @@ from pyrepo_check.execution import (
     PreparedRepositoryEnvironment,
 )
 from pyrepo_check import execution_workspace, repository_executor
-from pyrepo_check.planning import CoverageExecutionPlan, OutputFormat, RunPlan, build_checks
+from pyrepo_check.planning import (
+    CoverageExecutionPlan,
+    OutputFormat,
+    PlanningFacts,
+    RunPlan,
+    RunRequest,
+    build_checks,
+    plan_run,
+)
 from pyrepo_check.repository_executor import SafeRepositoryPreparation, prepare_safe_repository
 from pyrepo_check.repository_safety import (
     RepositoryStateSnapshot,
@@ -101,6 +110,42 @@ def _successful_runner(root: Path) -> RecordingRunner:
     )
 
 
+def test_pinned_uv_identity_replacement_stops_before_environment_probe(
+    tmp_path: Path,
+) -> None:
+    root = _write_locked_project(tmp_path / "repository")
+    helper_bin = tmp_path / "controller-bin"
+    helper_bin.mkdir()
+    for name in ("uv", "git"):
+        helper = helper_bin / name
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o755)
+    tools = resolve_controller_tools(root, path=str(helper_bin))
+    runner = _successful_runner(root)
+
+    def replace_uv_after_version(call: test_support.RecordedCall) -> None:
+        if len(runner.calls) != 5:
+            return
+        replacement = tmp_path / "replacement-uv"
+        replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        replacement.chmod(0o755)
+        (helper_bin / "uv").unlink()
+        replacement.rename(helper_bin / "uv")
+
+    runner.on_call = replace_uv_after_version
+    result = prepare_safe_repository(
+        focused_plan(root, "ruff"),
+        runner=runner,
+        clock_ns=monotonic_clock(),
+        controller_tools=tools,
+    )
+
+    assert result.preparation.prepared is None
+    assert result.preparation.observation.error is not None
+    assert result.preparation.observation.error.code == "unsafe_repository_environment"
+    assert len(runner.calls) == 5
+
+
 def test_missing_lock_returns_canonical_failure_before_git_or_uv(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     (root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
@@ -132,6 +177,37 @@ def test_missing_lock_returns_canonical_failure_before_git_or_uv(tmp_path: Path)
         dependency.error,
     ) == ("ruff", "ruff", ">=0.15,<1", "unobserved", None, None, None, None)
     assert runner.calls == []
+
+
+def test_parsed_pyproject_bytes_are_bound_before_repository_processes(
+    tmp_path: Path,
+) -> None:
+    root = _write_locked_project(tmp_path)
+    config = load_project_config(root)
+    plan = plan_run(
+        RunRequest(root, ("ruff",), False, False, output_format="json"),
+        config,
+        PlanningFacts(frozenset(), pyproject_exists=True),
+    )
+    (root / "pyproject.toml").write_text(
+        "[project]\nname='replacement'\nversion='0'\n",
+        encoding="utf-8",
+    )
+    runner = RecordingRunner()
+
+    result = prepare_safe_repository(
+        plan,
+        runner=runner,
+        clock_ns=monotonic_clock(),
+    )
+
+    assert runner.calls == []
+    assert result.baseline is None
+    assert result.preparation.prepared is None
+    error = result.preparation.observation.error
+    assert error is not None
+    assert error.code == "unsafe_repository_environment"
+    assert "pyproject.toml changed after configuration was parsed" in error.message
 
 
 def test_unsafe_lock_returns_canonical_failure_before_git_or_uv(tmp_path: Path) -> None:
@@ -240,7 +316,9 @@ def test_safe_preparation_runs_dependency_probe_before_any_check(tmp_path: Path)
         "--",
         ".",
     )
-    assert observation.processes[4].command == ("uv", "--version")
+    assert Path(observation.processes[4].command[0]).is_absolute()
+    assert Path(observation.processes[4].command[0]).name == "uv"
+    assert observation.processes[4].command[1:] == ("--version",)
     assert observation.mutation_protection == "unobserved"
     assert tuple(dependency.name for dependency in observation.dependencies) == ("ruff",)
     assert observation.dependencies[0].status == "available"
@@ -379,6 +457,16 @@ def _safe_preparation(
     prepared_environment: PreparedRepositoryEnvironment | None = None,
 ) -> SafeRepositoryPreparation:
     selected = prepared_environment or prepared_repository(plan.root, (3, 12, 11))
+    package = selected.path / "site-packages/coverage"
+    package.mkdir(parents=True, exist_ok=True)
+    origin = package / "__init__.py"
+    origin.write_text("__version__ = 'test-fixture'\n", encoding="utf-8")
+    dependencies = tuple(
+        replace(dependency, origin=str(origin))
+        if dependency.name == "coverage" and dependency.status == "available"
+        else dependency
+        for dependency in dependencies
+    )
     observation = RepositoryEnvironmentObservation(
         manager_version="0.10.12",
         path=selected.path,
@@ -525,6 +613,7 @@ def test_missing_coverage_is_retained_but_plain_pytest_runs(
             capture_output=capture_output,
             env=env,
         )
+        logical: tuple[str, ...] | None = None
         if "--module" in command:
             module_index = command.index("--module")
             separator_index = command.index("--", module_index + 2)
@@ -534,12 +623,12 @@ def test_missing_coverage_is_retained_but_plain_pytest_runs(
                 command[module_index + 1],
                 *command[separator_index + 1 :],
             )
-            if "-p" in logical:
-                test_support._publish_pytest_artifact(  # noqa: SLF001
-                    logical,
-                    env,
-                    completed.returncode,
-                )
+        if logical is not None and "-p" in logical:
+            test_support._publish_pytest_artifact(  # noqa: SLF001
+                logical,
+                env,
+                completed.returncode,
+            )
         return completed
 
     result = repository_executor.execute_repository_plan(
@@ -682,6 +771,14 @@ def test_prepared_pytest_launcher_failure_does_not_suppress_later_check(
                 "python",
                 "-m",
                 command[module_index + 1],
+                *command[separator_index + 1 :],
+            )
+        elif any("coverage-json-launcher-" in argument for argument in command):
+            separator_index = command.index("--")
+            logical = (
+                "python",
+                "-m",
+                "coverage",
                 *command[separator_index + 1 :],
             )
         elif "-m" in command:

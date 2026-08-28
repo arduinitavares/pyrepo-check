@@ -397,23 +397,23 @@ def test_public_planning_error_composition_retains_observed_tool_environment() -
         ),
         (
             _dependency_error_with_independent_failure(),
-            "88d8eb05eb6aa7c39f748d272b70593c699d2f7762020612feac7c939e00c91a",
+            "19049c098fee29a5ebb77c8b2a1a150b621e081a2c19db5569a550d8d89c1fc8",
         ),
         (
             report_with_ty(),
-            "54a68d31c3da32d5393fc89d05fb32977bfb85fb1c640aa5181f9e67b764e23e",
+            "a7555492c528f0d42fe10dc6104670d1f00dd5b6a15cb916cf4fc8c103c1d773",
         ),
         (
             _strict_aggregate_success(),
-            "7fdc66f6f991c933bce6ac9e27cf6520e1176572a7ca39bec3ddc5eb52025c3d",
+            "350118a3e11a7f403097cdcf9d13a65c7fc5ef863560e7f65900608e18a91f1e",
         ),
         (
             pytest_run_report(coverage="missing"),
-            "db36e5e5d467eebba30f8f52b5ddc4999d3ae696c81e887a2e00a9a90bbfcf57",
+            "52af495c3afefe79317644acd0eb8062491c7ffe04eb65769f9bcf6d4c77300a",
         ),
         (
             _repository_state_changed(),
-            "8aa199784274a4e9cd48bd9168506f7f8da77585602a21e94e94d650c68867c4",
+            "823a8d706382e28869f7f49b0845a043e75738787b84abcd7572360655dbb953",
         ),
     ),
     ids=(

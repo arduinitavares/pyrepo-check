@@ -770,7 +770,7 @@ def valid_run_report() -> RunReportV2:
             process_result(
                 "repository_safety",
                 argv=(
-                    "git",
+                    "/usr/bin/git",
                     "-C",
                     "/repo",
                     "ls-files",
@@ -1960,7 +1960,7 @@ def test_schema_v2_accepts_final_safety_after_uv_failure() -> None:
             process_result(
                 "repository_safety",
                 argv=(
-                    "git",
+                    "/usr/bin/git",
                     "-C",
                     "/repo",
                     "ls-files",
@@ -3112,7 +3112,14 @@ def observed_pytest_setup_failure_report(
     )
     pytest_dependency = available_dependency("pytest", "8.4.2")
     if coverage_status == "available":
-        coverage_dependency = available_dependency("coverage", "7.15.2")
+        package = prepared.path / "site-packages/coverage"
+        package.mkdir(parents=True, exist_ok=True)
+        origin = package / "__init__.py"
+        origin.write_text("__version__ = 'test-fixture'\n", encoding="utf-8")
+        coverage_dependency = replace(
+            available_dependency("coverage", "7.15.2"),
+            origin=str(origin),
+        )
     elif coverage_status == "missing":
         coverage_dependency = missing_dependency("coverage")
     else:
