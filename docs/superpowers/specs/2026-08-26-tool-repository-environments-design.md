@@ -609,9 +609,9 @@ version or rewrite `[tool.ruff].target-version`,
 
 Ruff can resolve different configuration files for different targets, and Ty owns its
 own resolution rules. This milestone therefore does not claim one effective numeric
-Analysis Python. For every Ruff, annotation, or Ty primary that has valid start
-evidence and completes with exit `0` or `1`, the `analysis_python_authority` field
-contains:
+Analysis Python. For every Ruff, annotations, annotations-fix, or Ty primary that has
+valid start evidence and completes with exit `0` or `1`, the
+`analysis_python_authority` field contains:
 
 ```json
 {"authority":"repository_tool","pyrepo_check_override":null}

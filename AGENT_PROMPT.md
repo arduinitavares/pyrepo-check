@@ -35,8 +35,9 @@ Environment contract:
 
 Dependency contract:
 - uv's default dependency selection must contain compatible repository-owned
-  dependencies required by the selected Checks, plus requested or configured
-  Coverage.py.
+  dependencies required by the selected Checks. Coverage.py is also required when
+  explicitly requested with `--coverage`, or when valid native Coverage
+  configuration auto-enables it for a target-free strict aggregate.
 - If a dependency is missing, incompatible, shadowed, or unusable, fix the target
   repository configuration and lock only with user authority. Never install or
   inject a package merely to make the report green.

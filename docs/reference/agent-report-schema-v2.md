@@ -119,7 +119,8 @@ Exact order: `name`, `module`, `required`, `status`, `version`, `origin`, `proce
 `error`.
 
 - `name`: `"ruff" | "ty" | "bandit" | "pytest" | "coverage"`
-- `module` and `required`: strings
+- `module`: exactly the same literal as `name`, using the fixed mapping below
+- `required`: string
 - `status`: `available | missing | incompatible | shadowed | unusable | unobserved`
 - `version`: string or null
 - `origin`: absolute path or null
@@ -137,10 +138,11 @@ Every non-null process has role `dependency_probe`. Status correlations are exac
 | `unusable` | No additional correlation | Successful process; `check_dependency_unusable`. |
 | `unobserved` | Both null | Either an attempted process with `check_dependency_unusable`, or null process/error because a pre-execution environment error prevented the attempt. |
 
-Here a successful probe means `outcome="exited"` and `exit_code=0`. The public
-validator intentionally imposes no further version/origin nullability rule on
-`missing` or `unusable`, nor on the unconstrained side of `incompatible` or
-`shadowed`.
+Here a successful probe has role `dependency_probe`, `outcome="exited"`, and
+`exit_code=0`; both `stdout` and `stderr` have `captured=true`, `truncated=false`, and
+`omitted_bytes=0`. The public validator intentionally imposes no further version/origin
+nullability rule on `missing` or `unusable`, nor on the unconstrained side of
+`incompatible` or `shadowed`.
 
 The normalized `required` ranges are fixed for this release:
 
@@ -281,7 +283,7 @@ Pytest correlations:
   | `session_incomplete` | `failed`, incomplete | Exit 1; evidence present. | Exact available dependency version. |
   | `interrupted` / `internal_error` / `usage_error` | `error`, incomplete | Exit 2 / 3 / 4; evidence present. | Exact available dependency version. |
   | `unknown_exit_code` | `error`, incomplete | Exit outside 0-5; evidence present. | Exact available dependency version. |
-  | Missing / incompatible / shadowed-or-unusable dependency | `module_unavailable` / `unsupported_version` / `preflight_invalid`; `error`, incomplete | Null exit/evidence. | Null / known incompatible version / null. |
+  | Missing / incompatible / shadowed, unusable, or unobserved dependency | `module_unavailable` / `unsupported_version` / `preflight_invalid`; `error`, incomplete | Null exit/evidence. | Null / known incompatible version / null. |
   | Environment unavailable | `preflight_invalid`; `error`, incomplete | Null exit/evidence. | Null. |
   | Setup did not reach primary | `not_started`; `error`, incomplete | Null exit/evidence. | Null before marker preparation; otherwise exact available dependency version. |
   | `spawn_failed` / `terminated_by_signal` | `error`, incomplete | Null exit/evidence. | Exact available dependency version. |
@@ -353,6 +355,19 @@ Error-version correlations are exact:
 - `unsupported_python`, `module_unavailable`, or `preflight_invalid`: null;
 - `spawn_failed` or `terminated_by_signal`: null or a supported stable version; and
 - every other Coverage error: a supported stable version.
+
+Repository-dependency and preparation correlations are also exact:
+
+| Cause | Coverage error/version/helper |
+| --- | --- |
+| Missing Coverage dependency | `module_unavailable`; null version; no `coverage_json` helper. |
+| Incompatible Coverage dependency | `unsupported_version`; known incompatible version; no `coverage_json` helper. |
+| Shadowed, unusable, or unobserved Coverage dependency | `preflight_invalid`; null version; no `coverage_json` helper. |
+| Environment/pytest preparation failure, unavailable pytest, or an early pytest setup/evidence failure that owns Coverage | `preflight_invalid`; null version; no `coverage_json` helper. |
+
+Thus unavailable Coverage never starts the JSON helper. A pytest preparation owner
+supersedes the Coverage-dependency mapping because no instrumentable pytest primary
+can establish Coverage evidence.
 
 | Coverage status | Required correlation |
 | --- | --- |

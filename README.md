@@ -28,8 +28,9 @@ controller. It does not replace the target project's Python or tool dependencies
 
 The target must be a uv project with `pyproject.toml` and a present, current
 `uv.lock`. uv's default dependency selection must provide compatible,
-repository-owned dependencies required by the selected Checks, plus Coverage when
-requested or configured:
+repository-owned dependencies required by the selected Checks. Coverage is also
+required when explicitly requested with `--coverage`, or when valid native Coverage
+configuration auto-enables it for a target-free strict aggregate:
 
 | Check | Locked distribution | Supported version |
 | --- | --- | --- |

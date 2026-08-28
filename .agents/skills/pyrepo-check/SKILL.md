@@ -43,9 +43,10 @@ use it only with source-change authority, inspect the diff, then rerun both chec
 ## Repository ownership and remediation
 
 uv's default selection must contain compatible repository-owned dependencies needed
-by the selected Checks, plus requested or configured Coverage. Fix dependency errors
-in repository configuration/lock only with user authority. Never inject packages
-merely to pass. Independent checks still run.
+by the selected Checks. Coverage is also required when requested with `--coverage` or
+auto-enabled by valid native configuration for a target-free strict aggregate. Fix
+dependency errors in repository configuration/lock only with user authority. Never
+inject packages merely to pass. Independent checks still run.
 
 uv may synchronize a safe ignored, untracked `.venv` from the current lock. Ordinary
 controller/preparation command construction does not request `pyproject.toml`,
