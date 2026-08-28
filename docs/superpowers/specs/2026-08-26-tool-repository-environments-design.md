@@ -31,25 +31,25 @@ inherited-`PYTHONPATH` rule, and positive-child-exit precedence in
 Existing selection, pytest, Coverage, artifact-safety, and quality-policy contracts
 remain in force unless this document explicitly changes them.
 
-## Problem
+## Pre-implementation problem
 
-The `pyrepo-check` package correctly requires Python 3.13.15 or newer. Current
-planning expands each Check into `uv run ... python -m ...`, but pytest and Coverage
-preflights also require the Repository Python to be at least 3.13.15. A repository
-that supports an older Python must therefore either raise its runtime requirement or
-cannot run the complete gate, even when its own Ruff, Ty, Bandit, pytest, and
-Coverage versions support that Python.
+Before this implementation, the `pyrepo-check` package correctly required Python
+3.13.15 or newer. Planning expanded each Check into `uv run ... python -m ...`, but
+pytest and Coverage preflights also required the Repository Python to be at least
+3.13.15. A repository that supported an older Python therefore had to either raise
+its runtime requirement or forgo the complete gate, even when its own Ruff, Ty,
+Bandit, pytest, and Coverage versions supported that Python.
 
-This couples two independent responsibilities:
+This coupled two independent responsibilities:
 
 - the Tool Environment imports and runs pyrepo-check's controller code; and
 - the Repository Environment executes code and Checks for the repository under
   validation.
 
-It also makes current Agent Reports ambiguous. A report can show a Python version
-from a pytest preflight without explicitly distinguishing the Python running the
-controller, the Python executing repository code, and the Python language rules
-used by static analysis.
+It also made Agent Reports ambiguous. A report could show a Python version from a
+pytest preflight without explicitly distinguishing the Python running the controller,
+the Python executing repository code, and the Python language rules used by static
+analysis.
 
 ## Goals
 

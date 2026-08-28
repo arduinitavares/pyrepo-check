@@ -1,9 +1,9 @@
 # pyrepo-check
 
 `pyrepo-check` is an install-once controller for Python repository quality gates.
-Python 3.13.15 or newer is required for the controller, while every selected check runs in
-the target repository's own locked uv environment and under one repository-selected
-CPython.
+Python 3.13.15 or newer is required for the controller, while every selected Check
+that can execute runs in the target repository's own locked uv environment and under
+one repository-selected CPython.
 
 ## Install the controller
 
@@ -28,7 +28,8 @@ controller. It does not replace the target project's Python or tool dependencies
 
 The target must be a uv project with `pyproject.toml` and a present, current
 `uv.lock`. uv's default dependency selection must provide compatible,
-repository-owned versions of the checks selected for the run:
+repository-owned dependencies required by the selected Checks, plus Coverage when
+requested or configured:
 
 | Check | Locked distribution | Supported version |
 | --- | --- | --- |
@@ -43,8 +44,13 @@ green. Fix a missing, incompatible, shadowed, or unusable dependency in the targ
 repository's configuration and lock, with the user's authority, then rerun.
 
 The repository's ignored, untracked `.venv` may be created or synchronized from the
-current lock. pyrepo-check does not change `pyproject.toml`, `uv.lock`, or tracked
-source during a normal run. A tracked, unignored, or symlinked `.venv` is rejected.
+current lock. Ordinary controller, preparation, and Check command construction does
+not request changes to `pyproject.toml`, `uv.lock`, or tracked source.
+Repository-controlled build backends, tests, and plugins may still write.
+Before/after evidence detects tracked or protected-file changes and reports
+`repository_state_changed`. This is not a sandbox: it does not prevent or roll back
+writes. Inspect changes and restore them
+only with user authority. A tracked, unignored, or symlinked `.venv` is rejected.
 
 ## Usage
 

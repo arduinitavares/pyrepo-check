@@ -27,12 +27,16 @@ Environment contract:
 - Ruff and Ty keep the Analysis Python semantics configured by the repository. Do
   not replace them with the controller or Repository Python version.
 - uv may reconstruct or synchronize a safe ignored, untracked `.venv` from the
-  current lock. pyrepo-check must not change `pyproject.toml`, `uv.lock`, or tracked
-  source during a normal run.
+  current lock. Ordinary pyrepo-check command construction does not request changes
+  to `pyproject.toml`, `uv.lock`, or tracked source, but repository-controlled build
+  backends, tests, or plugins may write. Before/after evidence reports detected
+  changes as `repository_state_changed`; this is not a sandbox and does not prevent
+  or roll back writes. Inspect changes and restore only with user authority.
 
 Dependency contract:
-- uv's default dependency selection must contain compatible repository-owned Ruff,
-  Ty, Bandit, pytest, and requested Coverage.py.
+- uv's default dependency selection must contain compatible repository-owned
+  dependencies required by the selected Checks, plus requested or configured
+  Coverage.py.
 - If a dependency is missing, incompatible, shadowed, or unusable, fix the target
   repository configuration and lock only with user authority. Never install or
   inject a package merely to make the report green.

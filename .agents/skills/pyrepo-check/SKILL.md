@@ -12,8 +12,8 @@ completion. `pyrepo-check --help` is the installed-version syntax authority.
 
 The globally installed Python 3.13.15+ CLI is only the **Tool Environment**
 controller. The target must be a uv project with a present, current `uv.lock`.
-Every executable check runs in one uv-managed **Repository Environment** under one
-Repository Python; pyrepo-check is not injected there.
+Every selected Check that can execute runs in one uv-managed **Repository
+Environment** under one Repository Python; pyrepo-check is not injected there.
 
 ## Workflow
 
@@ -42,13 +42,17 @@ use it only with source-change authority, inspect the diff, then rerun both chec
 
 ## Repository ownership and remediation
 
-uv's default selection must contain compatible repository-owned Ruff, Ty, Bandit,
-pytest, and requested Coverage. Fix missing, incompatible, shadowed, or unusable
-dependencies in repository configuration/lock only with user authority. Never inject
-or install them merely to pass. Independent checks still run.
+uv's default selection must contain compatible repository-owned dependencies needed
+by the selected Checks, plus requested or configured Coverage. Fix dependency errors
+in repository configuration/lock only with user authority. Never inject packages
+merely to pass. Independent checks still run.
 
-uv may synchronize a safe ignored, untracked `.venv` from the current lock. A normal
-run must not change `pyproject.toml`, `uv.lock`, or tracked source.
+uv may synchronize a safe ignored, untracked `.venv` from the current lock. Ordinary
+controller/preparation command construction does not request `pyproject.toml`,
+`uv.lock`, or tracked-source changes, but repository-controlled build backends, tests,
+or plugins may write. Before/after evidence detects and reports
+`repository_state_changed`; it does not prevent or roll back writes. Inspect and
+restore only with user authority.
 `--no-frozen` is recognized only to return `unsafe_unlocked_execution`; update the
 lock explicitly with user authority, then rerun without it.
 

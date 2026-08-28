@@ -126,11 +126,21 @@ Exact order: `name`, `module`, `required`, `status`, `version`, `origin`, `proce
 - `process`: `ProcessResult | null`
 - `error`: `CheckErrorV2 | null`
 
-`available` requires version, origin, a successful dependency-probe process, and null
-error. `missing`, `incompatible`, `shadowed`, and `unusable` require an attempted
-probe plus their matching error. `unobserved` either records an attempted probe whose
-evidence failed, or has null process/error because an environment-wide error prevented
-the attempt.
+Every non-null process has role `dependency_probe`. Status correlations are exact:
+
+| Status | Version/origin | Process/error |
+| --- | --- | --- |
+| `available` | Supported version and non-null origin | Successful process; null error. |
+| `missing` | No additional correlation | Successful process; `check_dependency_missing`. |
+| `incompatible` | Non-null version | Successful process; `check_dependency_incompatible`. |
+| `shadowed` | Non-null conflicting origin | Successful process; `check_dependency_shadowed`. |
+| `unusable` | No additional correlation | Successful process; `check_dependency_unusable`. |
+| `unobserved` | Both null | Either an attempted process with `check_dependency_unusable`, or null process/error because a pre-execution environment error prevented the attempt. |
+
+Here a successful probe means `outcome="exited"` and `exit_code=0`. The public
+validator intentionally imposes no further version/origin nullability rule on
+`missing` or `unusable`, nor on the unconstrained side of `incompatible` or
+`shadowed`.
 
 The normalized `required` ranges are fixed for this release:
 
@@ -214,9 +224,10 @@ Exact order: `name`, `status`, `execution_environment`,
 
 A passed/failed check has a completed primary, trusted start evidence,
 `execution_environment: "repository"`, and null error. An error check always has an
-error. Static-analysis authority is non-null only for Ruff/annotations/Ty after valid
-start evidence and primary exit 0 or 1. An environment/dependency synthesized error
-has no process or start/execution/analysis evidence. Independent checks may still run.
+error. Static-analysis authority is non-null only for Ruff, annotations,
+annotations-fix, or Ty after valid start evidence and primary exit 0 or 1. An
+environment/dependency synthesized error has no process or start/execution/analysis
+evidence. Independent checks may still run.
 
 ### `Advisory`
 
@@ -246,15 +257,53 @@ Exact order: `effective_args: string[]`, `collected: integer`,
 
 - `PytestCounts`: `passed`, `failed`, `errors`, `skipped`, `xfailed`, `xpassed`
   (all integers, in that order).
-- `CollectionIssue`: `nodeid`, then `message` (strings).
+- `CollectionIssue`: `nodeid: string`, then `message: string`.
 - `SlowTest`: `nodeid: string`, then `duration_ms: integer`.
-- `SpecialTestOutcome`: `nodeid`, `outcome`, `reason`, `strict`, `affects_exit`,
-  `duration_ms`. Outcome is `skipped | xfailed | xpassed`; `reason` and `strict` are
-  nullable; `affects_exit` is boolean.
+- `SpecialTestOutcome`: `nodeid: string`,
+  `outcome: "skipped" | "xfailed" | "xpassed"`, `reason: string | null`,
+  `strict: boolean | null`, `affects_exit: boolean`, then
+  `duration_ms: integer`. Skips and xfails require null `strict` and false
+  `affects_exit`; an xpass requires non-null `strict` and
+  `affects_exit == strict`.
 - `PytestError`: `code: PytestErrorCode`, then `message: string`.
 
-`complete` requires complete collection/session evidence and every selected test to
-reach a terminal result. `scope_reasons` are deterministic and ordered by policy.
+Pytest correlations:
+
+- `complete=true` requires evidence, null error, and a non-error status. Null evidence
+  requires an incomplete error result with a non-null error. The sole non-error result
+  allowed to contain an error is incomplete `failed` evidence with
+  `session_incomplete`.
+- Pytest status, error, exit, evidence, and dependency-version correlations are:
+
+  | Error/code family | Status and completeness | Exit/evidence | `pytest_version` |
+  | --- | --- | --- | --- |
+  | null, exit 0 / 1 / 5 | `passed` / `failed` / `failed`; may be complete | Same exit; evidence present. Complete exit 5 requires collected 0. | Exact available dependency version. |
+  | `session_incomplete` | `failed`, incomplete | Exit 1; evidence present. | Exact available dependency version. |
+  | `interrupted` / `internal_error` / `usage_error` | `error`, incomplete | Exit 2 / 3 / 4; evidence present. | Exact available dependency version. |
+  | `unknown_exit_code` | `error`, incomplete | Exit outside 0-5; evidence present. | Exact available dependency version. |
+  | Missing / incompatible / shadowed-or-unusable dependency | `module_unavailable` / `unsupported_version` / `preflight_invalid`; `error`, incomplete | Null exit/evidence. | Null / known incompatible version / null. |
+  | Environment unavailable | `preflight_invalid`; `error`, incomplete | Null exit/evidence. | Null. |
+  | Setup did not reach primary | `not_started`; `error`, incomplete | Null exit/evidence. | Null before marker preparation; otherwise exact available dependency version. |
+  | `spawn_failed` / `terminated_by_signal` | `error`, incomplete | Null exit/evidence. | Exact available dependency version. |
+  | `unsupported_parallelism`, `unsupported_retries`, `exit_code_mismatch`, `artifact_missing`, `artifact_invalid`, or `artifact_not_finalized` | `error`, incomplete | Retained primary exit; null evidence. | Exact available dependency version. |
+
+  If workspace setup fails before retaining an unavailable-dependency preflight, the
+  result uses the `not_started` row. `unsupported_python` remains in the owner enum
+  but has no accepted schema-v2 Run Report correlation; Repository Python rejection
+  is represented by environment error plus synthesized `preflight_invalid` pytest.
+- Scope is complete exactly when `scope_reasons` is empty. Reasons are unique in the
+  registry order. `planned_selector` exactly matches partial planned scope;
+  `deselected_tests` exactly matches a positive deselected count; and
+  `incomplete_session` exactly negates `complete`. The generator adds
+  `effective_narrowing_option`, `unclassified_external_option`, and
+  `collection_reduced` from the validated pytest invocation/artifact. Null evidence
+  permits only `planned_selector` and `incomplete_session`.
+- Collection errors and skips are unique and ordered by `(nodeid, message)`. Slow
+  tests use unique nodeids, descending duration then nodeid order, and contain exactly
+  `min(10, total outcome count)` entries. Special outcomes use unique nodeids and
+  nodeid order, and their cardinality equals skipped + xfailed + xpassed. A shared
+  nodeid has the same duration in both lists. Outcome counts never exceed collected;
+  complete evidence has no collection errors and total outcomes equal collected.
 
 ## Coverage objects
 
@@ -294,12 +343,32 @@ gate-eligible. Guidance is not gate-eligible and does not evaluate the threshold
 error is partial, incomplete, non-gating, has null totals/empty files, a non-null
 error, and threshold skip reason `evidence_error`.
 
+For thresholds, `configured=true` requires a finite numeric value; false requires a
+null value. `evaluated=true` requires a boolean result and null skip reason;
+unevaluated requires null `passed` and one non-null skip reason. Every non-error result
+has complete totals, null error, and a trusted supported stable Coverage version.
+Error-version correlations are exact:
+
+- `unsupported_version`: null or a stable version outside the supported range;
+- `unsupported_python`, `module_unavailable`, or `preflight_invalid`: null;
+- `spawn_failed` or `terminated_by_signal`: null or a supported stable version; and
+- every other Coverage error: a supported stable version.
+
 | Coverage status | Required correlation |
 | --- | --- |
 | `passed` | Complete scope/evidence and eligible; a configured threshold is evaluated and true, or an unconfigured threshold is skipped as `not_configured`. |
 | `failed` | Complete scope/evidence and eligible; configured threshold evaluated false with no skip reason. |
 | `guidance` | Valid complete measurement but non-gating; threshold is not evaluated and has a non-error skip reason. |
 | `error` | Partial/incomplete/non-gating; null totals, empty files, non-null error, and `evidence_error`. |
+
+Report-context validation derives Coverage scope, eligibility, skip reason, and
+status rather than trusting them independently. Scope is complete exactly when
+planned Coverage, pytest scope, and Coverage evidence are complete. Eligibility also
+requires strict-aggregate mode, target-free passing complete pytest evidence, no
+scope reason, and no Test Shortcut. Skip-reason priority is `evidence_error`,
+`not_configured`, `no_tests_collected`, `pytest_incomplete`, `pytest_failed`,
+`partial_run`, then `focused_run`; eligible threshold false yields `failed`, eligible
+otherwise yields `passed`, and non-eligible valid evidence yields `guidance`.
 
 ## Complete enum and code registry
 

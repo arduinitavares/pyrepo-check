@@ -20,8 +20,7 @@ As of 2026-08-25, the prior research, design specification, Agent Skill, README
 guidance, repository cleanup, and Milestones A-B implementation are merged and
 pushed on `main`. C1 Test Shortcuts, C2 structured pytest evidence, C3 coverage
 execution and guidance, and D repository coverage adoption are implemented and
-verified. The next separate post-D action is repository and installed Agent Skill
-synchronization. The implemented successor now synchronizes the repository Skill;
+verified. The implemented successor later synchronized the repository Skill. Only
 personal installed Skill deployment remains a separate action.
 
 | Milestone | State | Evidence |
