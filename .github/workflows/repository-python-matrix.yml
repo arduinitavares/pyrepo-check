@@ -18,8 +18,8 @@ jobs:
         with:
           version: "0.10.12"
           enable-cache: true
-      - name: Install controller and fixture Pythons
-        run: uv python install "$CONTROLLER_PYTHON" 3.13
+      - name: Install controller Python
+        run: uv python install "$CONTROLLER_PYTHON"
       - name: Synchronize controller environment
         run: uv sync --locked --python "$CONTROLLER_PYTHON"
       - name: Run controller quality gate including real uv integration

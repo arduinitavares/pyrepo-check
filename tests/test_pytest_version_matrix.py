@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess  # nosec B404
+import sys
 from typing import cast
 
 import pytest
@@ -24,13 +25,25 @@ def test_isolated_matrix_reports_process_failure_before_reading_artifact(
         stdout="isolated stdout",
         stderr="isolated stderr",
     )
-    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: completed)
+    captured_command: tuple[str, ...] | None = None
+
+    def fake_run(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_command
+        captured_command = command
+        return completed
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     with pytest.raises(AssertionError, match="isolated pytest failed") as captured:
         run_isolated_pytest_project(tmp_path, "8.0.2")
 
     assert "isolated stdout" in str(captured.value)
     assert "isolated stderr" in str(captured.value)
+    assert captured_command is not None
+    assert captured_command[4] == sys.executable
 
 
 def run_isolated_pytest_project(
@@ -104,7 +117,7 @@ def test_deselected():
             "run",
             "--isolated",
             "--python",
-            "3.13.15",
+            sys.executable,
             "--with",
             f"pytest=={pytest_version}",
             "python",
