@@ -1768,3 +1768,13 @@ def test_repository_coverage_threshold_is_explicit() -> None:
         "fail_under": 86.01,
         "precision": 2,
     }
+
+
+def test_integration_marker_does_not_hide_real_uv_proof_from_the_default_gate() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pytest_policy = pyproject["tool"]["pytest"]["ini_options"]
+
+    assert pytest_policy["markers"] == [
+        "integration: exercises real external uv and Git repository boundaries"
+    ]
+    assert "-m" not in pytest_policy["addopts"].split()

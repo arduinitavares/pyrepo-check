@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess  # nosec B404
 from typing import cast
 import uuid
@@ -39,6 +40,153 @@ _SUPPORTED_COVERAGE_PREFLIGHT = (
     b'{"schema_version":1,"python_version":[3,13,15],'
     b'"coverage_available":true,"coverage_version":"7.15.2"}'
 )
+
+_REPOSITORY_FIXTURE_DEPENDENCIES = (
+    "bandit>=1.9,<2",
+    "coverage[toml]>=7.15,<8",
+    "pytest>=8,<9",
+    "ruff>=0.15,<1",
+    "ty>=0.0.35,<0.1",
+)
+
+
+def repository_test_environment(storage_root: Path) -> dict[str, str]:
+    """Return a child environment whose writable uv cache stays test-owned."""
+    resolved_storage = storage_root.resolve()
+    return {
+        **os.environ,
+        "UV_CACHE_DIR": str(resolved_storage / "cache"),
+        "UV_PYTHON_CACHE_DIR": str(resolved_storage / "python-cache"),
+        "UV_PYTHON_BIN_DIR": str(resolved_storage / "python-bin"),
+        "UV_NO_PROGRESS": "1",
+    }
+
+
+def write_locked_repository_fixture(
+    tmp_path: Path,
+    *,
+    python: str,
+    dependencies: tuple[str, ...] = _REPOSITORY_FIXTURE_DEPENDENCIES,
+) -> Path:
+    """Create one committed uv repository without installing pyrepo-check."""
+    repository = tmp_path / "repository"
+    package = repository / "src" / "fixture_package"
+    tests = repository / "tests"
+    package.mkdir(parents=True)
+    tests.mkdir()
+    rendered_dependencies = "\n".join(f'    "{item}",' for item in dependencies)
+    (repository / "pyproject.toml").write_text(
+        f'''[project]
+name = "repository-environment-fixture"
+version = "0.0.0"
+requires-python = ">=3.10,<3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+{rendered_dependencies}
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/fixture_package"]
+parallel = false
+
+[tool.coverage.report]
+fail_under = 100
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ty.environment]
+python-version = "3.10"
+
+[tool.bandit]
+exclude_dirs = [".venv", "tests"]
+''',
+        encoding="utf-8",
+    )
+    (repository / ".gitignore").write_text(
+        ".venv/\n.pytest_cache/\n.ruff_cache/\n__pycache__/\n",
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text(
+        '''"""A fully annotated repository fixture package."""
+
+
+def classify(value: int) -> str:
+    """Classify one integer by sign."""
+    if value > 0:
+        return "positive"
+    return "nonpositive"
+''',
+        encoding="utf-8",
+    )
+    (tests / "test_fixture_package.py").write_text(
+        '''"""Repository-owned tests and environment assertions."""
+
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+import __main__
+from src.fixture_package import classify
+
+
+def test_classify_covers_both_branches() -> None:
+    """Exercise every branch for the fixture's strict Coverage policy."""
+    assert classify(1) == "positive"
+    assert classify(0) == "nonpositive"
+
+
+def test_repository_process_has_native_isolated_startup() -> None:
+    """Prove repository ownership without importing controller code."""
+    controller_path = os.environ["PYREPO_CHECK_CONTROLLER_PATH_SENTINEL"]
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    spec = __main__.__spec__
+    assert Path.cwd() == Path(__file__).parents[1]
+    assert controller_path not in pythonpath.split(os.pathsep)
+    assert importlib.util.find_spec("pyrepo_check") is None
+    assert spec is not None
+    assert sys.orig_argv[1] == "-m"
+    assert sys.orig_argv[2] in {"coverage", "pytest"}
+''',
+        encoding="utf-8",
+    )
+    uv = shutil.which("uv")
+    git = shutil.which("git")
+    if uv is None or git is None:
+        raise RuntimeError("real uv and Git executables are required for integration fixtures")
+    environment = repository_test_environment(tmp_path / "uv-storage")
+    subprocess.run(  # nosec B603
+        (str(Path(uv).resolve()), "lock", "--python", python),
+        cwd=repository,
+        env=environment,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run((str(Path(git).resolve()), "init", "-q"), cwd=repository, check=True)  # nosec B603
+    subprocess.run(  # nosec B603
+        (str(Path(git).resolve()), "config", "user.name", "pyrepo-check fixture"),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(  # nosec B603
+        (str(Path(git).resolve()), "config", "user.email", "fixture@example.invalid"),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run((str(Path(git).resolve()), "add", "."), cwd=repository, check=True)  # nosec B603
+    subprocess.run(  # nosec B603
+        (str(Path(git).resolve()), "commit", "-q", "-m", "fixture"),
+        cwd=repository,
+        check=True,
+    )
+    return repository
 
 
 @dataclass(frozen=True)

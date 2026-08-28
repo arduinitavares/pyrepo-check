@@ -34,6 +34,9 @@ target-version = "py313"
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+markers = [
+    "integration: exercises real external uv and Git repository boundaries",
+]
 
 [tool.coverage.run]
 branch = true

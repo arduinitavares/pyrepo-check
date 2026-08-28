@@ -31,6 +31,8 @@ from pyrepo_check.execution import (
     ToolEnvironmentObservation,
 )
 from pyrepo_check.planning import CheckInvocation, DefaultRepositoryPython, RunPlan
+from pyrepo_check.planning import PytestExecutionPlan
+from pyrepo_check.pytest_execution import PytestArtifactObservation, PytestExecutionObservation
 from pyrepo_check.pytest_evidence import (
     CollectionIssue,
     PytestCounts,
@@ -68,6 +70,8 @@ from tests.test_reporting_schema_v2 import (
     tool_environment_evidence,
     valid_run_report,
 )
+from tests.test_pytest_evidence import _check as pytest_evidence_check
+from tests.test_pytest_evidence import _with_exit as pytest_evidence_with_exit
 
 
 def _observed_process(process: object) -> ExecutedProcess:
@@ -152,6 +156,112 @@ def _ordinary_success_composition() -> tuple[Path, RunPlan, RepositoryExecutionR
                 ),
                 processes=tuple(_observed_process(process) for process in check.processes),
                 error=None,
+            ),
+        ),
+    )
+    return root, plan, execution
+
+
+def _pytest_composition(
+    pytest_observation: PytestExecutionObservation,
+    *,
+    primary_exit: int,
+    observation_error: CheckExecutionFailure | None = None,
+) -> tuple[Path, RunPlan, RepositoryExecutionResult]:
+    expected = pytest_run_report(exit_code=primary_exit)
+    root = Path(expected.project_root)
+    planned = CheckInvocation(
+        "pytest",
+        (),
+        pytest=PytestExecutionPlan(pytest_args=()),
+    )
+    plan = RunPlan(
+        root=root,
+        repository_python=DefaultRepositoryPython(),
+        mode=expected.mode,
+        targets=(),
+        checks=(planned,),
+        output_format="json",
+        pytest_args=(),
+        planned_test_scope="complete",
+        planned_coverage_scope="not_requested",
+    )
+    environment = expected.repository_environment
+    python = environment.python
+    assert python is not None
+    repository_python = PythonObservation(
+        python.implementation,
+        python.version,
+        Path(python.executable),
+    )
+    dependencies = tuple(
+        DependencyObservation(
+            name=dependency.name,
+            module=dependency.module,
+            required=dependency.required,
+            status=dependency.status,
+            version=dependency.version,
+            origin=dependency.origin,
+            process=(
+                None
+                if dependency.process is None
+                else _observed_process(dependency.process)
+            ),
+            error=(
+                None
+                if dependency.error is None
+                else CheckExecutionFailure(
+                    dependency.error.code,
+                    dependency.error.message,
+                    dependency.error.hint,
+                )
+            ),
+        )
+        for dependency in environment.dependencies
+    )
+    environment_observation = RepositoryEnvironmentObservation(
+        manager_version=environment.manager_version,
+        path=None if environment.path is None else Path(environment.path),
+        python_selection=plan.repository_python,
+        python=repository_python,
+        lock_path=Path(environment.lock.path),
+        lock_status=environment.lock.status,
+        mutation_protection=environment.mutation_protection,
+        dependencies=dependencies,
+        processes=tuple(_observed_process(process) for process in environment.processes),
+        error=None,
+    )
+    expected_check = expected.checks[0]
+    start = expected_check.start_evidence
+    assert start is not None
+    tool_python = expected.tool_environment.python
+    execution = RepositoryExecutionResult(
+        tool_environment=ToolEnvironmentObservation(
+            expected.tool_environment.pyrepo_check_version,
+            PythonObservation(
+                tool_python.implementation,
+                tool_python.version,
+                Path(tool_python.executable),
+            ),
+        ),
+        repository_environment=environment_observation,
+        checks=(
+            RepositoryCheckObservation(
+                invocation=planned,
+                execution_environment="repository",
+                analysis_python_authority=None,
+                start=CheckStartObservation(
+                    start.schema_version,
+                    start.check,
+                    start.module,
+                    start.arguments_sha256,
+                    repository_python,
+                ),
+                processes=tuple(
+                    _observed_process(process) for process in expected_check.processes
+                ),
+                error=observation_error,
+                pytest=pytest_observation,
             ),
         ),
     )
@@ -566,6 +676,118 @@ def test_public_composition_projects_exact_truncation_advisory_once() -> None:
     messages = {advisory.message for advisory in report.advisories}
     assert any("stdout omitted 9 byte(s)" in message for message in messages)
     assert any("stderr omitted 9 byte(s)" in message for message in messages)
+
+
+def _pytest_evidence_error_cases() -> tuple[
+    tuple[str, PytestExecutionObservation, int],
+    ...,
+]:
+    observed = pytest_evidence_check()
+    pytest_observation = observed.pytest
+    assert pytest_observation is not None
+    return (
+        (
+            "invalid",
+            replace(
+                pytest_observation,
+                artifact=PytestArtifactObservation(
+                    "snapshot",
+                    b"{",
+                    pytest_observation.artifact.writer_ids,
+                    None,
+                ),
+            ),
+            0,
+        ),
+        (
+            "missing",
+            replace(
+                pytest_observation,
+                artifact=PytestArtifactObservation("missing", None, (), None),
+            ),
+            0,
+        ),
+        ("exit-mismatch", pytest_observation, 1),
+    )
+
+
+@pytest.mark.parametrize(
+    ("_case", "pytest_observation", "primary_exit"),
+    _pytest_evidence_error_cases(),
+)
+def test_public_composition_projects_nested_pytest_evidence_errors_to_the_check(
+    _case: str,
+    pytest_observation: PytestExecutionObservation,
+    primary_exit: int,
+) -> None:
+    root, plan, execution = _pytest_composition(
+        pytest_observation,
+        primary_exit=primary_exit,
+    )
+
+    report = build_run_report(root, plan, execution)
+
+    nested_error = report.pytest.error if report.pytest is not None else None
+    assert nested_error is not None
+    assert report.checks[0].status == "error"
+    assert report.checks[0].error is not None
+    assert report.checks[0].error.code == "pytest_evidence_error"
+    assert report.checks[0].error.message == nested_error.message
+    assert report.checks[0].error.hint is None
+
+
+def test_public_composition_keeps_session_incomplete_as_a_failed_check() -> None:
+    observed = pytest_evidence_with_exit(
+        pytest_evidence_check(),
+        1,
+        stopped_early=True,
+    )
+    pytest_observation = observed.pytest
+    assert pytest_observation is not None
+    root, plan, execution = _pytest_composition(
+        pytest_observation,
+        primary_exit=1,
+    )
+
+    report = build_run_report(root, plan, execution)
+
+    assert report.pytest is not None
+    assert report.pytest.error is not None
+    assert report.pytest.error.code == "session_incomplete"
+    assert report.checks[0].status == "failed"
+    assert report.checks[0].error is None
+
+
+def test_authoritative_pytest_observation_error_precedes_nested_evidence_error() -> None:
+    observed = pytest_evidence_check()
+    pytest_observation = observed.pytest
+    assert pytest_observation is not None
+    invalid = replace(
+        pytest_observation,
+        artifact=PytestArtifactObservation(
+            "snapshot",
+            b"{",
+            pytest_observation.artifact.writer_ids,
+            None,
+        ),
+    )
+    authoritative = CheckExecutionFailure(
+        "cleanup_failed",
+        "pytest workspace cleanup failed",
+        "Inspect the run workspace.",
+    )
+    root, plan, execution = _pytest_composition(
+        invalid,
+        primary_exit=0,
+        observation_error=authoritative,
+    )
+
+    report = build_run_report(root, plan, execution)
+
+    assert report.checks[0].error is not None
+    assert report.checks[0].error.code == "cleanup_failed"
+    assert report.checks[0].error.message == authoritative.message
+    assert report.checks[0].error.hint == authoritative.hint
 
 
 def test_public_composition_rejects_missing_mismatched_and_extra_observations() -> None:

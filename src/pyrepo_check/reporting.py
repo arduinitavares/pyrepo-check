@@ -1671,6 +1671,17 @@ def _build_check_result_v2(
         if pytest_result is None:
             raise ReportingError("selected pytest requires nested evidence")
         status = pytest_result.status
+        nested_error = pytest_result.error
+        if (
+            status == "error"
+            and nested_error is not None
+            and nested_error.code != "session_incomplete"
+        ):
+            error = CheckErrorV2(
+                "pytest_evidence_error",
+                nested_error.message,
+                None,
+            )
     else:
         primary = next((process for process in observation.processes if process.role == "primary"), None)
         if primary is None:
