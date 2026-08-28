@@ -152,6 +152,35 @@ def test_python_request_is_accepted_before_or_after_check_tokens() -> None:
     assert parse_args(("ty", "--python", "3.12")).checks == ["ty"]
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    (
+        (("--all",), (True, None, "terminal", [])),
+        (("--python", "3.12", "--all"), (True, "3.12", "terminal", [])),
+        (
+            ("--python", "3.12", "annotations", "ty", "src/"),
+            (False, "3.12", "terminal", ["annotations", "ty", "src/"]),
+        ),
+        (
+            ("--python", "3.12", "--format", "json", "--all"),
+            (True, "3.12", "json", []),
+        ),
+    ),
+)
+def test_canonical_repository_environment_commands_are_public_cli_syntax(
+    argv: tuple[str, ...],
+    expected: tuple[bool, str | None, str, list[str]],
+) -> None:
+    arguments = parse_args(argv)
+
+    assert (
+        arguments.all,
+        arguments.python,
+        arguments.format,
+        arguments.checks,
+    ) == expected
+
+
 def test_schema_v2_planning_error_observes_tool_environment_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

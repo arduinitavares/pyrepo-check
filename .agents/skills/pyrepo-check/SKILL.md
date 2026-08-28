@@ -1,91 +1,74 @@
 ---
 name: pyrepo-check
-description: Use when validating Python repository changes with pyrepo-check, especially for focused typing, annotation, lint, security, pytest, or final quality-gate work.
+description: Use when validating Python repository changes with pyrepo-check, especially for focused typing, annotation, lint, security, pytest, coverage, or final quality-gate work.
 ---
 
 # Using pyrepo-check
 
-## Overview
+## Core contract
 
-Use `pyrepo-check` for fast, focused feedback while editing and the strict
-repository gate before completion. The installed CLI is the command source of
-truth; confirm its current interface with `pyrepo-check --help`.
+Use focused checks while editing and target-free `pyrepo-check --all` before
+completion. `pyrepo-check --help` is the installed-version syntax authority.
+
+The globally installed Python 3.13.15+ CLI is only the **Tool Environment**
+controller. The target must be a uv project with a present, current `uv.lock`.
+Every executable check runs in one uv-managed **Repository Environment** under one
+Repository Python; pyrepo-check is not injected there.
 
 ## Workflow
 
-1. Run from the target repository root, or pass `--root <path>`.
-2. During editing, choose the smallest checks that cover the changed behavior.
-3. Run `pyrepo-check --all` before claiming the repository is fully verified.
-4. Report the exact commands, failures, and any gate that remains unrun.
+1. Inspect `git status --short`, `pyproject.toml`, `uv.lock`, and
+   `pyrepo-check --help`.
+2. Run the smallest focused check for the edit.
+3. Fix code or repository configuration without weakening policy.
+4. Inspect `pyrepo-check --format json --all`, then run `pyrepo-check --all` before
+   claiming completion.
 
-If `pyrepo-check` is unavailable, report that fact. Do not install or upgrade it
-unless the current task authorizes environment changes.
+## Commands
 
-## Quick Reference
-
-| Change or intent | Command |
+| Intent | Command |
 | --- | --- |
-| Type signatures or annotations | `pyrepo-check annotations ty <target>` |
-| Lint | `pyrepo-check ruff <target>` |
-| Security-sensitive Python | `pyrepo-check bandit <target>` |
-| One test file | `pyrepo-check pytest tests/test_file.py` |
-| One exact test | `pyrepo-check pytest tests/test_file.py::test_name` |
-| Tests matching a name | `pyrepo-check pytest -- -k pattern` |
-| Strict final validation | `pyrepo-check --all` |
-| Machine-readable focused report | `pyrepo-check --format json ty` |
-| Machine-readable strict report | `pyrepo-check --format json --all` |
+| Strict repository-native gate | `pyrepo-check --all` |
+| One CI-selected Repository Python | `pyrepo-check --python 3.12 --all` |
+| Focused typing | `pyrepo-check --python 3.12 annotations ty src/` |
+| Strict schema-v2 evidence | `pyrepo-check --python 3.12 --format json --all` |
+| One test | `pyrepo-check pytest tests/test_file.py::test_name` |
 
-`annotations` enforces annotation policy; `ty` checks type correctness. Run
-both for typing-related edits. A target-only command such as
-`pyrepo-check src/module.py` runs the file-oriented checks but does not run
-pytest.
+Omit `--python` for uv's repository-native selection. Use it only when the user or
+CI chooses one Python for that run. A matrix requires separate invocations.
 
-## Agent report output
+Run `annotations` and `ty` together for typing work. `annotations-fix` mutates files:
+use it only with source-change authority, inspect the diff, then rerun both checks.
 
-Terminal is the default: native tool diagnostics stream as each check runs,
-followed by a deterministic summary. Focused and strict command selection is
-unchanged:
+## Repository ownership and remediation
 
-```bash
-pyrepo-check ty
-pyrepo-check pytest tests/test_cli.py::test_name
-pyrepo-check --format json ty
-pyrepo-check --format json --all
-```
+uv's default selection must contain compatible repository-owned Ruff, Ty, Bandit,
+pytest, and requested Coverage. Fix missing, incompatible, shadowed, or unusable
+dependencies in repository configuration/lock only with user authority. Never inject
+or install them merely to pass. Independent checks still run.
 
-`--format json` writes exactly one versioned JSON document and a trailing
-newline to stdout. It captures each tool's stdout and stderr inside the
-document. Schema version 1 has explicit top-level `pytest: null` and
-`coverage: null`; a selected pytest process still appears in `selection.checks`
-and `checks`.
+uv may synchronize a safe ignored, untracked `.venv` from the current lock. A normal
+run must not change `pyproject.toml`, `uv.lock`, or tracked source.
+`--no-frozen` is recognized only to return `unsafe_unlocked_execution`; update the
+lock explicitly with user authority, then rerun without it.
 
-The first positive tool exit code remains the CLI exit code. Checks continue
-after ordinary failures; when execution has only spawn or signal errors, the
-CLI returns `2`.
+Ruff and Ty retain repository-configured **Analysis Python** semantics, which may
+differ from Repository Python. Do not rewrite their target from controller evidence.
 
-## Mutating Fixes
+## Read schema version 2
 
-`pyrepo-check annotations-fix <target>` edits files. Use it only when source
-changes are authorized. Inspect the diff afterward, then rerun `annotations`
-and `ty` before the final gate.
+For JSON, inspect:
 
-## Example
+- `tool_environment` for controller version and Tool Python;
+- `repository_environment` for exact Repository Python, current lock, mutation
+  protection, dependencies, processes, and environment error;
+- every check's `execution_environment`, `analysis_python_authority`,
+  `start_evidence`, processes, status, and error; and
+- nested `pytest` and `coverage` evidence.
 
-For a type-signature and behavior change in an invoice module:
+Do not stop at `overall_status`: a local error can coexist with useful later evidence.
+Coverage with `scope="partial"`, `status="guidance"`, and `gate_eligible=false` is
+useful guidance, not a repository-wide threshold gate.
 
-```bash
-pyrepo-check annotations ty src/invoice.py
-pyrepo-check pytest tests/test_invoice.py::test_invoice_rounding
-pyrepo-check --all
-```
-
-## Common Mistakes
-
-- Do not guess names such as `typing`, `typecheck`, or `test`; inspect `--help`.
-- Do not treat `ty` alone as proof of annotation-policy compliance.
-- Do not bypass the wrapper for targeted pytest when its `pytest` check works.
-- Do not use focused checks as a substitute for the final `--all` gate.
-- Do not invent coverage or named-group options absent from `--help`.
-
-For installation, configuration, and command expansion details, consult the
-project `README.md`.
+Inside pyrepo-check source, use `docs/reference/agent-report-schema-v2.md` for every
+field, enum, invariant, and example.

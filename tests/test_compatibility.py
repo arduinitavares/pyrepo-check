@@ -1651,6 +1651,45 @@ options:
     assert output.err == ""
 
 
+def test_no_frozen_public_cli_returns_typed_schema_v2_rejection(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'unsafe-unlocked-fixture'\nversion = '0'\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(  # nosec B603
+        (
+            sys.executable,
+            "-m",
+            "pyrepo_check.cli",
+            "--root",
+            str(tmp_path),
+            "--format",
+            "json",
+            "--no-frozen",
+            "ty",
+        ),
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 2
+    assert completed.stderr == ""
+    assert payload["schema_version"] == 2
+    assert payload["kind"] == "planning_error"
+    assert payload["repository_environment"] is None
+    assert payload["error"] == {
+        "code": "unsafe_unlocked_execution",
+        "message": "--no-frozen is incompatible with repository-safe execution.",
+        "hint": "Update uv.lock explicitly, then rerun without --no-frozen.",
+    }
+
+
 def test_format_defaults_to_terminal() -> None:
     assert parse_args([]).format == "terminal"
 

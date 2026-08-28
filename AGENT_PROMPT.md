@@ -1,98 +1,88 @@
-# Agent Prompt: pyrepo-check Cleanup Workflow
+# Agent Prompt: pyrepo-check Repository Workflow
 
-Use this prompt when asking an agent to clean up a repository that uses the
-global `pyrepo-check` quality gate.
+Use this prompt when asking an agent to improve a uv-managed Python repository with
+the globally installed `pyrepo-check` controller.
 
 ```text
-I want you to strategically refactor this repository until `pyrepo-check --all`
-passes cleanly.
+Improve this repository until its pyrepo-check quality gate passes without weakening
+intended behavior or quality policy.
 
-Goal:
-Make the repo healthy under the global `pyrepo-check` quality gate without
-changing intended behavior.
-
-Start by inspecting the repository:
+Start with read-only evidence:
 - `git status --short`
-- project layout
-- `pyproject.toml`
-- existing tests
-- current `pyrepo-check --all` output
+- project layout and `pyproject.toml`
+- `uv.lock` presence/currentness
+- `pyrepo-check --help`
+- `pyrepo-check --format json --all`
 
-Important pyrepo-check behavior:
-- `pyrepo-check --all` is the strict aggregate gate.
-- No-argument `pyrepo-check` behaves the same as `pyrepo-check --all`.
-- The aggregate gate runs all selected checks and reports diagnostics from every
-  selected tool before returning a non-zero exit code.
-- Without explicit target paths, `--all` runs Ruff, annotation reporting, and
-  Bandit against the repository root (`.`).
-- Focused checks may use project-configured targets.
+Environment contract:
+- The globally installed pyrepo-check and its Python 3.13.15+ runtime are only the
+  Tool Environment/controller.
+- The target must be a uv project with a present, current `uv.lock`.
+- One normal invocation uses one uv-selected Repository Python. Use `--python` only
+  when the user or CI selects one version, for example:
+  `pyrepo-check --python 3.12 --all`
+- A Python matrix is multiple invocations, not one pyrepo-check run.
+- Every executable check runs in the Repository Environment. pyrepo-check itself is
+  not injected there.
+- Ruff and Ty keep the Analysis Python semantics configured by the repository. Do
+  not replace them with the controller or Repository Python version.
+- uv may reconstruct or synchronize a safe ignored, untracked `.venv` from the
+  current lock. pyrepo-check must not change `pyproject.toml`, `uv.lock`, or tracked
+  source during a normal run.
 
-Core commands:
-- Full strict repo gate:
+Dependency contract:
+- uv's default dependency selection must contain compatible repository-owned Ruff,
+  Ty, Bandit, pytest, and requested Coverage.py.
+- If a dependency is missing, incompatible, shadowed, or unusable, fix the target
+  repository configuration and lock only with user authority. Never install or
+  inject a package merely to make the report green.
+- `--no-frozen` is intentionally rejected as `unsafe_unlocked_execution`. Update the
+  lock explicitly with user authority, then rerun without the flag.
+- A check-local dependency error does not suppress independent checks. Inspect every
+  check status and its evidence.
+
+Editing workflow:
+1. Use the smallest focused command for the current change.
+2. Fix one coherent failure class at a time.
+3. Preserve public APIs and behavior unless tests establish the intended change.
+4. Never weaken Ruff, annotation, Ty, Bandit, pytest, or Coverage configuration just
+   to pass.
+5. Run the strict target-free gate before completion.
+
+Canonical commands:
+- Strict repository-native gate:
   `pyrepo-check --all`
-- Focused checks by class:
-  `pyrepo-check ruff`
-  `pyrepo-check annotations`
-  `pyrepo-check ty`
-  `pyrepo-check bandit`
-  `pyrepo-check pytest`
-- File-oriented checks for one file:
-  `pyrepo-check path/to/file.py`
-- Full gate against one file, including pytest:
-  `pyrepo-check --all path/to/file.py`
-- Focused annotation report for one file:
-  `pyrepo-check annotations path/to/file.py`
-- Mechanical annotation fixer:
-  `pyrepo-check annotations-fix path/to/file.py`
+- One explicit Repository Python:
+  `pyrepo-check --python 3.12 --all`
+- Focused typing:
+  `pyrepo-check --python 3.12 annotations ty src/`
+- Complete agent evidence:
+  `pyrepo-check --python 3.12 --format json --all`
+- One test:
+  `pyrepo-check pytest tests/test_file.py::test_name`
+- Mechanical annotation fixes, only when source mutation is authorized:
+  `pyrepo-check annotations-fix src/`
 
-Work strategically:
-- Do not blindly rewrite the repo.
-- Use `pyrepo-check --all` to see the full failure set.
-- Then fix failures by class, usually in this order:
-  Ruff/lint correctness -> annotations -> ty -> Bandit -> pytest.
-- Prefer small, coherent changes over broad churn.
-- Preserve public APIs and intended behavior unless a test clearly proves the
-  behavior is broken.
-
-Annotation workflow:
-- `pyrepo-check annotations` reports Ruff `ANN` issues explicitly.
-- `pyrepo-check annotations-fix` applies Ruff's mechanical annotation fixes.
-- After running `annotations-fix`, inspect the diff before continuing.
-- Do not rely on `ty` to report missing annotations; `ty` checks type
-  consistency.
-
-Safety rules:
-- Do not revert unrelated user changes.
-- Do not delete files without confirming they are obsolete.
-- Do not change dependency versions unless required; explain why if you do.
-- Do not weaken `pyrepo-check`, Ruff, ty, Bandit, or pytest config just to pass.
-- Fix lint issues by improving code, not by suppressing rules.
-- Use narrow ignores only when there is a clear documented reason.
-- Fix Bandit findings with safer code, not blanket skips.
-- Make tests deterministic and meaningful.
-- If behavior must change, add or update tests that capture the intended
-  behavior.
-
-Version sanity:
-- If editor diagnostics differ from terminal diagnostics, check tool versions.
-- For ty specifically, compare:
-  `uv run --frozen python -m ty --version`
-  against the editor/bundled ty version.
-- Do not upgrade dependencies just to silence disagreement; upgrade only when the
-  repo should intentionally adopt the newer tool behavior.
-
-Verification:
-- After each meaningful batch, rerun the relevant focused check.
-- At the end, run:
-  `pyrepo-check --all`
+JSON interpretation:
+- Require `schema_version == 2` for this release.
+- Inspect `tool_environment` and `repository_environment`, including exact Python,
+  lock status, mutation protection, dependencies, processes, and environment error.
+- For each check inspect `execution_environment`, `analysis_python_authority`,
+  `start_evidence`, processes, status, and error.
+- Inspect nested pytest and Coverage results when selected.
+- Coverage with `scope="partial"`, `status="guidance"`, and
+  `gate_eligible=false` is useful guidance, not a complete threshold gate.
 
 Deliverable:
-Finish with:
-- summary of what changed
-- checks run and results
-- any residual risks or follow-up recommendations
-
-If the full cleanup is too large for one pass, create a prioritized checklist
-and complete the highest-impact phase first, but keep working until at least one
-full class of failures is eliminated.
+- changes made and why
+- exact focused commands and results
+- exact final `pyrepo-check --all` result
+- Tool and Repository Python evidence
+- lock/dependency/mutation evidence
+- pytest/Coverage completeness and eligibility
+- residual risks or unrun gates
 ```
+
+The installed CLI's `pyrepo-check --help` is the syntax source of truth for that
+installed version. For schema version 2, use
+[`docs/reference/agent-report-schema-v2.md`](docs/reference/agent-report-schema-v2.md).

@@ -1,6 +1,6 @@
 # Separate Tool and Repository Environments
 
-**Status:** Approved
+**Status:** Implemented and verified
 **Date:** 2026-08-26
 **Issue:** [#1 — Global pyrepo-check cannot run the full gate for projects on older Python versions](https://github.com/arduinitavares/pyrepo-check/issues/1)
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
@@ -23,7 +23,7 @@ schema version 2 only and identifies the Tool Environment, Repository Environmen
 Repository Python, Check Dependencies, and Analysis Python authority without
 conflating those facts.
 
-Upon implementation, this design supersedes the earlier document's Repository
+This implemented design supersedes the earlier document's Repository
 Python minimum, pytest/Coverage dependency preflights, frozen/unfrozen execution and
 `--no-frozen` behavior, schema-v1-only output, missing-Coverage no-fallback rule,
 inherited-`PYTHONPATH` rule, and positive-child-exit precedence in
@@ -1235,9 +1235,22 @@ deployment must first compare repository and installed hashes and preserve
 17. Fast tests, real uv integration tests, the four-version compatibility matrix, and
     the repository strict aggregate gate all pass.
 
-## Implementation boundary
+## Implementation evidence
 
-This document approves design, not implementation. Production code changes begin
-only after the written specification is reviewed and an implementation plan is
-written and approved. Merge, push, release, and personal Skill deployment remain
-separate explicit actions.
+The environment implementation reached Task 9 HEAD
+`709e6b4b0890c8b1680da768cdaa3dd87f007f1d`. Its real uv integration suite passed
+all 42 cases. Separate Tool-Python-3.13.15 runs selected Repository CPython 3.10,
+3.11, 3.12, and 3.13 successfully. The exact-HEAD strict gate passed 1,466 tests
+with one intentional matrix-selector skip and complete Coverage of 86.56%, above
+the configured 86.01% threshold.
+
+Task 10 then published the controller/repository usage contract, repository Agent
+Skill, and complete schema-v2 reference. Fresh final verification passed 1,471 tests
+with the same one intentional selector skip. The strict aggregate passed all checks
+and complete Coverage at 86.56%, again evaluating and passing the 86.01% threshold.
+The schema-v2 JSON gate reported current lock evidence, Tool and Repository Python
+3.13.15, all five required dependencies available, repository execution attribution
+for every Check, complete pytest and Coverage evidence, and no environment error.
+
+Merge, push, release, worktree cleanup, and personal Skill deployment remain separate
+explicit actions.

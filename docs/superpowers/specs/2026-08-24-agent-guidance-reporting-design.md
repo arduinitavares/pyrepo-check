@@ -5,13 +5,14 @@
 **Related context:** [`CONTEXT.md`](../../../CONTEXT.md)
 **Research:** [`2026-08-24-agent-guidance-metrics.md`](../../research/2026-08-24-agent-guidance-metrics.md)
 
-> **Proposed successor:** Once implemented, the
+> **Implemented successor:** The
 > [Tool and Repository Environments design](2026-08-26-tool-repository-environments-design.md)
-> supersedes this document's Repository Python minimum, pytest/Coverage dependency
-> preflights, frozen/unfrozen execution and `--no-frozen` behavior, schema-v1-only
-> output, missing-Coverage no-fallback rule, inherited-`PYTHONPATH` rule, and
-> positive-child-exit precedence. Until then, this document still describes the
-> shipped behavior.
+> now supersedes this document's Repository Python minimum, pytest/Coverage
+> dependency preflights, frozen/unfrozen execution and `--no-frozen` behavior,
+> schema-v1-only output, missing-Coverage no-fallback rule, inherited-`PYTHONPATH`
+> rule, and positive-child-exit precedence. The selection, pytest, Coverage,
+> artifact-safety, and quality-policy contracts not explicitly replaced remain valid
+> historical design authority.
 
 ## Delivery status
 
@@ -20,7 +21,8 @@ guidance, repository cleanup, and Milestones A-B implementation are merged and
 pushed on `main`. C1 Test Shortcuts, C2 structured pytest evidence, C3 coverage
 execution and guidance, and D repository coverage adoption are implemented and
 verified. The next separate post-D action is repository and installed Agent Skill
-synchronization; it remains unchanged in this milestone.
+synchronization. The implemented successor now synchronizes the repository Skill;
+personal installed Skill deployment remains a separate action.
 
 | Milestone | State | Evidence |
 | --- | --- | --- |
@@ -1602,6 +1604,6 @@ The work is complete when all of the following are proven:
 
 C3 completion deliberately excluded criterion 12; its dependency-locking and
 repository-coverage adoption requirement is now implemented and verified by
-Milestone D. Criterion 13 remains outside this change. Repository and installed
-Agent Skill synchronization remains the next separate post-D action and was
-not performed in this milestone.
+Milestone D. Criterion 13 remains outside this change. Repository Skill
+synchronization is implemented by the successor design; personal installed Skill
+deployment remains separate and was not performed here.
