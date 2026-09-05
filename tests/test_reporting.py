@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -86,6 +87,14 @@ from tests.test_pytest_evidence import _check as pytest_evidence_check
 from tests.test_pytest_evidence import _with_exit as pytest_evidence_with_exit
 
 
+_REPO = Path("C:/repo") if os.name == "nt" else Path("/repo")
+_TOOL = Path("C:/tool") if os.name == "nt" else Path("/tool")
+
+
+def _platform_sha256(posix: str, windows: str) -> str:
+    return windows if os.name == "nt" else posix
+
+
 def _observed_process(process: object) -> ExecutedProcess:
     assert isinstance(process, ProcessResult)
     assert process.outcome == "exited"
@@ -117,15 +126,15 @@ def _ordinary_success_composition() -> tuple[Path, RunPlan, RepositoryExecutionR
         planned_test_scope="not_selected",
         planned_coverage_scope="not_requested",
     )
-    tool_python = PythonObservation("cpython", (3, 12, 11), Path("/tool/bin/python"))
+    tool_python = PythonObservation("cpython", (3, 12, 11), _TOOL / "bin/python")
     repository_python = PythonObservation(
-        "cpython", (3, 12, 11), Path("/repo/.venv/bin/python")
+        "cpython", (3, 12, 11), _REPO / ".venv/bin/python"
     )
     dependency = expected.repository_environment.dependencies[0]
     assert dependency.process is not None
     environment = RepositoryEnvironmentObservation(
         manager_version=expected.repository_environment.manager_version,
-        path=Path("/repo/.venv"),
+        path=_REPO / ".venv",
         python_selection=plan.repository_python,
         python=repository_python,
         lock_path=Path(expected.repository_environment.lock.path),
@@ -195,7 +204,7 @@ def _pytest_composition(
         pytest=PytestExecutionPlan(
             pytest_args=(),
             coverage=(
-                CoverageExecutionPlan(Path("/repo/pyproject.toml"), None)
+                CoverageExecutionPlan(_REPO / "pyproject.toml", None)
                 if coverage_requested
                 else None
             ),
@@ -401,11 +410,13 @@ def test_exact_planning_error_json_uses_schema_v2_field_order() -> None:
         ),
     )
 
+    executable = b"C:\\\\tool\\\\bin\\\\python" if os.name == "nt" else b"/tool/bin/python"
+
     assert serialize_json(report) == (
         b'{"schema_version":2,"kind":"planning_error","overall_status":"error",'
         b'"complete":false,"tool_environment":{"pyrepo_check_version":"0.1.0",'
         b'"python":{"implementation":"cpython","version":[3,13,15],'
-        b'"executable":"/tool/bin/python"}},"repository_environment":null,'
+        b'"executable":"' + executable + b'"}},"repository_environment":null,'
         b'"error":{"code":"unsafe_unlocked_execution","message":"--no-frozen is '
         b'incompatible with repository-safe execution.","hint":"Update uv.lock '
         b'explicitly, then rerun without --no-frozen."}}\n'
@@ -423,7 +434,7 @@ def test_public_composition_builds_strict_schema_v2_from_execution_evidence() ->
 def test_public_planning_error_composition_retains_observed_tool_environment() -> None:
     tool = ToolEnvironmentObservation(
         "0.1.0",
-        PythonObservation("cpython", (3, 13, 15), Path("/tool/bin/python")),
+        PythonObservation("cpython", (3, 13, 15), _TOOL / "bin/python"),
     )
 
     report = build_planning_error_report(
@@ -443,27 +454,45 @@ def test_public_planning_error_composition_retains_observed_tool_environment() -
     (
         (
             environment_failure_report(),
-            "3c74d76a595d5f6d0b7c78433b0a3d98973d9a5f78d8a2c9c08b3d392faf3b30",
+            _platform_sha256(
+                "3c74d76a595d5f6d0b7c78433b0a3d98973d9a5f78d8a2c9c08b3d392faf3b30",
+                "a38f0fc6081fb6b1a92ba508cdc9d9584598b19155a4cb55b23c00118129f22c",
+            ),
         ),
         (
             _dependency_error_with_independent_failure(),
-            "19049c098fee29a5ebb77c8b2a1a150b621e081a2c19db5569a550d8d89c1fc8",
+            _platform_sha256(
+                "19049c098fee29a5ebb77c8b2a1a150b621e081a2c19db5569a550d8d89c1fc8",
+                "53947c5d2def92c488ed1d19cea8baf7348a1d0db33a619f103d84990e474f74",
+            ),
         ),
         (
             report_with_ty(),
-            "a7555492c528f0d42fe10dc6104670d1f00dd5b6a15cb916cf4fc8c103c1d773",
+            _platform_sha256(
+                "a7555492c528f0d42fe10dc6104670d1f00dd5b6a15cb916cf4fc8c103c1d773",
+                "bec47027efd0894f23ebb73e1f96c5b516860e35a068d509fedfff63523a9da4",
+            ),
         ),
         (
             _strict_aggregate_success(),
-            "350118a3e11a7f403097cdcf9d13a65c7fc5ef863560e7f65900608e18a91f1e",
+            _platform_sha256(
+                "350118a3e11a7f403097cdcf9d13a65c7fc5ef863560e7f65900608e18a91f1e",
+                "d814d67f174d25de881e27b87fb259b73c2c6cf00708fdbe62df2be297f9963e",
+            ),
         ),
         (
             pytest_run_report(coverage="missing"),
-            "52af495c3afefe79317644acd0eb8062491c7ffe04eb65769f9bcf6d4c77300a",
+            _platform_sha256(
+                "52af495c3afefe79317644acd0eb8062491c7ffe04eb65769f9bcf6d4c77300a",
+                "b989e05177ab9cfa7d43142f7f6e2d6ad3f57aa500587a4127462fa2ef2796c8",
+            ),
         ),
         (
             _repository_state_changed(),
-            "823a8d706382e28869f7f49b0845a043e75738787b84abcd7572360655dbb953",
+            _platform_sha256(
+                "823a8d706382e28869f7f49b0845a043e75738787b84abcd7572360655dbb953",
+                "2851b56315c2c7940208b0c37fd80f4f38f231f93b2a36cdb2aba8432eb34f52",
+            ),
         ),
     ),
     ids=(

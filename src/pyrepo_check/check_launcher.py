@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import os
+
+from pyrepo_check import filesystem as fs
 from pathlib import Path
 import re
 import secrets
@@ -138,7 +140,7 @@ def ensure_start_marker_absent(
     _require_workspace_child(marker_path, workspace)
     workspace.verify("immediately before Check spawn")
     try:
-        os.stat(
+        fs.stat(
             marker_path.name,
             dir_fd=workspace.descriptor,
             follow_symlinks=False,
@@ -165,7 +167,7 @@ def validate_start_marker(
     try:
         descriptor = _open_marker(marker_path, workspace)
         initial = os.fstat(descriptor)
-        _validate_marker_metadata(initial, marker_path.name)
+        _validate_marker_metadata(initial, marker_path.name, descriptor=descriptor)
         if initial.st_size > _MAX_MARKER_BYTES:
             raise OSError(f"Check start marker exceeds the 4096-byte limit: {marker_path.name}")
         content = bytearray()
@@ -177,7 +179,7 @@ def validate_start_marker(
         if len(content) > _MAX_MARKER_BYTES:
             raise OSError(f"Check start marker exceeds the 4096-byte limit: {marker_path.name}")
         final = os.fstat(descriptor)
-        lexical = os.stat(
+        lexical = fs.stat(
             marker_path.name,
             dir_fd=workspace.descriptor,
             follow_symlinks=False,
@@ -198,18 +200,18 @@ def validate_start_marker(
         if descriptor is not None:
             os.close(descriptor)
         try:
-            os.unlink(marker_path.name, dir_fd=workspace.descriptor)
+            fs.unlink(marker_path.name, dir_fd=workspace.descriptor)
         except FileNotFoundError:
             pass
 
 
 def _open_marker(path: Path, workspace: VerifiedRunWorkspace) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
+    no_follow = getattr(fs, "O_NOFOLLOW", None)
+    non_blocking = getattr(fs, "O_NONBLOCK", None)
     if type(no_follow) is not int or type(non_blocking) is not int:
         raise OSError("safe no-follow Check start marker opening is unavailable")
     try:
-        descriptor = os.open(
+        descriptor = fs.open(
             path.name,
             os.O_RDONLY | no_follow | non_blocking,
             dir_fd=workspace.descriptor,
@@ -229,9 +231,18 @@ def _open_marker(path: Path, workspace: VerifiedRunWorkspace) -> int:
     return descriptor
 
 
-def _validate_marker_metadata(file_status: os.stat_result, name: str) -> None:
+def _validate_marker_metadata(
+    file_status: os.stat_result, name: str, *, descriptor: int | None = None
+) -> None:
     if not stat.S_ISREG(file_status.st_mode):
         raise OSError(f"Check start marker is not a regular file: {name}")
+    if file_status.st_nlink != 1:
+        raise OSError("Check start marker link count is not one")
+    if os.name == "nt":
+        if descriptor is None:
+            raise OSError("Check start marker handle is unavailable for ACL validation")
+        fs.verify_private(descriptor)
+        return
     get_effective_uid = getattr(os, "geteuid", None)
     if not callable(get_effective_uid):
         raise OSError("effective user identity is unavailable for Check start marker")

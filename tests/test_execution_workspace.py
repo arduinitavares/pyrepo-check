@@ -9,6 +9,7 @@ from typing import Callable, TypeVar, cast
 
 import pytest
 
+from pyrepo_check import filesystem
 import pyrepo_check.execution_workspace as execution_workspace
 
 from pyrepo_check.execution_workspace import (
@@ -16,13 +17,23 @@ from pyrepo_check.execution_workspace import (
     open_verified_workspace,
     remove_run_workspace,
 )
+from tests.support import symlink_or_skip
 
 
 _T = TypeVar("_T")
-_OS_NONBLOCK = cast(int, getattr(os, "O_NONBLOCK"))
-_OS_DIRECTORY = cast(int, getattr(os, "O_DIRECTORY"))
-_OS_NOFOLLOW = cast(int, getattr(os, "O_NOFOLLOW"))
-_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo"))
+_HAS_POSIX_FIFO = callable(getattr(os, "mkfifo", None))
+_POSIX_FIFO = pytest.mark.skipif(
+    not _HAS_POSIX_FIFO,
+    reason="exercises POSIX FIFO behavior; native Windows file coverage is separate",
+)
+_POSIX_DESCRIPTOR_CLEANUP = pytest.mark.skipif(
+    os.name == "nt",
+    reason="fault-injects POSIX descriptor syscalls; native Windows cleanup has dedicated coverage",
+)
+_OS_NONBLOCK = filesystem.O_NONBLOCK
+_OS_DIRECTORY = filesystem.O_DIRECTORY
+_OS_NOFOLLOW = filesystem.O_NOFOLLOW
+_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo", None))
 
 
 def _run_fifo_call_with_watchdog(call: Callable[[], _T], fifo: Path) -> _T:
@@ -87,7 +98,7 @@ def test_workspace_cleanup_never_traverses_replaced_root(
     workspace = create_run_workspace(repository)
     original = workspace.path.with_name(f"{workspace.path.name}-original")
     workspace.path.rename(original)
-    workspace.path.symlink_to(outside, target_is_directory=True)
+    symlink_or_skip(workspace.path, outside, target_is_directory=True)
 
     try:
         observation = remove_run_workspace(
@@ -114,6 +125,7 @@ def _cleanup_record(run_directory: Path) -> execution_workspace.RunWorkspace:
     )
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_validation_stops_after_4097_lazy_entries_without_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -190,6 +202,7 @@ def test_cleanup_validation_stops_after_4097_lazy_entries_without_deletion(
     assert observation.retained_path == run_directory
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_rejects_unvalidated_directory_injected_between_passes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -254,6 +267,7 @@ def test_cleanup_rejects_unvalidated_directory_injected_between_passes(
     assert observation.retained_path == run_directory
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_rejects_leaf_substituted_between_validation_and_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -308,7 +322,11 @@ def test_cleanup_rejects_leaf_substituted_between_validation_and_deletion(
     assert observation.retained_path == run_directory
 
 
-@pytest.mark.parametrize("leaf_type", ("regular", "symlink", "fifo"))
+@_POSIX_DESCRIPTOR_CLEANUP
+@pytest.mark.parametrize(
+    "leaf_type",
+    ("regular", "symlink", pytest.param("fifo", marks=_POSIX_FIFO)),
+)
 def test_cleanup_quarantines_leaf_replaced_immediately_before_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -400,6 +418,7 @@ def test_cleanup_quarantines_leaf_replaced_immediately_before_rename(
     assert outside_sentinel.read_text() == "keep"
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_deadline_after_quarantine_rename_retains_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -442,6 +461,8 @@ def test_cleanup_deadline_after_quarantine_rename_retains_entry(
     assert tuple(observation.retained_quarantine_path.iterdir())
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
+@_POSIX_FIFO
 def test_successful_leaf_cleanup_unlinks_only_from_quarantine_and_removes_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -531,6 +552,7 @@ def test_successful_leaf_cleanup_unlinks_only_from_quarantine_and_removes_it(
     assert outside_sentinel.read_text() == "keep"
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_quarantine_open_identity_failure_retains_truthful_empty_quarantine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -582,6 +604,7 @@ def test_quarantine_open_identity_failure_retains_truthful_empty_quarantine(
     observation.retained_quarantine_path.rmdir()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_quarantine_removal_error_reports_verified_retained_quarantine_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -622,6 +645,7 @@ def test_quarantine_removal_error_reports_verified_retained_quarantine_only(
     original_rmdir(observation.retained_quarantine_path)
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_quarantine_name_replacement_fails_closed_without_stale_path_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -663,6 +687,7 @@ def test_quarantine_name_replacement_fails_closed_without_stale_path_claim(
     displaced_quarantine.rmdir()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_rejects_validated_entry_missing_during_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -715,6 +740,7 @@ def test_cleanup_rejects_validated_entry_missing_during_deletion(
     assert observation.retained_path == run_directory
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_validation_manifest_accepts_exactly_4096_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -783,6 +809,7 @@ def test_cleanup_validation_manifest_accepts_exactly_4096_entries(
         )[manifest_key] = manifest_entry
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 @pytest.mark.parametrize(("depth", "removed"), ((64, True), (65, False)))
 def test_cleanup_depth_boundary_is_exact(
     tmp_path: Path,
@@ -812,6 +839,7 @@ def test_cleanup_depth_boundary_is_exact(
         assert observation.retained_path == run_directory
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_unlinks_symlink_without_touching_outside_and_never_uses_rmtree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -844,6 +872,7 @@ def test_cleanup_unlinks_symlink_without_touching_outside_and_never_uses_rmtree(
     assert sentinel.read_text() == "keep"
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_final_root_removal_is_descriptor_relative(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -880,6 +909,7 @@ def test_cleanup_final_root_removal_is_descriptor_relative(
     assert final_calls[0][1] is not None
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_directory_opens_use_exact_secure_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -914,6 +944,7 @@ def test_cleanup_directory_opens_use_exact_secure_flags(
     assert all(flags == expected for flags in directory_open_flags)
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_rejects_cross_device_child_and_retains_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -961,6 +992,7 @@ def test_cleanup_rejects_cross_device_child_and_retains_tree(
     assert child.exists()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_rejects_child_substitution_between_stat_and_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1008,6 +1040,7 @@ def test_cleanup_rejects_child_substitution_between_stat_and_open(
     assert displaced.exists()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_rejects_child_substitution_before_rmdir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1053,6 +1086,7 @@ def test_cleanup_rejects_child_substitution_before_rmdir(
     assert displaced.exists()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_reports_child_swap_during_rmdir_as_unsafe_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1092,6 +1126,7 @@ def test_cleanup_reports_child_swap_during_rmdir_as_unsafe_tree(
     assert displaced.exists()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_reports_root_swap_during_rmdir_as_unsafe_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1130,6 +1165,7 @@ def test_cleanup_reports_root_swap_during_rmdir_as_unsafe_tree(
     assert displaced.exists()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_parent_rename_prevents_stale_retained_path_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1157,6 +1193,7 @@ def test_parent_rename_prevents_stale_retained_path_claim(
     assert (moved_parent / "run").exists()
 
 
+@_POSIX_DESCRIPTOR_CLEANUP
 def test_cleanup_concurrent_growth_reports_enotempty_and_retains_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

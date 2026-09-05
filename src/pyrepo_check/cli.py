@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+
+from pyrepo_check.filesystem import PlatformSafetyError
 import argparse
 import sys
 from typing import cast
@@ -108,6 +110,14 @@ def main(
 
     try:
         config = load_project_config(request.root)
+    except PlatformSafetyError as error:
+        return _write_planning_error(
+            "platform_safety_unavailable",
+            str(error),
+            hint="Use a filesystem and platform that support native safe file operations.",
+            output_format=output_format,
+            tool_environment=tool_environment,
+        )
     except InvalidCoverageConfigError as error:
         return _write_planning_error(
             "invalid_project_config",

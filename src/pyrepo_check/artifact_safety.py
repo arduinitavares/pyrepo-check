@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import os
+
+from pyrepo_check import filesystem as fs
 from pathlib import Path
 import stat
 from typing import Never, cast
@@ -76,15 +78,15 @@ def read_regular_file(
     dir_fd: int | None = None,
 ) -> bytes:
     """Read one regular file without following links and within its byte budget."""
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
+    no_follow = getattr(fs, "O_NOFOLLOW", None)
+    non_blocking = getattr(fs, "O_NONBLOCK", None)
     if type(no_follow) is not int or type(non_blocking) is not int:
         raise _UnsafePathError("safe no-follow file opening is unavailable")
     try:
         if dir_fd is None:
-            descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+            descriptor = fs.open(path, os.O_RDONLY | no_follow | non_blocking)
         else:
-            descriptor = os.open(
+            descriptor = fs.open(
                 path.name,
                 os.O_RDONLY | no_follow | non_blocking,
                 dir_fd=dir_fd,
@@ -233,6 +235,7 @@ def copy_regular_file(
         destination_metadata = _destination_metadata(
             os.fstat(destination_descriptor),
             destination_path.name,
+            descriptor=destination_descriptor,
         )
         digest, size = _stream_copy(
             source_descriptor,
@@ -247,6 +250,7 @@ def copy_regular_file(
             os.fstat(destination_descriptor),
             destination_metadata,
             destination_path.name,
+            descriptor=destination_descriptor,
         )
 
         _verify_parent_binding(
@@ -255,6 +259,12 @@ def copy_regular_file(
             parent_identity,
             require_path_match=verify_parent_path,
         )
+        if os.name == "nt":
+            # Native readers exclude writers. Reopen only after our writer closes;
+            # the stored identity, private metadata and digest bind verification
+            # to the exact file and content created above.
+            os.close(destination_descriptor)
+            destination_descriptor = None
         verification_descriptor, verification_status = _open_regular_file(
             Path(destination_path.name),
             max_bytes=max_bytes,
@@ -265,6 +275,7 @@ def copy_regular_file(
                 verification_status,
                 destination_metadata,
                 destination_path.name,
+                descriptor=verification_descriptor,
             )
             destination_hash, destination_size = _stream_digest(
                 verification_descriptor,
@@ -309,15 +320,15 @@ def _open_regular_file(
     max_bytes: int,
     dir_fd: int | None,
 ) -> tuple[int, os.stat_result]:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
+    no_follow = getattr(fs, "O_NOFOLLOW", None)
+    non_blocking = getattr(fs, "O_NONBLOCK", None)
     if type(no_follow) is not int or type(non_blocking) is not int:
         raise _UnsafePathError("safe no-follow file opening is unavailable")
     try:
         if dir_fd is None:
-            descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+            descriptor = fs.open(path, os.O_RDONLY | no_follow | non_blocking)
         else:
-            descriptor = os.open(
+            descriptor = fs.open(
                 path.name,
                 os.O_RDONLY | no_follow | non_blocking,
                 dir_fd=dir_fd,
@@ -404,9 +415,9 @@ def _create_destination(
     *,
     destination_dir_fd: int | None,
 ) -> tuple[int, int, bool]:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
-    directory = getattr(os, "O_DIRECTORY", None)
+    no_follow = getattr(fs, "O_NOFOLLOW", None)
+    non_blocking = getattr(fs, "O_NONBLOCK", None)
+    directory = getattr(fs, "O_DIRECTORY", None)
     if (
         type(no_follow) is not int
         or type(non_blocking) is not int
@@ -417,7 +428,7 @@ def _create_destination(
     close_parent_descriptor = False
     try:
         if destination_dir_fd is None:
-            parent_descriptor = os.open(
+            parent_descriptor = fs.open(
                 destination_path.parent,
                 os.O_RDONLY | directory | no_follow | non_blocking,
             )
@@ -425,7 +436,7 @@ def _create_destination(
         if parent_descriptor is None:
             raise _UnsafePathError("safe destination directory opening is unavailable")
         _directory_identity(parent_descriptor)
-        descriptor = os.open(
+        descriptor = fs.open(
             destination_path.name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | non_blocking,
             0o600,
@@ -448,14 +459,21 @@ def _directory_identity(descriptor: int) -> _DirectoryIdentity:
 def _destination_metadata(
     file_status: os.stat_result,
     filename: str,
+    *,
+    descriptor: int | None = None,
 ) -> _DestinationMetadata:
     if not stat.S_ISREG(file_status.st_mode):
         raise _UnsafePathError(f"{filename} destination is not a regular file")
-    if file_status.st_uid != _effective_user_id():
-        raise _UnsafePathError(f"{filename} destination owner is not the effective user")
     mode = stat.S_IMODE(file_status.st_mode)
-    if mode & ~0o600:
-        raise _UnsafePathError(f"{filename} destination permissions are broader than 0600")
+    if os.name == "nt":
+        if descriptor is None:
+            raise _UnsafePathError("destination handle is unavailable for ACL validation")
+        fs.verify_private(descriptor)
+    else:
+        if file_status.st_uid != _effective_user_id():
+            raise _UnsafePathError(f"{filename} destination owner is not the effective user")
+        if mode & ~0o600:
+            raise _UnsafePathError(f"{filename} destination permissions are broader than 0600")
     if file_status.st_nlink != 1:
         raise _UnsafePathError(f"{filename} destination link count is not one")
     return _DestinationMetadata(
@@ -478,8 +496,10 @@ def _verify_destination_metadata(
     file_status: os.stat_result,
     expected: _DestinationMetadata,
     filename: str,
+    *,
+    descriptor: int | None = None,
 ) -> None:
-    observed = _destination_metadata(file_status, filename)
+    observed = _destination_metadata(file_status, filename, descriptor=descriptor)
     if observed != expected:
         raise _UnsafePathError(f"{filename} destination changed during verification")
 
@@ -496,7 +516,7 @@ def _verify_parent_binding(
     if not require_path_match:
         return
     try:
-        current = os.stat(destination_path.parent, follow_symlinks=False)
+        current = fs.stat(destination_path.parent, follow_symlinks=False)
     except OSError as error:
         raise _UnsafePathError("destination parent changed during verification") from error
     if (

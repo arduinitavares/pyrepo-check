@@ -7,13 +7,29 @@ from typing import Callable, TypeVar, cast
 
 import pytest
 
+from pyrepo_check import filesystem
 import pyrepo_check.artifact_safety as artifact_safety
+from tests.support import symlink_or_skip
 
 
 _T = TypeVar("_T")
-_OS_NONBLOCK = cast(int, getattr(os, "O_NONBLOCK"))
-_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo"))
-_PWRITE = cast(Callable[[int, bytes, int], int], getattr(os, "pwrite"))
+_HAS_POSIX_FIFO = callable(getattr(os, "mkfifo", None))
+_HAS_POSIX_PWRITE = callable(getattr(os, "pwrite", None))
+_POSIX_FIFO = pytest.mark.skipif(
+    not _HAS_POSIX_FIFO,
+    reason="exercises POSIX FIFO behavior; native Windows file coverage is separate",
+)
+_POSIX_PWRITE = pytest.mark.skipif(
+    not _HAS_POSIX_PWRITE,
+    reason="exercises POSIX positional writes; Windows uses a native file handle backend",
+)
+_POSIX_RENAME_RACE = pytest.mark.skipif(
+    os.name == "nt",
+    reason="requires replacing an open POSIX directory; Windows handle sharing blocks that race",
+)
+_OS_NONBLOCK = filesystem.O_NONBLOCK
+_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo", None))
+_PWRITE = cast(Callable[[int, bytes, int], int], getattr(os, "pwrite", None))
 
 
 def _run_fifo_call_with_watchdog(call: Callable[[], _T], fifo: Path) -> _T:
@@ -98,8 +114,11 @@ def test_regular_file_growth_after_fstat_is_rejected(
         return original_read(descriptor, size)
 
     monkeypatch.setattr(artifact_safety.os, "read", grow_before_first_read)
-    with pytest.raises(artifact_safety._BoundedReadError, match="exceeds"):
+    expected = PermissionError if os.name == "nt" else artifact_safety._BoundedReadError
+    with pytest.raises(expected, match=None if os.name == "nt" else "exceeds"):
         artifact_safety.read_regular_file(marker, max_bytes=1)
+    if os.name == "nt":
+        assert marker.read_bytes() == b"x"
 
 
 def test_regular_file_same_size_mutation_during_read_is_rejected(
@@ -108,6 +127,7 @@ def test_regular_file_same_size_mutation_during_read_is_rejected(
 ) -> None:
     marker = tmp_path / "marker.json"
     marker.write_bytes(b"original")
+    initial_status = marker.stat()
     original_read = artifact_safety.os.read
     mutated = False
 
@@ -117,23 +137,31 @@ def test_regular_file_same_size_mutation_during_read_is_rejected(
         if content and not mutated:
             mutated = True
             marker.write_bytes(b"changed!")
+            os.utime(
+                marker,
+                ns=(initial_status.st_atime_ns, initial_status.st_mtime_ns + 1_000_000),
+            )
         return content
 
     monkeypatch.setattr(artifact_safety.os, "read", mutate_after_read)
-    with pytest.raises(artifact_safety._UnsafePathError, match="changed during read"):
+    expected = PermissionError if os.name == "nt" else artifact_safety._UnsafePathError
+    with pytest.raises(expected, match=None if os.name == "nt" else "changed during read"):
         artifact_safety.read_regular_file(marker, max_bytes=8)
+    if os.name == "nt":
+        assert marker.read_bytes() == b"original"
 
 
 def test_regular_file_reader_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target.json"
     target.write_text("{}")
     artifact = tmp_path / "artifact.json"
-    artifact.symlink_to(target)
+    symlink_or_skip(artifact, target)
 
     with pytest.raises(artifact_safety._UnsafePathError, match="not a regular file"):
         artifact_safety.read_regular_file(artifact, max_bytes=1024)
 
 
+@_POSIX_FIFO
 def test_regular_file_reader_rejects_fifo_promptly(tmp_path: Path) -> None:
     artifact = tmp_path / "artifact.json"
     _MKFIFO(artifact)
@@ -225,7 +253,10 @@ def test_digest_regular_file_respects_exact_size_boundary(
             artifact_safety.digest_regular_file(source, max_bytes=8)
 
 
-@pytest.mark.parametrize("leaf_type", ("symlink", "fifo"))
+@pytest.mark.parametrize(
+    "leaf_type",
+    ("symlink", pytest.param("fifo", marks=_POSIX_FIFO)),
+)
 def test_digest_regular_file_rejects_unsafe_source_types(
     tmp_path: Path,
     leaf_type: str,
@@ -234,7 +265,7 @@ def test_digest_regular_file_rejects_unsafe_source_types(
     if leaf_type == "symlink":
         target = tmp_path / "target.data"
         target.write_bytes(b"data")
-        source.symlink_to(target)
+        symlink_or_skip(source, target)
     else:
         _MKFIFO(source)
 
@@ -302,10 +333,14 @@ def test_copy_regular_file_with_digest_rejects_source_mutation(
         return original_read(descriptor, size)
 
     monkeypatch.setattr(artifact_safety.os, "read", mutate_before_read)
-    with pytest.raises(artifact_safety._UnsafePathError, match="changed during read"):
+    expected = PermissionError if os.name == "nt" else artifact_safety._UnsafePathError
+    with pytest.raises(expected, match=None if os.name == "nt" else "changed during read"):
         artifact_safety.copy_regular_file_with_digest(source, destination, max_bytes=8)
+    if os.name == "nt":
+        assert source.read_bytes() == b"original"
 
 
+@_POSIX_PWRITE
 def test_copy_regular_file_with_digest_rejects_destination_digest_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -353,6 +388,7 @@ def test_copy_regular_file_with_digest_rejects_same_byte_leaf_replacement(
         artifact_safety.copy_regular_file_with_digest(source, destination, max_bytes=8)
 
 
+@_POSIX_RENAME_RACE
 def test_copy_regular_file_with_digest_rejects_parent_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

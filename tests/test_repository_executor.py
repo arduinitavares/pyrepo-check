@@ -49,6 +49,16 @@ from tests.support import (
 )
 
 
+def _controller_executable_name(name: str) -> str:
+    return f"{name}.exe" if os.name == "nt" else name
+
+
+_POSIX_RENAME_RACE = pytest.mark.skipif(
+    os.name == "nt",
+    reason="requires replacing an open POSIX directory; Windows handle sharing blocks that race",
+)
+
+
 def _run_git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(  # nosec B603
         ("git", "-C", str(root), *arguments),
@@ -114,18 +124,19 @@ def _successful_runner(root: Path) -> RecordingRunner:
 def _controller_tools(root: Path, helper_bin: Path) -> ControllerTools:
     helper_bin.mkdir()
     for name in ("uv", "git"):
-        helper = helper_bin / name
+        helper = helper_bin / _controller_executable_name(name)
         helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         helper.chmod(0o755)
     return resolve_controller_tools(root, path=str(helper_bin))
 
 
 def _replace_controller_helper(helper_bin: Path, name: str) -> None:
-    replacement = helper_bin / f"replacement-{name}"
+    executable_name = _controller_executable_name(name)
+    replacement = helper_bin / f"replacement-{executable_name}"
     replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     replacement.chmod(0o755)
-    (helper_bin / name).unlink()
-    replacement.rename(helper_bin / name)
+    (helper_bin / executable_name).unlink()
+    replacement.rename(helper_bin / executable_name)
 
 
 def test_pinned_uv_identity_replacement_stops_before_environment_probe(
@@ -328,7 +339,7 @@ def test_unsafe_lock_returns_canonical_failure_before_git_or_uv(tmp_path: Path) 
     (root / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
     target = root / "lock-target"
     target.write_text("version = 1\n", encoding="utf-8")
-    (root / "uv.lock").symlink_to(target)
+    test_support.symlink_or_skip(root / "uv.lock", target)
     runner = RecordingRunner()
 
     result = prepare_safe_repository(
@@ -352,7 +363,7 @@ def test_unsafe_venv_stops_before_git_or_uv(tmp_path: Path) -> None:
     (root / "uv.lock").write_text("version = 1\nrevision = 3\n", encoding="utf-8")
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
-    (root / ".venv").symlink_to(outside, target_is_directory=True)
+    test_support.symlink_or_skip(root / ".venv", outside, target_is_directory=True)
     runner = RecordingRunner()
 
     result = prepare_safe_repository(
@@ -430,7 +441,7 @@ def test_safe_preparation_runs_dependency_probe_before_any_check(tmp_path: Path)
         ".",
     )
     assert Path(observation.processes[4].command[0]).is_absolute()
-    assert Path(observation.processes[4].command[0]).name == "uv"
+    assert Path(observation.processes[4].command[0]).name == _controller_executable_name("uv")
     assert observation.processes[4].command[1:] == ("--version",)
     assert observation.mutation_protection == "unobserved"
     assert tuple(dependency.name for dependency in observation.dependencies) == ("ruff",)
@@ -1224,6 +1235,7 @@ def test_repository_workspace_descriptors_close_on_all_execution_paths(
         assert result.checks[0].error is None
 
 
+@_POSIX_RENAME_RACE
 def test_prepared_pytest_cleanup_preserves_replacement_after_run_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1293,10 +1305,14 @@ def test_prepared_pytest_cleanup_preserves_replacement_after_run_swap(
     assert "identity mismatch" in check_result.error.message
 
 
+@pytest.mark.parametrize("unsupported", (False, True))
 def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    unsupported: bool,
 ) -> None:
+    from pyrepo_check.filesystem import PlatformSafetyError
+
     plan = _internal_plan(tmp_path.resolve(), "ty")
     safe = _safe_preparation(
         plan,
@@ -1306,7 +1322,9 @@ def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
     monkeypatch.setattr(
         execution_workspace,
         "create_run_workspace",
-        lambda root: (_ for _ in ()).throw(OSError("setup blocked")),
+        lambda root: (_ for _ in ()).throw(
+            PlatformSafetyError("private ACL unsupported") if unsupported else OSError("setup blocked")
+        ),
     )
 
     result = repository_executor.execute_repository_plan(
@@ -1317,7 +1335,7 @@ def test_execute_repository_plan_attaches_workspace_setup_failure_to_check(
 
     check = result.checks[0]
     assert check.error is not None
-    assert check.error.code == "cleanup_failed"
+    assert check.error.code == ("platform_safety_unavailable" if unsupported else "cleanup_failed")
     assert check.processes == ()
 
 

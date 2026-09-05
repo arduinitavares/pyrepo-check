@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, fields, make_dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
@@ -88,6 +89,24 @@ from tests.support import (
 )
 
 
+_REPO = str(Path("C:/repo")) if os.name == "nt" else "/repo"
+_TOOL = str(Path("C:/tool")) if os.name == "nt" else "/tool"
+_GIT = str(Path("C:/tool/git.exe")) if os.name == "nt" else "/usr/bin/git"
+_OUTSIDE = str(Path("C:/outside")) if os.name == "nt" else "/outside"
+
+
+def _repo_path(path: str) -> str:
+    return str(Path(_REPO) / path)
+
+
+def _tool_path(path: str) -> str:
+    return str(Path(_TOOL) / path)
+
+
+def _outside_path(path: str) -> str:
+    return str(Path(_OUTSIDE) / path)
+
+
 def tool_environment_evidence(
     *, python: tuple[int, int, int] = (3, 12, 11)
 ) -> ToolEnvironmentEvidence:
@@ -96,7 +115,7 @@ def tool_environment_evidence(
         python=PythonEvidence(
             implementation="cpython",
             version=python,
-            executable="/tool/bin/python",
+            executable=_tool_path("bin/python"),
         ),
     )
 
@@ -202,7 +221,7 @@ def pytest_run_report(
         module="pytest",
         required=">=8,<9",
         version="8.4.2",
-        origin="/repo/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+        origin=_repo_path(".venv/lib/python3.12/site-packages/pytest/__init__.py"),
     )
     coverage_dependency: DependencyEvidence | None = None
     coverage_result: CoverageResult | None = None
@@ -221,7 +240,7 @@ def pytest_run_report(
             module="coverage",
             required=">=7.15,<8",
             version="7.15.0",
-            origin="/repo/.venv/lib/python3.12/site-packages/coverage/__init__.py",
+            origin=_repo_path(".venv/lib/python3.12/site-packages/coverage/__init__.py"),
         )
         if coverage == "helper_failure":
             coverage_result = replace(
@@ -266,9 +285,9 @@ def pytest_run_report(
             "run",
             "--locked",
             "python",
-            "/repo/.pyrepo-check/check-launcher.py",
+            _repo_path(".pyrepo-check/check-launcher.py"),
             "--evidence",
-            "/repo/.pyrepo-check/start.json",
+            _repo_path(".pyrepo-check/start.json"),
             "--check",
             "pytest",
             "--module",
@@ -504,7 +523,7 @@ def environment_failure_report(*, coverage_requested: bool = False) -> RunReport
     return RunReportV2(
         schema_version=2,
         kind="run",
-        project_root="/repo",
+        project_root=_REPO,
         mode="focused",
         overall_status="error",
         complete=False,
@@ -515,7 +534,7 @@ def environment_failure_report(*, coverage_requested: bool = False) -> RunReport
             path=None,
             python_selection=RepositoryPythonSelectionEvidence(kind="default", request=None),
             python=None,
-            lock=LockEvidence(path="/repo/uv.lock", status="missing"),
+            lock=LockEvidence(path=_repo_path("uv.lock"), status="missing"),
             dependency_selection="default",
             mutation_protection="unobserved",
             dependencies=tuple(dependencies),
@@ -573,9 +592,9 @@ def report_with_ty() -> RunReportV2:
                     "run",
                     "--locked",
                     "python",
-                    "/repo/.pyrepo-check/check-launcher.py",
+                    _repo_path(".pyrepo-check/check-launcher.py"),
                     "--evidence",
-                    "/repo/.pyrepo-check/start.json",
+                    _repo_path(".pyrepo-check/start.json"),
                     "--check",
                     "ty",
                     "--module",
@@ -593,7 +612,7 @@ def report_with_ty() -> RunReportV2:
         module="ty",
         required=">=0.0.35,<0.1",
         version="0.0.35",
-        origin="/repo/.venv/lib/python3.12/site-packages/ty/__init__.py",
+        origin=_repo_path(".venv/lib/python3.12/site-packages/ty/__init__.py"),
     )
     return replace(
         report,
@@ -615,7 +634,7 @@ def process_result(
     return ProcessResult(
         role=cast(Any, role),
         argv=argv,
-        cwd="/repo",
+        cwd=_REPO,
         outcome="exited",
         exit_code=exit_code,
         signal=None,
@@ -730,7 +749,7 @@ def repository_python() -> PythonEvidence:
     return PythonEvidence(
         implementation="cpython",
         version=(3, 12, 11),
-        executable="/repo/.venv/bin/python",
+        executable=_repo_path(".venv/bin/python"),
     )
 
 
@@ -749,17 +768,17 @@ def valid_run_report() -> RunReportV2:
         required=">=0.15,<1",
         status="available",
         version="0.15.0",
-        origin="/repo/.venv/lib/python3.12/site-packages/ruff/__init__.py",
+        origin=_repo_path(".venv/lib/python3.12/site-packages/ruff/__init__.py"),
         process=process_result("dependency_probe"),
         error=None,
     )
     environment = RepositoryEnvironmentEvidence(
         manager="uv",
         manager_version="0.8.13",
-        path="/repo/.venv",
+        path=_repo_path(".venv"),
         python_selection=RepositoryPythonSelectionEvidence(kind="default", request=None),
         python=python,
-        lock=LockEvidence(path="/repo/uv.lock", status="current"),
+        lock=LockEvidence(path=_repo_path("uv.lock"), status="current"),
         dependency_selection="default",
         mutation_protection="tracked_files",
         dependencies=(dependency,),
@@ -770,9 +789,9 @@ def valid_run_report() -> RunReportV2:
             process_result(
                 "repository_safety",
                 argv=(
-                    "/usr/bin/git",
+                    _GIT,
                     "-C",
-                    "/repo",
+                    _REPO,
                     "ls-files",
                     "--stage",
                     "-z",
@@ -800,9 +819,9 @@ def valid_run_report() -> RunReportV2:
                     "run",
                     "--locked",
                     "python",
-                    "/repo/.pyrepo-check/check-launcher.py",
+                    _repo_path(".pyrepo-check/check-launcher.py"),
                     "--evidence",
-                    "/repo/.pyrepo-check/start.json",
+                    _repo_path(".pyrepo-check/start.json"),
                     "--check",
                     "ruff",
                     "--module",
@@ -818,7 +837,7 @@ def valid_run_report() -> RunReportV2:
     return RunReportV2(
         schema_version=2,
         kind="run",
-        project_root="/repo",
+        project_root=_REPO,
         mode="focused",
         overall_status="passed",
         complete=True,
@@ -1960,9 +1979,9 @@ def test_schema_v2_accepts_final_safety_after_uv_failure() -> None:
             process_result(
                 "repository_safety",
                 argv=(
-                    "/usr/bin/git",
+                    _GIT,
                     "-C",
-                    "/repo",
+                    _REPO,
                     "ls-files",
                     "--stage",
                     "-z",
@@ -4043,7 +4062,7 @@ def test_schema_v2_rejects_execution_and_analysis_attribution_mutations() -> Non
         module="bandit",
         required=">=1.9,<2",
         version="1.9.0",
-        origin="/repo/.venv/lib/python3.12/site-packages/bandit/__init__.py",
+        origin=_repo_path(".venv/lib/python3.12/site-packages/bandit/__init__.py"),
     )
     bandit_report = replace(
         report,
@@ -4079,7 +4098,7 @@ def dependency_failure_report(status: str) -> RunReportV2:
         status=cast(Any, status),
         version="0.14.0" if status in {"incompatible", "shadowed", "unusable"} else None,
         origin=(
-            "/repo/.venv/lib/python3.12/site-packages/ruff/__init__.py"
+            _repo_path(".venv/lib/python3.12/site-packages/ruff/__init__.py")
             if status in {"incompatible", "shadowed"}
             else None
         ),
@@ -4125,7 +4144,7 @@ def pytest_dependency_failure_report(status: str) -> RunReportV2:
     }[status]
     version = "7.4.0" if status == "incompatible" else "8.4.2" if status == "shadowed" else None
     origin = (
-        "/outside/repo/site-packages/pytest/__init__.py"
+        _outside_path("repo/site-packages/pytest/__init__.py")
         if status == "shadowed"
         else dependency.origin
         if status == "incompatible"
@@ -4218,12 +4237,12 @@ def test_schema_v2_rejects_dependency_status_evidence_mutations() -> None:
 @pytest.mark.parametrize(
     ("version", "origin"),
     (
-        ("banana", "/repo/.venv/site-packages/ruff/__init__.py"),
-        ("0.15.0rc1", "/repo/.venv/site-packages/ruff/__init__.py"),
-        ("0.14.9", "/repo/.venv/site-packages/ruff/__init__.py"),
-        ("1.0", "/repo/.venv/site-packages/ruff/__init__.py"),
+        ("banana", _repo_path(".venv/site-packages/ruff/__init__.py")),
+        ("0.15.0rc1", _repo_path(".venv/site-packages/ruff/__init__.py")),
+        ("0.14.9", _repo_path(".venv/site-packages/ruff/__init__.py")),
+        ("1.0", _repo_path(".venv/site-packages/ruff/__init__.py")),
         ("0.15.0", "repo/.venv/site-packages/ruff/__init__.py"),
-        ("0.15.0", "/repo/.venv/../site-packages/ruff/__init__.py"),
+        ("0.15.0", f"{_REPO}/.venv/../site-packages/ruff/__init__.py"),
     ),
 )
 def test_schema_v2_rejects_non_authoritative_available_dependency(

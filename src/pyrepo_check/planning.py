@@ -26,6 +26,7 @@ OutputFormat = Literal["terminal", "json"]
 PlannedTestScope = Literal["not_selected", "partial", "complete"]
 PlannedCoverageScope = Literal["not_requested", "unavailable", "partial", "complete"]
 PlanningErrorCode = Literal[
+    "platform_safety_unavailable",
     "invalid_arguments",
     "invalid_project_config",
     "invalid_test_shortcut",

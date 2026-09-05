@@ -86,6 +86,7 @@ _CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CHECK_NAMES = frozenset(("ruff", "annotations", "annotations-fix", "ty", "bandit", "pytest"))
 _PLANNING_ERROR_CODES = frozenset(
     (
+        "platform_safety_unavailable",
         "invalid_arguments",
         "invalid_project_config",
         "invalid_test_shortcut",
@@ -109,6 +110,7 @@ _CHECK_ERROR_CODES = frozenset(
         "pytest_evidence_error",
         "coverage_preflight_failed",
         "missing_primary_process",
+        "platform_safety_unavailable",
         "cleanup_failed",
     )
 )
@@ -727,7 +729,7 @@ def _validate_check_result_v2(
         and dependency.status != "available"
         and primary is None
         and check.error is not None
-        and check.error.code == "cleanup_failed"
+        and check.error.code in {"cleanup_failed", "platform_safety_unavailable"}
     ):
         _validate_pytest_check_v2(
             check,
@@ -869,6 +871,7 @@ def _validate_ordinary_check_v2(
             or check.error.code
             not in {
                 "missing_primary_process",
+                "platform_safety_unavailable",
                 "cleanup_failed",
                 "check_start_evidence_invalid",
             }
@@ -975,6 +978,7 @@ def _validate_pytest_check_v2(
             or check.error.code
             not in {
                 "missing_primary_process",
+                "platform_safety_unavailable",
                 "cleanup_failed",
                 "check_start_evidence_invalid",
                 "pytest_evidence_error",
@@ -1170,7 +1174,7 @@ def _validate_unstarted_coverage_v2(
             check.error is not None
             and (
                 check.error.code == "pytest_evidence_error"
-                or check.error.code == "cleanup_failed"
+                or check.error.code in {"cleanup_failed", "platform_safety_unavailable"}
                 and pytest_result.pytest_version is None
             )
         )

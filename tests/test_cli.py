@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,7 @@ def _uv_project(tmp_path: Path) -> None:
 def _tool_environment() -> ToolEnvironmentObservation:
     return ToolEnvironmentObservation(
         pyrepo_check_version="0.1.0",
-        python=PythonObservation("cpython", (3, 13, 15), Path("/tool/bin/python")),
+        python=PythonObservation("cpython", (3, 13, 15), Path("C:/tool/bin/python") if os.name == "nt" else Path("/tool/bin/python")),
     )
 
 

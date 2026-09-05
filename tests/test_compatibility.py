@@ -20,10 +20,16 @@ from tests.support import RecordingRunner, focused_plan, monotonic_clock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _tool_executable(name: str) -> Path:
+    directory = "Scripts" if os.name == "nt" else "bin"
+    suffix = ".exe" if os.name == "nt" else ""
+    return PROJECT_ROOT / ".venv" / directory / f"{name}{suffix}"
+
+
 def _launcher_module_and_arguments(process: dict[str, Any]) -> tuple[str, list[str]]:
     argv = process["argv"]
     assert Path(argv[0]).is_absolute()
-    assert Path(argv[0]).name == "uv"
+    assert Path(argv[0]).stem == "uv"
     assert argv[1:4] == ["run", "--locked", "--python"]
     assert argv[5] == argv[4]
     module_index = argv.index("--module")
@@ -185,6 +191,9 @@ dependencies = [
 {pytest_addopts}pythonpath = ["src"]
 testpaths = ["tests"]
 
+[tool.ruff]
+target-version = "py313"
+
 {coverage_config}[tool.bandit]
 exclude_dirs = [".venv", ".pytest_cache", ".ruff_cache"]
 
@@ -280,7 +289,7 @@ def _run_external_json(
 ) -> tuple[subprocess.CompletedProcess[bytes], dict[str, Any]]:
     completed = subprocess.run(  # nosec B603
         (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            str(_tool_executable("pyrepo-check")),
             "--format",
             "json",
             *arguments,
@@ -299,7 +308,7 @@ def _run_external_terminal(
     *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # nosec B603
-        (str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"), *arguments),
+        (str(_tool_executable("pyrepo-check")), *arguments),
         cwd=consumer,
         check=False,
         capture_output=True,
@@ -423,7 +432,7 @@ def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
     environment["PYTHONPATH"] = str(consumer / "support")
     completed = subprocess.run(  # nosec B603
         (
-            str(PROJECT_ROOT / ".venv" / "bin" / "python"),
+            str(_tool_executable("python")),
             "-c",
             (
                 "import os\n"
@@ -435,7 +444,7 @@ def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
                 "sys.argv = [entrypoint, *arguments]\n"
                 "runpy.run_path(entrypoint, run_name='__main__')\n"
             ),
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            str(_tool_executable("pyrepo-check")),
             str(consumer / "coverage.toml"),
             str(consumer / "coverage.toml"),
             "--format",
@@ -476,7 +485,7 @@ def test_external_configured_coverage_all_is_complete_and_keeps_consumer_clean(
 
     completed = subprocess.run(  # nosec B603
         (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            str(_tool_executable("pyrepo-check")),
             "--format",
             "json",
             "--all",
@@ -625,7 +634,7 @@ def test_external_configured_coverage_public_modes_keep_exact_selection_and_stat
         expected_threshold_skip,
     ) in modes:
         completed = subprocess.run(  # nosec B603
-            (str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"), *arguments),
+            (str(_tool_executable("pyrepo-check")), *arguments),
             cwd=consumer,
             check=False,
             capture_output=True,
@@ -1331,7 +1340,7 @@ def test_external_consumer_cannot_shadow_isolated_plugin_or_forge_a_pass(
 
     completed = subprocess.run(  # nosec B603
         (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            str(_tool_executable("pyrepo-check")),
             "--root",
             str(consumer),
             "--format",
@@ -1367,7 +1376,7 @@ def test_external_pytest_nine_consumer_stops_after_unsupported_preflight(
 
     completed = subprocess.run(  # nosec B603
         (
-            str(PROJECT_ROOT / ".venv" / "bin" / "pyrepo-check"),
+            str(_tool_executable("pyrepo-check")),
             "--root",
             str(consumer),
             "--format",

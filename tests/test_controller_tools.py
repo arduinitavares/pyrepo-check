@@ -4,6 +4,11 @@ import os
 from pathlib import Path
 
 from pyrepo_check.controller_tools import resolve_controller_tools
+from tests.support import symlink_or_skip
+
+
+def _controller_executable_name(name: str) -> str:
+    return f"{name}.exe" if os.name == "nt" else name
 
 
 def _executable(path: Path) -> Path:
@@ -16,11 +21,11 @@ def _executable(path: Path) -> Path:
 def test_resolution_skips_repository_and_unsafe_path_entries(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    _executable(root / ".venv/bin/uv")
-    _executable(root / "bin/git")
+    _executable(root / ".venv/bin" / _controller_executable_name("uv"))
+    _executable(root / "bin" / _controller_executable_name("git"))
     external = tmp_path / "controller-bin"
-    safe_uv = _executable(external / "uv").resolve()
-    safe_git = _executable(external / "git").resolve()
+    safe_uv = _executable(external / _controller_executable_name("uv")).resolve()
+    safe_git = _executable(external / _controller_executable_name("git")).resolve()
 
     tools = resolve_controller_tools(
         root,
@@ -36,9 +41,9 @@ def test_resolution_skips_repository_and_unsafe_path_entries(tmp_path: Path) -> 
 def test_resolution_rejects_repository_resolving_alias(tmp_path: Path) -> None:
     root = tmp_path / "project"
     repository_bin = root / "bin"
-    _executable(repository_bin / "uv")
+    _executable(repository_bin / _controller_executable_name("uv"))
     external_alias = tmp_path / "alias"
-    external_alias.symlink_to(repository_bin, target_is_directory=True)
+    symlink_or_skip(external_alias, repository_bin, target_is_directory=True)
 
     tools = resolve_controller_tools(root, path=str(external_alias))
 
@@ -48,7 +53,7 @@ def test_resolution_rejects_repository_resolving_alias(tmp_path: Path) -> None:
 def test_controller_executable_detects_identity_replacement(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    executable = _executable(tmp_path / "bin/uv")
+    executable = _executable(tmp_path / "bin" / _controller_executable_name("uv"))
     tools = resolve_controller_tools(root, path=str(executable.parent))
     assert tools.uv is not None
     assert tools.uv.path_for_use() == executable.resolve()

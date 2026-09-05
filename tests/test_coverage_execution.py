@@ -9,11 +9,22 @@ from typing import Callable, TypeVar, cast
 import pytest
 
 from pyrepo_check import coverage_execution
+from pyrepo_check import filesystem
 from pyrepo_check.artifact_safety import FileDigest, RegularFileCopy
+from tests.support import symlink_or_skip
 
 
 _T = TypeVar("_T")
-_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo"))
+_HAS_POSIX_FIFO = callable(getattr(os, "mkfifo", None))
+_POSIX_FIFO = pytest.mark.skipif(
+    not _HAS_POSIX_FIFO,
+    reason="exercises POSIX FIFO behavior; native Windows file coverage is separate",
+)
+_POSIX_RENAME_RACE = pytest.mark.skipif(
+    os.name == "nt",
+    reason="requires replacing an open POSIX directory; Windows handle sharing blocks that race",
+)
+_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo", None))
 
 
 def _run_fifo_call_with_watchdog(call: Callable[[], _T], fifo: Path) -> _T:
@@ -41,12 +52,12 @@ def _run_fifo_call_with_watchdog(call: Callable[[], _T], fifo: Path) -> _T:
 
 
 def _open_directory(directory: Path) -> int:
-    return os.open(
+    return filesystem.open(
         directory,
         os.O_RDONLY
-        | cast(int, getattr(os, "O_DIRECTORY"))
-        | cast(int, getattr(os, "O_NOFOLLOW"))
-        | cast(int, getattr(os, "O_NONBLOCK")),
+        | filesystem.O_DIRECTORY
+        | filesystem.O_NOFOLLOW
+        | filesystem.O_NONBLOCK,
     )
 
 
@@ -82,7 +93,19 @@ def test_coverage_data_base_is_copied_to_an_immutable_descriptor_held_snapshot(
 
 @pytest.mark.parametrize(
     "base_kind",
-    ("missing", "symlink", "fifo", "oversized", "unreadable"),
+    (
+        "missing",
+        "symlink",
+        pytest.param("fifo", marks=_POSIX_FIFO),
+        "oversized",
+        pytest.param(
+            "unreadable",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="POSIX permission-bit fixture; Windows ACL checks have native coverage",
+            ),
+        ),
+    ),
 )
 def test_coverage_data_missing_or_unusable_base_fails_closed(
     tmp_path: Path,
@@ -94,7 +117,7 @@ def test_coverage_data_missing_or_unusable_base_fails_closed(
     if base_kind == "symlink":
         target = tmp_path / "outside.coverage"
         target.write_bytes(b"outside")
-        base.symlink_to(target)
+        symlink_or_skip(base, target)
     elif base_kind == "fifo":
         _MKFIFO(base)
     elif base_kind == "oversized":
@@ -122,7 +145,14 @@ def test_coverage_data_missing_or_unusable_base_fails_closed(
 @pytest.mark.parametrize(
     ("entry_name", "rejected"),
     (
-        (".coverage.", True),
+        pytest.param(
+            ".coverage.",
+            True,
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="Windows normalizes a trailing dot, so this fixture overwrites .coverage",
+            ),
+        ),
         (".coverage.worker", True),
         (".coveragex.worker", False),
         ("coverage.worker", False),
@@ -325,7 +355,7 @@ def test_coverage_data_preparation_cleanup_attempts_both_closes_and_preserves_er
     report_descriptors: list[int] = []
     close_attempts: list[int] = []
     original_dup = coverage_execution.os.dup
-    original_open = coverage_execution.os.open
+    original_open = coverage_execution.fs.open
     original_close = coverage_execution.os.close
 
     def tracked_dup(descriptor: int) -> int:
@@ -339,7 +369,7 @@ def test_coverage_data_preparation_cleanup_attempts_both_closes_and_preserves_er
         *args: int,
         **kwargs: int | None,
     ) -> int:
-        descriptor = original_open(path, flags, *args, **kwargs)
+        descriptor = original_open(os.fsdecode(path), flags, *args, **kwargs)
         if os.fsdecode(path) == "report-input":
             report_descriptors.append(descriptor)
         return descriptor
@@ -357,7 +387,7 @@ def test_coverage_data_preparation_cleanup_attempts_both_closes_and_preserves_er
         )
 
     monkeypatch.setattr(coverage_execution.os, "dup", tracked_dup)
-    monkeypatch.setattr(coverage_execution.os, "open", tracked_open)
+    monkeypatch.setattr(coverage_execution.fs, "open", tracked_open)
     monkeypatch.setattr(coverage_execution.os, "close", fail_report_close)
     monkeypatch.setattr(coverage_execution, "verify_coverage_data_snapshot", fail_verification)
     try:
@@ -386,6 +416,7 @@ def test_coverage_data_preparation_cleanup_attempts_both_closes_and_preserves_er
                 pass
 
 
+@_POSIX_RENAME_RACE
 def test_coverage_data_rejects_report_directory_substitution(tmp_path: Path) -> None:
     run_directory = tmp_path / "run"
     run_directory.mkdir()
@@ -531,7 +562,7 @@ def test_coverage_json_snapshot_rejects_unsafe_leaf(tmp_path: Path) -> None:
     (run / ".coverage").write_bytes(b"data")
     outside = tmp_path / "outside.json"
     outside.write_text("{}", encoding="utf-8")
-    (run / "coverage.json").symlink_to(outside)
+    symlink_or_skip(run / "coverage.json", outside)
     snapshot = _prepare_coverage_data(run)
     try:
         observation = coverage_execution.snapshot_coverage_json(snapshot)
@@ -643,7 +674,7 @@ def test_coverage_destination_and_shard_scan_io_errors_are_typed(
     snapshot = _prepare_coverage_data(run)
     with monkeypatch.context() as patch:
         patch.setattr(
-            coverage_execution.os,
+            coverage_execution.fs,
             "stat",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("stat denied")),
         )
@@ -669,7 +700,7 @@ def test_coverage_destination_and_shard_scan_io_errors_are_typed(
 def test_coverage_secure_directory_capabilities_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(coverage_execution.os, "O_NOFOLLOW", None)
+    monkeypatch.setattr(coverage_execution.fs, "O_NOFOLLOW", None)
 
     with pytest.raises(OSError, match="safe no-follow directory opening is unavailable"):
         coverage_execution._secure_directory_open_flags()

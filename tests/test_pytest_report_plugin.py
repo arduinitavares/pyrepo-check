@@ -15,6 +15,8 @@ import uuid
 
 import pytest
 
+from pyrepo_check import filesystem
+
 
 class _CountingNodeId(str):
     comparisons = 0
@@ -54,10 +56,10 @@ def run_plugin_project(
         destination.write_text(source, encoding="utf-8")
 
     artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
+    filesystem.mkdir(artifact_dir, 0o700)
     artifact_path = artifact_dir / "pytest.json"
     writer_dir = artifact_dir / "writers"
-    writer_dir.mkdir()
+    filesystem.mkdir(writer_dir, 0o700)
 
     module_dir = tmp_path / "plugin"
     module_dir.mkdir()
@@ -395,8 +397,15 @@ def test_plugin_finalizes_one_atomic_session_for_a_passing_test(tmp_path: Path) 
     assert run.markers[0]["schema_version"] == 1
     assert isinstance(run.markers[0]["pid"], int)
     assert run.artifact["writer_id"] == run.markers[0]["writer_id"]
-    assert S_IMODE(run.artifact_path.stat().st_mode) == 0o600
-    assert S_IMODE(run.marker_paths[0].stat().st_mode) == 0o600
+    for artifact in (run.artifact_path, run.marker_paths[0]):
+        if os.name == "nt":
+            descriptor = filesystem.open(artifact, os.O_RDONLY | filesystem.O_NOFOLLOW)
+            try:
+                filesystem.verify_private(descriptor)
+            finally:
+                os.close(descriptor)
+        else:
+            assert S_IMODE(artifact.stat().st_mode) == 0o600
     assert run.artifact["session"] == {
         "starts": 1,
         "finishes": 1,
@@ -485,6 +494,8 @@ def test_plugin_records_effective_args_after_all_public_sources(tmp_path: Path) 
         plugin_sources={
             "mutate_args": """
 import pytest
+
+from pyrepo_check import filesystem
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -661,6 +672,8 @@ def test_plugin_records_pytest_8_expected_failure_shapes(
         (
             """import pytest
 
+from pyrepo_check import filesystem
+
 
 @pytest.fixture
 def xfail_in_setup():
@@ -674,6 +687,8 @@ def xfail_in_setup():
         ),
         (
             """import pytest
+
+from pyrepo_check import filesystem
 
 
 @pytest.fixture

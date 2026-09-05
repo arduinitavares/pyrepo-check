@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import os
+
+from pyrepo_check import filesystem as fs
 from pathlib import Path
 import re
 import stat
@@ -386,7 +388,7 @@ def _inspect_venv(root: Path) -> EnvironmentFailureObservation | None:
         return None
     except OSError:
         return _unsafe_failure(".venv could not be safely inspected.")
-    if not stat.S_ISDIR(status.st_mode):
+    if not stat.S_ISDIR(status.st_mode) or _is_reparse_point(status):
         return _unsafe_failure(".venv must be a real directory or be absent.")
     return None
 
@@ -593,7 +595,7 @@ def _tracked_parent_exists_safely(root: Path, relative_path: str) -> bool:
             return False
         except OSError as error:
             raise _SnapshotError from error
-        if not stat.S_ISDIR(status.st_mode):
+        if not stat.S_ISDIR(status.st_mode) or _is_reparse_point(status):
             raise _SnapshotError
     return True
 
@@ -624,12 +626,12 @@ def _capture_protected_files(root: Path) -> tuple[ProtectedFileSnapshot, ...]:
 
 
 def _digest_regular_file(path: Path, expected: os.stat_result) -> str:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
+    no_follow = getattr(fs, "O_NOFOLLOW", None)
+    non_blocking = getattr(fs, "O_NONBLOCK", None)
     if type(no_follow) is not int or type(non_blocking) is not int:
         raise _SnapshotError
     try:
-        descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+        descriptor = fs.open(path, os.O_RDONLY | no_follow | non_blocking)
     except OSError as error:
         raise _SnapshotError from error
     try:
@@ -674,6 +676,10 @@ def _same_file_observation(left: os.stat_result, right: os.stat_result) -> bool:
         right.st_size,
         right.st_mtime_ns,
     )
+
+
+def _is_reparse_point(status: os.stat_result) -> bool:
+    return bool(getattr(status, "st_file_attributes", 0) & 0x400)
 
 
 def _complete_stdout(process: ExecutedProcess) -> bytes | None:

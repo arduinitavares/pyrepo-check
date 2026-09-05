@@ -9,6 +9,8 @@ from typing import Any, NoReturn
 import re
 import tomllib
 
+from pyrepo_check.filesystem import PlatformSafetyError
+
 from pyrepo_check.artifact_safety import (
     _BoundedReadError,
     _UnsafePathError,
@@ -142,6 +144,8 @@ def _load_configuration_tables(
         )
     except FileNotFoundError:
         return {}, None, None
+    except PlatformSafetyError:
+        raise
     except (_BoundedReadError, _UnsafePathError, OSError) as error:
         raise InvalidProjectConfigError(
             f"Invalid project configuration in {pyproject_path}: "

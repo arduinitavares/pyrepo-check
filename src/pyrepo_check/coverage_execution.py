@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import os
+
+from pyrepo_check import filesystem as fs
 from pathlib import Path
 import stat
 from typing import Literal, cast
@@ -153,8 +155,8 @@ def prepare_coverage_data_snapshot(
             raise CoverageDataError(code, _data_error_message(error)) from error
 
         try:
-            os.mkdir(_REPORT_INPUT_NAME, mode=0o700, dir_fd=owned_run_descriptor)
-            report_descriptor = os.open(
+            fs.mkdir(_REPORT_INPUT_NAME, mode=0o700, dir_fd=owned_run_descriptor)
+            report_descriptor = fs.open(
                 _REPORT_INPUT_NAME,
                 _secure_directory_open_flags(),
                 dir_fd=owned_run_descriptor,
@@ -215,7 +217,7 @@ def verify_coverage_data_snapshot(snapshot: CoverageDataSnapshot) -> None:
     try:
         if _status_identity(os.fstat(snapshot.run_descriptor)) != snapshot.run_identity:
             raise _UnsafePathError("run directory identity changed")
-        report_status = os.stat(
+        report_status = fs.stat(
             _REPORT_INPUT_NAME,
             dir_fd=snapshot.run_descriptor,
             follow_symlinks=False,
@@ -282,7 +284,7 @@ def verify_coverage_data_snapshot(snapshot: CoverageDataSnapshot) -> None:
 def require_coverage_json_destination_absent(snapshot: CoverageDataSnapshot) -> None:
     """Refuse to let Coverage.py replace an existing run-owned JSON leaf."""
     try:
-        os.stat(
+        fs.stat(
             "coverage.json",
             dir_fd=snapshot.run_descriptor,
             follow_symlinks=False,
@@ -316,12 +318,12 @@ def _reject_shards(descriptor: int, *, prefix: str, namespace: str) -> None:
 
 
 def _directory_is_empty(descriptor: int) -> bool:
-    with os.scandir(descriptor) as entries:
+    with fs.scandir(descriptor) as entries:
         return next(entries, None) is None
 
 
 def _find_prefixed_entry(descriptor: int, prefix: str) -> str | None:
-    with os.scandir(descriptor) as entries:
+    with fs.scandir(descriptor) as entries:
         return next((entry.name for entry in entries if entry.name.startswith(prefix)), None)
 
 
@@ -333,7 +335,7 @@ def _directory_identity(descriptor: int, name: str) -> tuple[int, int]:
 
 
 def _regular_leaf_identity(descriptor: int, name: str) -> FileIdentity:
-    file_status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    file_status = fs.stat(name, dir_fd=descriptor, follow_symlinks=False)
     if not stat.S_ISREG(file_status.st_mode):
         raise _UnsafePathError(f"{name} is not a regular file")
     return FileIdentity(file_status.st_dev, file_status.st_ino)
@@ -365,6 +367,9 @@ def _close_snapshot_descriptors(
 
 
 def _verify_report_directory_metadata(descriptor: int) -> None:
+    if os.name == "nt":
+        fs.verify_private(descriptor)
+        return
     file_status = os.fstat(descriptor)
     get_effective_user_id = getattr(os, "geteuid", None)
     if not callable(get_effective_user_id):
@@ -376,9 +381,9 @@ def _verify_report_directory_metadata(descriptor: int) -> None:
 
 
 def _secure_directory_open_flags() -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    non_blocking = getattr(os, "O_NONBLOCK", None)
-    directory = getattr(os, "O_DIRECTORY", None)
+    no_follow = getattr(fs, "O_NOFOLLOW", None)
+    non_blocking = getattr(fs, "O_NONBLOCK", None)
+    directory = getattr(fs, "O_DIRECTORY", None)
     if type(no_follow) is not int or type(non_blocking) is not int or type(directory) is not int:
         raise _UnsafePathError("safe no-follow directory opening is unavailable")
     return os.O_RDONLY | no_follow | non_blocking | directory

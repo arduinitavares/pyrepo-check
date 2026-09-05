@@ -126,7 +126,7 @@ def test_tool_environment_observation_uses_controller_without_a_process(
 
     assert observation.python.implementation == execution.sys.implementation.name
     assert observation.python.version == (3, 13, 15)
-    assert observation.python.executable == Path("/tool/bin/python")
+    assert observation.python.executable == Path("/tool/bin/python").absolute()
 
 
 def test_public_execute_plan_delegates_once_without_legacy_adapters(
@@ -293,7 +293,7 @@ def test_terminal_process_inherits_streams(tmp_path: Path, capfd: pytest.Capture
     assert process.returncode == 0
     assert process.stdout is None
     assert process.stderr is None
-    assert capfd.readouterr().out == "visible\n"
+    assert capfd.readouterr().out == "visible" + os.linesep
 
 
 def test_production_capture_uses_distinct_readers_and_exact_bounded_tails(

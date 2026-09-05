@@ -42,6 +42,7 @@ from pyrepo_check.execution import (
     observe_tool_environment,
 )
 from pyrepo_check import execution_workspace
+from pyrepo_check.filesystem import PlatformSafetyError
 from pyrepo_check.execution_workspace import VerifiedRunWorkspace
 from pyrepo_check.planning import CheckInvocation, RunPlan
 from pyrepo_check.pytest_execution import execute_prepared_pytest
@@ -451,6 +452,11 @@ def _nonthrowing_progress_writer(writer: TerminalWriter) -> TerminalWriter:
     return emit
 
 
+def _platform_safety_message(error: PlatformSafetyError) -> str:
+    details = "; ".join((str(error), *getattr(error, "__notes__", ())))
+    return f"workspace filesystem safety is unavailable: {details}"
+
+
 def _execute_in_workspace(
     invocation: CheckInvocation,
     *,
@@ -464,6 +470,11 @@ def _execute_in_workspace(
 ) -> RepositoryCheckObservation:
     try:
         run_workspace = execution_workspace.create_run_workspace(prepared.root)
+    except PlatformSafetyError as error:
+        return _check_failure(
+            invocation, "platform_safety_unavailable",
+            _platform_safety_message(error),
+        )
     except ControllerHelperIdentityError:
         raise
     except OSError as error:
@@ -521,6 +532,11 @@ def _execute_in_workspace(
             )
     except ControllerHelperIdentityError:
         raise
+    except PlatformSafetyError as error:
+        observation = _check_failure(
+            invocation, "platform_safety_unavailable",
+            _platform_safety_message(error),
+        )
     except OSError as error:
         diagnostics.append(f"workspace setup failed: {type(error).__name__}: {error}")
     finally:

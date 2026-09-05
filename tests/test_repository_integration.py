@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess  # nosec B404
 import sys
+import textwrap
 from typing import Any
 
 import pytest
@@ -31,7 +32,11 @@ _UV_STORAGE_VARIABLES = (
     "UV_PYTHON_CACHE_DIR",
     "UV_PYTHON_BIN_DIR",
 )
-_UV_STORAGE_BASES = ("HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_BIN_HOME")
+_UV_STORAGE_BASES = (
+    ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "XDG_DATA_HOME", "XDG_BIN_HOME")
+    if os.name == "nt"
+    else ("HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_BIN_HOME")
+)
 
 
 def _run_repository_json(
@@ -70,6 +75,28 @@ def _resolved_executable(name: str) -> Path:
     executable = shutil.which(name)
     assert executable is not None, f"required executable is unavailable: {name}"
     return Path(executable).resolve()
+
+
+def _link_executable(directory: Path, name: str) -> None:
+    """Expose one executable through an isolated test-owned PATH."""
+    executable = _resolved_executable(name)
+    if os.name == "nt":
+        shutil.copy2(executable, directory / executable.name)
+        return
+    (directory / name).symlink_to(executable)
+
+
+def _directory_alias(alias: Path, target: Path) -> None:
+    """Create a directory alias without requiring Windows symlink privilege."""
+    if os.name != "nt":
+        support.symlink_or_skip(alias, target, target_is_directory=True)
+        return
+    completed = subprocess.run(  # nosec B603
+        ("cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(target)),
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode()
 
 
 def _run_git(
@@ -122,10 +149,27 @@ def _without_dependency(name: str) -> tuple[str, ...]:
     return tuple(dependency for dependency in _DEPENDENCIES if not dependency.startswith(name))
 
 
+def _overridden_uv_storage_variables(base_variable: str) -> tuple[str, ...]:
+    if os.name == "nt":
+        return {
+            "LOCALAPPDATA": ("UV_CACHE_DIR",),
+            "APPDATA": ("UV_PYTHON_INSTALL_DIR",),
+            "USERPROFILE": ("UV_PYTHON_BIN_DIR",),
+            "XDG_DATA_HOME": ("UV_PYTHON_BIN_DIR",),
+            "XDG_BIN_HOME": ("UV_PYTHON_BIN_DIR",),
+        }[base_variable]
+    return {
+        "HOME": ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "UV_PYTHON_BIN_DIR"),
+        "XDG_CACHE_HOME": ("UV_CACHE_DIR",),
+        "XDG_DATA_HOME": ("UV_PYTHON_INSTALL_DIR", "UV_PYTHON_BIN_DIR"),
+        "XDG_BIN_HOME": ("UV_PYTHON_BIN_DIR",),
+    }[base_variable]
+
+
 def _write_uv_proxy(tmp_path: Path, mode: str) -> Path:
     proxy_directory = tmp_path / "uv-proxy"
     proxy_directory.mkdir()
-    proxy = proxy_directory / "uv"
+    proxy = proxy_directory / "uv-proxy.py"
     proxy.write_text(
         f'''#!{sys.executable}
 import json
@@ -178,7 +222,58 @@ raise SystemExit(completed.returncode)
 ''',
         encoding="utf-8",
     )
-    proxy.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    if os.name == "nt":
+        package = proxy_directory / "package"
+        package.mkdir()
+        (package / "pyproject.toml").write_text(
+            '''[project]
+name = "test-uv-proxy"
+version = "0.0.0"
+
+[project.scripts]
+uv = "test_uv_proxy:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["test_uv_proxy"]
+''',
+            encoding="utf-8",
+        )
+        payload = proxy.read_text(encoding="utf-8").split("\n", maxsplit=1)[1]
+        module = package / "test_uv_proxy"
+        module.mkdir()
+        (module / "__init__.py").write_text(
+            "def main() -> None:\n" + textwrap.indent(payload, "    "),
+            encoding="utf-8",
+        )
+        environment = proxy_directory / "venv"
+        created = subprocess.run(  # nosec B603
+            (_resolved_executable("uv"), "venv", "--python", sys.executable, str(environment)),
+            check=False,
+            capture_output=True,
+        )
+        assert created.returncode == 0, created.stderr.decode()
+        installed = subprocess.run(  # nosec B603
+            (
+                _resolved_executable("uv"),
+                "pip",
+                "install",
+                "--python",
+                str(environment / "Scripts" / "python.exe"),
+                str(package),
+            ),
+            check=False,
+            capture_output=True,
+        )
+        assert installed.returncode == 0, installed.stderr.decode()
+        shutil.copy2(environment / "Scripts" / "uv.exe", proxy_directory / "uv.exe")
+    else:
+        launcher = proxy_directory / "uv"
+        shutil.copy2(proxy, launcher)
+        launcher.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
     return proxy_directory
 
 
@@ -186,29 +281,18 @@ def _add_artifact_attack(repository: Path) -> None:
     (repository / "conftest.py").write_text(
         '''"""Corrupt repository-controlled pytest evidence after plugin finalization."""
 
-import os
-import subprocess
-import sys
-
-
-_ATTACK_SOURCE = r"""
+import atexit
 import json
 import os
 from pathlib import Path
-import time
+import sys
 
-artifact = Path(os.environ["PYREPO_CHECK_PYTEST_JSON"])
-mode = os.environ["PYREPO_CHECK_ARTIFACT_ATTACK"]
-deadline = time.monotonic() + 10
-while time.monotonic() < deadline:
-    try:
-        payload = json.loads(artifact.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        time.sleep(0.005)
-        continue
+def _attack_after_finalization():
+    artifact = Path(os.environ["PYREPO_CHECK_PYTEST_JSON"])
+    mode = os.environ["PYREPO_CHECK_ARTIFACT_ATTACK"]
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
     if payload.get("state") != "finalized":
-        time.sleep(0.005)
-        continue
+        raise RuntimeError("pytest artifact was not finalized before attack")
     if mode == "replace":
         replacement = artifact.with_name("replacement.json")
         replacement.write_text('{"schema_version":1}', encoding="utf-8")
@@ -218,10 +302,17 @@ while time.monotonic() < deadline:
     else:
         payload["session"]["starts"] = 2
         artifact.write_text(json.dumps(payload), encoding="utf-8")
-    break
-"""
+    print(f"PYREPO_CHECK_ATTACK_COMPLETE:{mode}", file=sys.stderr)
 
-subprocess.Popen((sys.executable, "-c", _ATTACK_SOURCE), env=os.environ)  # noqa: S603
+def pytest_unconfigure(config):
+    plugin = next(
+        module
+        for name, module in sys.modules.items()
+        if name.startswith("_pyrepo_check_pytest_")
+    )
+    atexit.unregister(plugin._finalize_at_exit)
+    atexit.register(_attack_after_finalization)
+    atexit.register(plugin._finalize_at_exit)
 ''',
         encoding="utf-8",
     )
@@ -242,7 +333,10 @@ def test_missing_environment_is_rebuilt_from_the_current_lock(
     assert (repository / ".venv").is_dir()
     repository_python = Path(report["repository_environment"]["python"]["executable"])
     assert repository_python.is_relative_to(repository / ".venv")
-    assert repository_python.resolve().is_relative_to(repository) is False
+    if os.name == "nt":
+        assert repository_python.resolve().is_relative_to(repository / ".venv")
+    else:
+        assert repository_python.resolve().is_relative_to(repository) is False
     assert [dependency["name"] for dependency in report["repository_environment"]["dependencies"]] == [
         "ruff",
         "ty",
@@ -350,9 +444,12 @@ def test_unsafe_uv_storage_override_stops_before_processes(
 ) -> None:
     repository = support.write_locked_repository_fixture(tmp_path, python="3.13")
     environment = support.repository_test_environment(tmp_path / "safe-storage")
-    alias = tmp_path / "repository-alias"
-    alias.symlink_to(repository, target_is_directory=True)
-    destination = repository / "storage" if destination_kind == "lexical" else alias / "storage"
+    if destination_kind == "lexical":
+        destination = repository / "storage"
+    else:
+        alias = tmp_path / "repository-alias"
+        _directory_alias(alias, repository)
+        destination = alias / "storage"
     environment[variable] = str(destination)
 
     completed, report = _run_repository_json(repository, "ty", environment=environment)
@@ -371,17 +468,15 @@ def test_unsafe_uv_default_storage_base_stops_before_processes(
 ) -> None:
     repository = support.write_locked_repository_fixture(tmp_path, python="3.13")
     environment = support.repository_test_environment(tmp_path / "safe-storage")
-    alias = tmp_path / "repository-alias"
-    alias.symlink_to(repository, target_is_directory=True)
-    environment[base_variable] = str(
-        repository if destination_kind == "lexical" else alias
-    )
-    if base_variable in {"HOME", "XDG_CACHE_HOME"}:
-        environment.pop("UV_CACHE_DIR")
-    if base_variable in {"HOME", "XDG_DATA_HOME"}:
-        environment.pop("UV_PYTHON_INSTALL_DIR", None)
-    if base_variable in {"HOME", "XDG_DATA_HOME", "XDG_BIN_HOME"}:
-        environment.pop("UV_PYTHON_BIN_DIR")
+    suffix = "data" if os.name == "nt" and base_variable == "XDG_DATA_HOME" else ""
+    if destination_kind == "lexical":
+        environment[base_variable] = str(repository / suffix)
+    else:
+        alias = tmp_path / "repository-alias"
+        _directory_alias(alias, repository)
+        environment[base_variable] = str(alias / suffix)
+    for variable in _overridden_uv_storage_variables(base_variable):
+        environment.pop(variable, None)
 
     completed, report = _run_repository_json(repository, "ty", environment=environment)
 
@@ -410,7 +505,7 @@ def test_unsafe_repository_environment_path_stops_before_uv(
     else:
         external = tmp_path / "external-environment"
         external.mkdir()
-        environment_path.symlink_to(external, target_is_directory=True)
+        support.symlink_or_skip(environment_path, external, target_is_directory=True)
 
     completed, report = _run_repository_json(repository, "ty")
 
@@ -424,7 +519,7 @@ def test_unavailable_git_is_bounded_and_stops_before_uv(tmp_path: Path) -> None:
     repository = support.write_locked_repository_fixture(tmp_path, python="3.13")
     executable_directory = tmp_path / "uv-only-bin"
     executable_directory.mkdir()
-    (executable_directory / "uv").symlink_to(_resolved_executable("uv"))
+    _link_executable(executable_directory, "uv")
     environment = support.repository_test_environment(tmp_path / "uv-storage")
     environment["PATH"] = str(executable_directory)
 
@@ -672,6 +767,7 @@ def test_repository_controlled_pytest_artifact_attacks_are_rejected(
     assert check["execution_environment"] == "repository"
     assert check["start_evidence"] is not None
     assert primary["exit_code"] == 0
+    assert f"PYREPO_CHECK_ATTACK_COMPLETE:{mode}" in primary["stderr"]["text"]
     assert pytest_result["status"] == "error"
     assert pytest_result["error"]["code"] == "artifact_invalid"
     assert primary["stdout"]["text"]
@@ -686,9 +782,13 @@ def _isolated_acquisition_environment(
 ) -> dict[str, str]:
     executable_directory = root / "bin"
     executable_directory.mkdir(parents=True)
-    (executable_directory / "uv").symlink_to(_resolved_executable("uv"))
+    _link_executable(executable_directory, "uv")
+    path_entries = [str(executable_directory)]
     if include_git:
-        (executable_directory / "git").symlink_to(_resolved_executable("git"))
+        if os.name == "nt":
+            path_entries.append(str(_resolved_executable("git").parent))
+        else:
+            _link_executable(executable_directory, "git")
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -706,7 +806,7 @@ def _isolated_acquisition_environment(
     environment.update(
         {
             "HOME": str(root / "home"),
-            "PATH": str(executable_directory),
+            "PATH": os.pathsep.join(path_entries),
             "UV_CACHE_DIR": str(root / "cache"),
             "UV_PYTHON_BIN_DIR": str(root / "python-bin"),
             "UV_PYTHON_CACHE_DIR": str(root / "python-cache"),

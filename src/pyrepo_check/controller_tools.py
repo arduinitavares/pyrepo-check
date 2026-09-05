@@ -72,7 +72,8 @@ def _resolve_executable(
         entry = Path(raw_entry)
         if not entry.is_absolute():
             continue
-        lexical_candidate = _normalized_absolute(entry / name)
+        filename = f"{name}.exe" if os.name == "nt" else name
+        lexical_candidate = _normalized_absolute(entry / filename)
         if _contained_by(lexical_candidate, project_root):
             continue
         try:

@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+from tests.support import symlink_or_skip
+
 from pyrepo_check.coverage_dependency import (
     coverage_json_staged_command,
     ensure_staged_coverage_dependency,
@@ -176,7 +178,7 @@ def test_repository_venv_sitecustomize_cannot_run_before_coverage_launcher(
         check=True,
         capture_output=True,
     )
-    repository_python = environment_root / "bin/python"
+    repository_python = environment_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     purelib = Path(
         subprocess.run(  # nosec B603
             (
@@ -378,6 +380,6 @@ def test_pytest_module_root_alias_is_rejected_before_json(tmp_path: Path) -> Non
         external = tmp_path / "aliased-module-root"
         shutil.copytree(staged.module_root, external)
         shutil.rmtree(staged.module_root)
-        staged.module_root.symlink_to(external, target_is_directory=True)
+        symlink_or_skip(staged.module_root, external, target_is_directory=True)
         with pytest.raises(OSError):
             ensure_staged_coverage_dependency(staged, workspace=workspace)

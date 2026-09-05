@@ -28,7 +28,62 @@ jobs:
           uv run --locked --python "$CONTROLLER_PYTHON" python -m ruff check . --select ANN --output-format concise
           uv run --locked --python "$CONTROLLER_PYTHON" python -m ty check
           uv run --locked --python "$CONTROLLER_PYTHON" python -m bandit -c pyproject.toml -r .
-          uv run --locked --python "$CONTROLLER_PYTHON" python -m coverage run --rcfile=pyproject.toml -m pytest
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m coverage run --rcfile=pyproject.toml --data-file=.coverage.linux -m pytest
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-linux
+          path: .coverage.linux
+          include-hidden-files: true
+          if-no-files-found: error
+
+  windows-regression:
+    runs-on: windows-latest
+    env:
+      WINDOWS_CONTROLLER_PYTHON: "3.13.15"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          # This catalog includes the reported Windows CPython 3.13.15 build.
+          version: "0.12.8"
+          enable-cache: true
+      - name: Synchronize native Windows controller environment
+        run: |
+          uv python install $env:WINDOWS_CONTROLLER_PYTHON
+          uv sync --locked --python $env:WINDOWS_CONTROLLER_PYTHON
+      - name: Exercise native safety and a separately installed controller
+        run: >-
+          uv run --locked --python $env:WINDOWS_CONTROLLER_PYTHON python -m coverage run
+          --rcfile=pyproject.toml --data-file=.coverage.windows -m pytest
+          tests/test_windows_files.py tests/test_windows_safety.py
+          tests/test_windows_controller.py tests/test_platform_safety.py
+          tests/test_windows_integration.py
+          tests/test_artifact_safety.py tests/test_execution_workspace.py
+          tests/test_pytest_execution.py tests/test_coverage_execution.py
+          tests/test_controller_tools.py tests/test_repository_executor.py -q
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-windows
+          path: .coverage.windows
+          include-hidden-files: true
+          if-no-files-found: error
+
+  combined-coverage-gate:
+    needs: [controller-gate, windows-regression]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.12"
+          enable-cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+      - name: Enforce the unchanged coverage threshold across both platforms
+        run: |
+          uv run --locked --python "$CONTROLLER_PYTHON" python -m coverage combine --rcfile=pyproject.toml
           uv run --locked --python "$CONTROLLER_PYTHON" python -m coverage report --rcfile=pyproject.toml
 
   repository-python:

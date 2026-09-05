@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+
+from pyrepo_check import filesystem as fs
 from pathlib import Path
 import secrets
 import stat
@@ -62,15 +64,15 @@ def stage_coverage_dependency(
     package_descriptor: int | None = None
     module_root_identity: tuple[int, int] | None = None
     try:
-        os.mkdir(module_root_name, mode=0o700, dir_fd=workspace.descriptor)
-        destination_descriptor = os.open(
+        fs.mkdir(module_root_name, mode=0o700, dir_fd=workspace.descriptor)
+        destination_descriptor = fs.open(
             module_root_name,
             _directory_open_flags(),
             dir_fd=workspace.descriptor,
         )
         module_root_identity = _directory_identity(destination_descriptor)
-        os.mkdir(package_name, mode=0o700, dir_fd=destination_descriptor)
-        package_descriptor = os.open(
+        fs.mkdir(package_name, mode=0o700, dir_fd=destination_descriptor)
+        package_descriptor = fs.open(
             package_name,
             _directory_open_flags(),
             dir_fd=destination_descriptor,
@@ -123,7 +125,7 @@ def ensure_staged_coverage_dependency(
 ) -> None:
     """Reject any post-staging package or launcher mutation before JSON execution."""
     workspace.verify("before staged Coverage dependency validation")
-    module_root_descriptor = os.open(
+    module_root_descriptor = fs.open(
         staged.module_root.name,
         _directory_open_flags(),
         dir_fd=workspace.descriptor,
@@ -192,7 +194,7 @@ def _copy_tree(
     if depth > _MAX_DEPTH:
         raise OSError("Coverage package exceeds staging depth limit")
     initial_identity = _directory_identity(source_descriptor)
-    entries = sorted(os.scandir(source_descriptor), key=lambda entry: entry.name)
+    entries = sorted(fs.scandir(source_descriptor), key=lambda entry: entry.name)
     for entry in entries:
         counts[0] += 1
         if counts[0] > _MAX_ENTRIES:
@@ -200,13 +202,13 @@ def _copy_tree(
         status = entry.stat(follow_symlinks=False)
         child_relative = relative / entry.name
         if stat.S_ISDIR(status.st_mode):
-            os.mkdir(entry.name, mode=0o700, dir_fd=destination_descriptor)
-            source_child = os.open(
+            fs.mkdir(entry.name, mode=0o700, dir_fd=destination_descriptor)
+            source_child = fs.open(
                 entry.name,
                 _directory_open_flags(),
                 dir_fd=source_descriptor,
             )
-            destination_child = os.open(
+            destination_child = fs.open(
                 entry.name,
                 _directory_open_flags(),
                 dir_fd=destination_descriptor,
@@ -241,7 +243,7 @@ def _copy_tree(
             raise OSError("Coverage package contains a non-regular entry")
     if _directory_identity(source_descriptor) != initial_identity:
         raise OSError("Coverage package directory identity changed")
-    final_names = tuple(sorted(entry.name for entry in os.scandir(source_descriptor)))
+    final_names = tuple(sorted(entry.name for entry in fs.scandir(source_descriptor)))
     if final_names != tuple(entry.name for entry in entries):
         raise OSError("Coverage package directory entries changed")
 
@@ -256,14 +258,14 @@ def _snapshot_tree(
 ) -> None:
     if depth > _MAX_DEPTH:
         raise OSError("staged Coverage dependency exceeds validation depth limit")
-    entries = sorted(os.scandir(descriptor), key=lambda entry: entry.name)
+    entries = sorted(fs.scandir(descriptor), key=lambda entry: entry.name)
     if len(files) + len(directories) + len(entries) > _MAX_ENTRIES:
         raise OSError("staged Coverage dependency exceeds validation entry limit")
     for entry in entries:
         status = entry.stat(follow_symlinks=False)
         child_relative = relative / entry.name
         if stat.S_ISDIR(status.st_mode):
-            child_descriptor = os.open(
+            child_descriptor = fs.open(
                 entry.name,
                 _directory_open_flags(),
                 dir_fd=descriptor,
@@ -290,10 +292,10 @@ def _snapshot_tree(
 
 
 def _open_relative_directory(root: Path, relative: Path) -> int:
-    descriptor = os.open(root, _directory_open_flags())
+    descriptor = fs.open(root, _directory_open_flags())
     try:
         for component in relative.parts:
-            next_descriptor = os.open(
+            next_descriptor = fs.open(
                 component,
                 _directory_open_flags(),
                 dir_fd=descriptor,
@@ -309,9 +311,9 @@ def _open_relative_directory(root: Path, relative: Path) -> int:
 def _directory_open_flags() -> int:
     return (
         os.O_RDONLY
-        | cast(int, getattr(os, "O_DIRECTORY"))
-        | cast(int, getattr(os, "O_NOFOLLOW"))
-        | cast(int, getattr(os, "O_NONBLOCK"))
+        | cast(int, getattr(fs, "O_DIRECTORY"))
+        | cast(int, getattr(fs, "O_NOFOLLOW"))
+        | cast(int, getattr(fs, "O_NONBLOCK"))
     )
 
 

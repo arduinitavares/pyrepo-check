@@ -20,12 +20,14 @@ from pyrepo_check.execution import PreparedRepositoryEnvironment
 from pyrepo_check.planning import CheckInvocation
 from pyrepo_check import _check_launcher as standalone_launcher
 from pyrepo_check import repository_executor
+from pyrepo_check import filesystem
 from tests.support import (
     RecordingRunner,
     launcher_aware_runner,
     monotonic_clock,
     prepared_repository,
     RecordedCall,
+    symlink_or_skip,
     test_workspace,
 )
 
@@ -63,14 +65,25 @@ def _marker_payload(
 
 
 def _write_marker(path: Path, payload: object) -> None:
-    descriptor = os.open(
+    descriptor = filesystem.open(
         path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | filesystem.O_NOFOLLOW,
         0o600,
     )
     try:
         os.write(descriptor, json.dumps(payload, separators=(",", ":")).encode())
         os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _assert_private_marker(path: Path) -> None:
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        return
+    descriptor = filesystem.open(path, os.O_RDONLY | filesystem.O_NOFOLLOW)
+    try:
+        filesystem.verify_private(descriptor)
     finally:
         os.close(descriptor)
 
@@ -150,7 +163,9 @@ def test_standalone_dispatch_publishes_before_module_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    marker = tmp_path / "marker.json"
+    run_directory = tmp_path / "private-run"
+    filesystem.mkdir(run_directory, 0o700)
+    marker = run_directory / "marker.json"
     observed: list[tuple[object, ...]] = []
     original_path0 = sys.path[0]
     original_argv = sys.argv
@@ -193,14 +208,16 @@ def test_standalone_dispatch_publishes_before_module_boundary(
     assert payload["check"] == "ruff"
     assert payload["module"] == "probe"
     assert payload["arguments_sha256"] == _arguments_sha256(("a", "b"))
-    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    _assert_private_marker(marker)
 
 
 def test_standalone_dispatch_maps_ordinary_exception_to_reserved_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    marker = tmp_path / "marker.json"
+    run_directory = tmp_path / "private-run"
+    filesystem.mkdir(run_directory, 0o700)
+    marker = run_directory / "marker.json"
     original_path0 = sys.path[0]
     original_argv = sys.argv
     original_orig_argv = sys.orig_argv
@@ -289,15 +306,12 @@ def test_staged_launcher_is_exclusive_regular_owner_only_copy(
         launcher = _launcher()
         monkeypatch.setattr(launcher.secrets, "token_hex", lambda size: "fixed")
         staged = launcher.stage_check_launcher(workspace)
-        file_status = os.stat(
-            staged.path.name,
-            dir_fd=workspace.descriptor,
-            follow_symlinks=False,
-        )
+        file_status = filesystem.stat(staged.path, follow_symlinks=False)
 
         assert stat.S_ISREG(file_status.st_mode)
-        assert stat.S_IMODE(file_status.st_mode) == 0o600
-        assert file_status.st_uid == getattr(os, "geteuid")()
+        _assert_private_marker(staged.path)
+        if os.name != "nt":
+            assert file_status.st_uid == getattr(os, "geteuid")()
         assert staged.digest.size == staged.path.stat().st_size
         with pytest.raises(FileExistsError):
             launcher.stage_check_launcher(workspace)
@@ -500,14 +514,14 @@ def test_marker_rejects_duplicate_keys_and_4097_bytes(tmp_path: Path) -> None:
             )
 
 
-def test_marker_rejects_symlink_and_broad_permissions(tmp_path: Path) -> None:
+def test_marker_rejects_symlink(tmp_path: Path) -> None:
     prepared = prepared_repository(tmp_path, (3, 12, 11))
     invocation = CheckInvocation("ruff", ("check", "."))
     with test_workspace(tmp_path) as workspace:
         target = workspace.workspace.path / "target.json"
         _write_marker(target, _marker_payload(prepared, invocation, "ruff"))
         symlink = workspace.workspace.path / "symlink.json"
-        symlink.symlink_to(target.name)
+        symlink_or_skip(symlink, target)
         with pytest.raises(OSError, match="regular|symbolic|marker"):
             _launcher().validate_start_marker(
                 symlink,
@@ -517,6 +531,16 @@ def test_marker_rejects_symlink_and_broad_permissions(tmp_path: Path) -> None:
                 prepared=prepared,
             )
 
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="chmod mode bits do not model Windows marker ACL permissions",
+)
+def test_marker_rejects_broad_permissions(tmp_path: Path) -> None:
+    prepared = prepared_repository(tmp_path, (3, 12, 11))
+    invocation = CheckInvocation("ruff", ("check", "."))
+    with test_workspace(tmp_path) as workspace:
         broad = workspace.workspace.path / "broad.json"
         _write_marker(broad, _marker_payload(prepared, invocation, "ruff"))
         broad.chmod(0o644)
@@ -530,6 +554,10 @@ def test_marker_rejects_symlink_and_broad_permissions(tmp_path: Path) -> None:
             )
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="the Windows marker contract validates an ACL instead of a POSIX UID",
+)
 def test_marker_rejects_wrong_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     prepared = prepared_repository(tmp_path, (3, 12, 11))
     invocation = CheckInvocation("ruff", ("check", "."))
@@ -583,7 +611,10 @@ def test_marker_open_closes_descriptor_when_inheritability_setup_fails(
         marker = workspace.workspace.path / "marker.json"
         _write_marker(marker, _marker_payload(prepared, invocation, "ruff"))
         launcher = _launcher()
-        original_close = launcher.os.close
+        marker_os = ModuleType("marker_os")
+        marker_os.__dict__.update(os.__dict__)
+        monkeypatch.setattr(launcher, "os", marker_os)
+        original_close = marker_os.close
         closed: list[int] = []
 
         def close(descriptor: int) -> None:
@@ -591,9 +622,9 @@ def test_marker_open_closes_descriptor_when_inheritability_setup_fails(
             original_close(descriptor)
 
         with monkeypatch.context() as marker_patch:
-            marker_patch.setattr(launcher.os, "close", close)
+            marker_patch.setattr(marker_os, "close", close)
             marker_patch.setattr(
-                launcher.os,
+                marker_os,
                 "set_inheritable",
                 lambda descriptor, inheritable: (_ for _ in ()).throw(
                     OSError("blocked")
@@ -611,6 +642,10 @@ def test_marker_open_closes_descriptor_when_inheritability_setup_fails(
             assert len(closed) == 1
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="fchmod mode-bit mutation is POSIX-specific; Windows ACL coverage is native",
+)
 def test_marker_in_place_mode_mutation_during_read_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -633,7 +668,8 @@ def test_marker_in_place_mode_mutation_during_read_fails_closed(
             return chunk
 
         monkeypatch.setattr(launcher.os, "read", mutate_mode_after_read)
-        with pytest.raises(OSError, match="changed|metadata"):
+        expected = "Permission denied" if os.name == "nt" else "changed|metadata"
+        with pytest.raises(OSError, match=expected):
             launcher.validate_start_marker(
                 marker,
                 workspace=workspace,
@@ -671,7 +707,8 @@ def test_marker_in_place_size_mutation_during_read_fails_closed(
             return chunk
 
         monkeypatch.setattr(launcher.os, "read", mutate_size_after_read)
-        with pytest.raises(OSError, match="changed|metadata"):
+        expected = "Permission denied" if os.name == "nt" else "changed|metadata"
+        with pytest.raises(OSError, match=expected):
             launcher.validate_start_marker(
                 marker,
                 workspace=workspace,
@@ -908,6 +945,7 @@ def _parity_pythons() -> tuple[str, ...]:
         executable
         for name in ("python3.10", "python3.11", "python3.12", "python3.13")
         if (executable := shutil.which(name)) is not None
+        and (os.name != "nt" or Path(executable).suffix.lower() == ".exe")
     )
     return tuple(dict.fromkeys(candidates))
 
@@ -950,7 +988,9 @@ def test_launcher_matches_native_python_module_startup(
     )
     direct_output = tmp_path / "direct.json"
     launched_output = tmp_path / "launched.json"
-    marker = tmp_path / "marker.json"
+    run_directory = tmp_path / "private-run"
+    filesystem.mkdir(run_directory, 0o700)
+    marker = run_directory / "marker.json"
     direct_environment = {**os.environ, "PROBE_OUTPUT": str(direct_output)}
     launched_environment = {**os.environ, "PROBE_OUTPUT": str(launched_output)}
 
@@ -987,4 +1027,4 @@ def test_launcher_matches_native_python_module_startup(
     )
     marker_status = marker.stat(follow_symlinks=False)
     assert stat.S_ISREG(marker_status.st_mode)
-    assert stat.S_IMODE(marker_status.st_mode) == 0o600
+    _assert_private_marker(marker)

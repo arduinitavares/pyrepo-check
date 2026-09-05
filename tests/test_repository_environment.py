@@ -35,11 +35,26 @@ from tests.support import (
     focused_plan,
     missing_dependency,
     monotonic_clock,
+    symlink_or_skip,
     write_minimal_uv_project,
 )
 
 
 _MKFIFO = getattr(os, "mkfifo", None)
+
+
+def _venv_python(root: Path) -> Path:
+    return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _venv_site_packages(root: Path) -> Path:
+    if os.name == "nt":
+        return root / "Lib/site-packages"
+    return root / "lib/python3.12/site-packages"
+
+
+def _toml_path(path: Path) -> str:
+    return path.as_posix()
 
 
 _ALLOWED_UV_CONTROLS = (
@@ -159,7 +174,7 @@ def test_sanitized_pythonwarnings_cannot_import_repository_shadow_before_probe(
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == b"probe\n"
+    assert completed.stdout == f"probe{os.linesep}".encode()
     assert not witness.exists()
 
 
@@ -188,7 +203,7 @@ def test_storage_override_rejects_every_repository_alias_without_mutation(
     external = tmp_path / "external"
     external.mkdir()
     alias = external / "repository-alias"
-    alias.symlink_to(root, target_is_directory=True)
+    symlink_or_skip(alias, root, target_is_directory=True)
     destinations = {
         "relative": Path("relative-storage"),
         "root": root,
@@ -240,6 +255,8 @@ def test_no_cache_validates_effective_temporary_storage_and_ignores_cache_dir(
             "UV_NO_CACHE": "1",
             "UV_CACHE_DIR": str(root / "ineffective-cache"),
             "TMPDIR": str(root / "temporary-cache-parent"),
+            "TEMP": str(root / "temporary-cache-parent"),
+            "TMP": str(root / "temporary-cache-parent"),
         }
     )
 
@@ -264,6 +281,8 @@ def test_no_cache_accepts_external_temporary_storage_despite_unsafe_cache_overri
             "UV_NO_CACHE": "true",
             "UV_CACHE_DIR": str(root / "ineffective-cache"),
             "TMPDIR": str(tmp_path / "external-temporary-cache-parent"),
+            "TEMP": str(tmp_path / "external-temporary-cache-parent"),
+            "TMP": str(tmp_path / "external-temporary-cache-parent"),
         }
     )
 
@@ -304,7 +323,7 @@ def test_project_config_no_cache_validates_temporary_storage_before_process(
 ) -> None:
     write_minimal_uv_project(tmp_path)
     (tmp_path / "uv.toml").write_text(
-        f'no-cache = true\ncache-dir = "{tmp_path.parent / "ineffective-cache"}"\n',
+        f'no-cache = true\ncache-dir = "{_toml_path(tmp_path.parent / "ineffective-cache")}"\n',
         encoding="utf-8",
     )
     sentinel = tmp_path / "sentinel"
@@ -312,7 +331,8 @@ def test_project_config_no_cache_validates_temporary_storage_before_process(
     _apply_external_storage_environment(monkeypatch, tmp_path.parent)
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("UV_NO_CACHE", raising=False)
-    monkeypatch.setenv("TMPDIR", str(tmp_path / "temporary-cache-parent"))
+    for variable in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(variable, str(tmp_path / "temporary-cache-parent"))
     runner = RecordingRunner()
 
     preparation = prepare_repository_environment(
@@ -336,12 +356,12 @@ def test_user_config_cache_inside_repository_is_rejected(tmp_path: Path) -> None
     config_home = tmp_path / "config"
     (config_home / "uv").mkdir(parents=True)
     (config_home / "uv/uv.toml").write_text(
-        f'cache-dir = "{root / "user-cache"}"\n',
+        f'cache-dir = "{_toml_path(root / "user-cache")}"\n',
         encoding="utf-8",
     )
     environment = _external_storage_environment(tmp_path)
     environment.pop("UV_CACHE_DIR")
-    environment["XDG_CONFIG_HOME"] = str(config_home)
+    environment["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(config_home)
 
     failure = validate_uv_storage_boundaries(root.resolve(), environment)
 
@@ -357,11 +377,11 @@ def test_explicit_cache_dir_overrides_unsafe_configuration_cache(tmp_path: Path)
     config_home = tmp_path / "config"
     (config_home / "uv").mkdir(parents=True)
     (config_home / "uv/uv.toml").write_text(
-        f'cache-dir = "{root / "ineffective-user-cache"}"\n',
+        f'cache-dir = "{_toml_path(root / "ineffective-user-cache")}"\n',
         encoding="utf-8",
     )
     environment = _external_storage_environment(tmp_path)
-    environment["XDG_CONFIG_HOME"] = str(config_home)
+    environment["APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME"] = str(config_home)
 
     assert validate_uv_storage_boundaries(root.resolve(), environment) is None
 
@@ -373,7 +393,14 @@ def test_configuration_no_cache_cannot_be_disabled_by_false_environment_value(
     root.mkdir()
     (root / "uv.toml").write_text("no-cache = true\n", encoding="utf-8")
     environment = _external_storage_environment(tmp_path)
-    environment.update({"UV_NO_CACHE": "0", "TMPDIR": str(root / "temporary-cache")})
+    environment.update(
+        {
+            "UV_NO_CACHE": "0",
+            "TMPDIR": str(root / "temporary-cache"),
+            "TEMP": str(root / "temporary-cache"),
+            "TMP": str(root / "temporary-cache"),
+        }
+    )
 
     failure = validate_uv_storage_boundaries(root.resolve(), environment)
 
@@ -400,7 +427,7 @@ def test_windows_systemdrive_config_cache_stops_before_process_without_mutation(
     config_directory = system_drive / "ProgramData/uv"
     config_directory.mkdir(parents=True)
     (config_directory / "uv.toml").write_text(
-        f'cache-dir = "{tmp_path / "system-cache"}"\n',
+        f'cache-dir = "{_toml_path(tmp_path / "system-cache")}"\n',
         encoding="utf-8",
     )
     sentinel = tmp_path / "sentinel"
@@ -438,7 +465,14 @@ def test_windows_systemdrive_config_cache_stops_before_process_without_mutation(
     ("base_variable", "unsafe_value"),
     (
         ("HOME", "."),
-        ("XDG_CACHE_HOME", "."),
+        pytest.param(
+            "XDG_CACHE_HOME",
+            ".",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="XDG cache bases are not active on Windows",
+            ),
+        ),
         ("XDG_DATA_HOME", "."),
         ("XDG_BIN_HOME", "."),
     ),
@@ -462,7 +496,18 @@ def test_relative_default_storage_base_is_rejected(
 
 @pytest.mark.parametrize(
     "base_variable",
-    ("HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_BIN_HOME"),
+    (
+        "HOME",
+        pytest.param(
+            "XDG_CACHE_HOME",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="XDG cache bases are not active on Windows",
+            ),
+        ),
+        "XDG_DATA_HOME",
+        "XDG_BIN_HOME",
+    ),
 )
 def test_default_storage_destination_inside_repository_is_rejected(
     tmp_path: Path,
@@ -552,9 +597,9 @@ def test_unsafe_lock_entry_stops_before_every_process(
     elif unsafe_kind == "symlink":
         target = tmp_path / "real-lock"
         target.write_text("version = 1\n", encoding="utf-8")
-        lock_path.symlink_to(target)
+        symlink_or_skip(lock_path, target)
     else:
-        lock_path.symlink_to(tmp_path / "missing-lock")
+        symlink_or_skip(lock_path, tmp_path / "missing-lock")
     runner = RecordingRunner()
 
     preparation = prepare_repository_environment(
@@ -666,7 +711,7 @@ def test_existing_macos_legacy_uv_storage_alias_is_rejected(
         else home / "Library/Application Support"
     )
     legacy_parent.mkdir(parents=True)
-    (legacy_parent / "uv").symlink_to(root, target_is_directory=True)
+    symlink_or_skip(legacy_parent / "uv", root, target_is_directory=True)
     environment = _external_storage_environment(tmp_path)
     environment["HOME"] = str(home)
     if storage_kind == "cache":
@@ -753,6 +798,7 @@ def test_default_repository_python_omits_probe_selector(tmp_path: Path) -> None:
         ((0,), (b"uv 0.10.12\ntrailing\n",), "environment_evidence_invalid"),
         ((0,), (b"x" * 65_537,), "environment_evidence_invalid"),
     ),
+    ids=("exit-one", "signal", "missing-output", "not-uv", "trailing", "oversized"),
 )
 def test_uv_version_failure_stops_before_locked_probe(
     tmp_path: Path,
@@ -846,6 +892,7 @@ def test_locked_probe_process_failure_keeps_lock_unverified(
         b"[1,2,3]",
         b"x" * 65_537,
     ),
+    ids=("not-json", "duplicate-key", "unknown-field", "trailing", "array", "oversized"),
 )
 def test_malformed_probe_evidence_is_rejected(
     tmp_path: Path,
@@ -1140,7 +1187,7 @@ def test_symlinked_venv_is_unsafe(tmp_path: Path) -> None:
     external = tmp_path / "external-venv"
     (external / "bin").mkdir(parents=True)
     (external / "bin/python").write_bytes(b"")
-    (tmp_path / ".venv").symlink_to(external, target_is_directory=True)
+    symlink_or_skip(tmp_path / ".venv", external, target_is_directory=True)
     plan = focused_plan(tmp_path, "ty")
     runner = RecordingRunner(
         stdout=(
@@ -1175,7 +1222,7 @@ def test_lexical_venv_python_symlink_to_managed_interpreter_is_accepted(
     managed.write_bytes(b"")
     python = tmp_path / ".venv/bin/python"
     python.unlink()
-    python.symlink_to(managed)
+    symlink_or_skip(python, managed)
     plan = focused_plan(tmp_path, "ty")
     runner = RecordingRunner(
         stdout=(
@@ -1286,7 +1333,10 @@ def test_dependency_helpers_return_complete_canonical_observations() -> None:
         ">=0.0.35,<0.1",
         "available",
         "0.0.35",
-        "/repository/.venv/site-packages/ty/__init__.py",
+        str(
+            (Path("C:/repository") if os.name == "nt" else Path("/repository"))
+            / ".venv/site-packages/ty/__init__.py"
+        ),
         True,
         None,
     )
@@ -1363,7 +1413,7 @@ def test_oversized_numeric_dependency_version_is_rejected_without_raising() -> N
                 "module": "pytest",
                 "status": "available",
                 "version": "8.4.2",
-                "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+                "origin": ".venv/lib/python3.12/site-packages/pytest/__init__.py",
                 "diagnostic": None,
             },
             0,
@@ -1391,7 +1441,7 @@ def test_oversized_numeric_dependency_version_is_rejected_without_raising() -> N
                 "module": "pytest",
                 "status": "available",
                 "version": "9.0.0",
-                "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+                "origin": ".venv/lib/python3.12/site-packages/pytest/__init__.py",
                 "diagnostic": None,
             },
             0,
@@ -1405,7 +1455,7 @@ def test_oversized_numeric_dependency_version_is_rejected_without_raising() -> N
                 "module": "pytest",
                 "status": "shadowed",
                 "version": "8.4.2",
-                "origin": "/project/pytest.py",
+                "origin": "pytest.py",
                 "diagnostic": "module origin is not owned by the distribution",
             },
             0,
@@ -1419,7 +1469,7 @@ def test_oversized_numeric_dependency_version_is_rejected_without_raising() -> N
                 "module": "pytest",
                 "status": "unusable",
                 "version": "8.4.2",
-                "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+                "origin": ".venv/lib/python3.12/site-packages/pytest/__init__.py",
                 "diagnostic": "module import failed",
             },
             0,
@@ -1436,6 +1486,8 @@ def test_dependency_probe_payloads_preserve_status_error_and_process(
     expected_code: str | None,
 ) -> None:
     plan, prepared = _prepared_dependency_environment(tmp_path, "pytest")
+    if isinstance(payload["origin"], str):
+        payload = {**payload, "origin": str(plan.root / payload["origin"])}
     runner = RecordingRunner(
         returncodes=(returncode,),
         stdout=(json.dumps(payload, separators=(",", ":")).encode(),),
@@ -1559,7 +1611,7 @@ def test_dependency_probe_uses_exact_capture_bound(
             "module": "pytest",
             "status": "available",
             "version": "8.4.2",
-            "origin": "/project/.venv/lib/python3.12/site-packages/pytest/__init__.py",
+            "origin": str(_venv_site_packages(plan.root) / "pytest/__init__.py"),
             "diagnostic": None,
         },
         separators=(",", ":"),
@@ -1601,7 +1653,7 @@ def test_standalone_dependency_probe_emits_exact_available_document(
             },
             separators=(",", ":"),
         ).encode()
-        + b"\n"
+        + os.linesep.encode()
     )
 
 
@@ -1866,14 +1918,14 @@ def test_standalone_dependency_probe_rejects_symlinks_before_import(
         package.mkdir()
         repository_payload = project / "payload.py"
         repository_payload.write_text(payload_source, encoding="utf-8")
-        (package / "__init__.py").symlink_to(repository_payload)
+        symlink_or_skip(package / "__init__.py", repository_payload)
     else:
         _write_distribution(site_packages, version="8.4.2", write_module=False)
         real_package = site_packages / "real_sample_dep"
         real_package.mkdir()
         (real_package / "__init__.py").write_text(payload_source, encoding="utf-8")
-        (site_packages / "sample_dep").symlink_to(
-            real_package, target_is_directory=True
+        symlink_or_skip(
+            site_packages / "sample_dep", real_package, target_is_directory=True
         )
 
     completed = _run_dependency_probe(project, environment_root, site_packages)
@@ -1963,7 +2015,7 @@ def _prepared_dependency_environment(
             python=PythonObservation(
                 implementation="cpython",
                 version=(3, 12, 11),
-                executable=environment_root / "bin/python",
+                executable=_venv_python(environment_root),
             ),
             python_selection=plan.repository_python,
             manager_version="0.10.12",
@@ -1976,7 +2028,11 @@ def _dependency_probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
     project = tmp_path / "project"
     project.mkdir()
     environment_root = project / ".venv"
-    site_packages = environment_root / "lib/python3.13/site-packages"
+    site_packages = (
+        environment_root / "Lib/site-packages"
+        if os.name == "nt"
+        else environment_root / "lib/python3.13/site-packages"
+    )
     site_packages.mkdir(parents=True)
     return project, environment_root, site_packages
 
@@ -2080,6 +2136,10 @@ def _external_storage_environment(tmp_path: Path) -> dict[str, str]:
         "UV_PYTHON_INSTALL_DIR": str(external / "python"),
         "UV_PYTHON_CACHE_DIR": str(external / "python-cache"),
         "UV_PYTHON_BIN_DIR": str(external / "bin"),
+        "TMPDIR": str(external / "tmp"),
+        "TMP": str(external / "tmp"),
+        "TEMP": str(external / "tmp"),
+        "LOCALAPPDATA": str(external / "local-app-data"),
     }
 
 

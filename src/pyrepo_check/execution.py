@@ -124,6 +124,7 @@ CheckExecutionErrorCode = Literal[
     "pytest_evidence_error",
     "coverage_preflight_failed",
     "missing_primary_process",
+    "platform_safety_unavailable",
     "cleanup_failed",
     "repository_environment_unavailable",
     "check_dependency_missing",

@@ -15,6 +15,8 @@ import time
 from types import MappingProxyType, ModuleType
 from typing import Literal, Protocol, cast
 
+from pyrepo_check import filesystem as fs
+
 if sys.platform == "darwin":
     import fcntl as _fcntl
 else:
@@ -60,7 +62,7 @@ class VerifiedRunWorkspace:
                 self.workspace.path.parent,
                 follow_symlinks=False,
             )
-            relative_status = os.stat(
+            relative_status = fs.stat(
                 self.workspace.path.name,
                 dir_fd=self.parent_descriptor,
                 follow_symlinks=False,
@@ -204,6 +206,10 @@ class _CleanupFrame:
 
 
 def create_run_workspace(repository_root: Path) -> RunWorkspace:
+    if os.name == "nt":
+        from pyrepo_check._windows_workspace import create_workspace
+
+        return create_workspace(repository_root)
     resolved_root = repository_root.resolve()
     candidates = (Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp"))  # nosec B108
     last_error: OSError | None = None
@@ -276,6 +282,12 @@ def remove_run_workspace(
     repository_root: Path,
     clock_ns: Callable[[], int] = time.monotonic_ns,
 ) -> CleanupObservation | None:
+    if os.name == "nt":
+        from pyrepo_check._windows_workspace import remove_workspace
+
+        return remove_workspace(
+            run_directory, repository_root=repository_root, clock_ns=clock_ns
+        )
     parent_descriptor: int | None = None
     parent_verified = False
     quarantine: _QuarantineDirectory | None = None
@@ -736,7 +748,7 @@ def _open_verified_parent(run_directory: RunWorkspace) -> int:
     parent_identity = run_directory.parent_identity
     if parent_identity is None:
         raise _CleanupFailure("unsafe_tree", "run directory parent identity is unavailable")
-    descriptor = os.open(run_directory.path.parent, _secure_directory_open_flags())
+    descriptor = fs.open(run_directory.path.parent, _secure_directory_open_flags())
     try:
         os.set_inheritable(descriptor, False)
         if _status_identity(os.fstat(descriptor)) != parent_identity:
@@ -756,7 +768,7 @@ def open_verified_workspace(
     parent_descriptor = _open_verified_parent(workspace)
     run_descriptor: int | None = None
     try:
-        run_descriptor = os.open(
+        run_descriptor = fs.open(
             workspace.path.name,
             _secure_directory_open_flags(),
             dir_fd=parent_descriptor,
@@ -1006,9 +1018,9 @@ def _verified_quarantine_path(
 
 
 def _secure_directory_open_flags() -> int:
-    directory_only = cast(int, getattr(os, "O_DIRECTORY"))
-    no_follow = cast(int, getattr(os, "O_NOFOLLOW"))
-    non_blocking = cast(int, getattr(os, "O_NONBLOCK"))
+    directory_only = fs.O_DIRECTORY
+    no_follow = fs.O_NOFOLLOW
+    non_blocking = fs.O_NONBLOCK
     return os.O_RDONLY | directory_only | no_follow | non_blocking
 
 
@@ -1112,6 +1124,8 @@ def _with_cleanup_error(error: OSError, cleanup_error: OSError | None) -> OSErro
 
 
 def _platform_capability_error() -> str | None:
+    if os.name == "nt":
+        return None  # Native operations report unavailable capabilities at their boundary.
     if (
         type(getattr(os, "O_NOFOLLOW", None)) is not int
         or type(getattr(os, "O_DIRECTORY", None)) is not int

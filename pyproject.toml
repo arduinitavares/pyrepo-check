@@ -47,6 +47,9 @@ parallel = false
 fail_under = 86.01
 precision = 2
 
+[tool.coverage.paths]
+source = ["src/pyrepo_check", "*/src/pyrepo_check"]
+
 [tool.bandit]
 exclude_dirs = [".venv", ".pytest_cache", ".ruff_cache"]
 

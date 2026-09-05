@@ -11,6 +11,8 @@ from typing import Any, Literal, cast
 
 import pytest
 
+from tests.support import symlink_or_skip
+
 from pyrepo_check.coverage_evidence import (
     CoverageCounts,
     CoverageError,
@@ -530,7 +532,7 @@ def test_coverage_json_accepts_paths_that_resolve_to_the_measured_file(
     elif path_form == "dotdot":
         key = "src/../src/alpha.py"
     else:
-        (root / "alias.py").symlink_to(root / "src/alpha.py")
+        symlink_or_skip(root / "alias.py", root / "src/alpha.py")
         key = "alias.py"
     document["files"][key] = alpha
 
@@ -562,7 +564,12 @@ def test_coverage_json_rejects_distinct_keys_for_the_same_measured_file(
     document["totals"]["covered_lines"] += 1
     document["totals"]["num_statements"] += 1
 
-    with pytest.raises(ValueError, match="duplicate measured file"):
+    message = (
+        "duplicate normalized file paths"
+        if alias_kind == "case_alias" and os.name == "nt"
+        else "duplicate measured file"
+    )
+    with pytest.raises(ValueError, match=message):
         validate_coverage_json(
             _coverage_json_bytes(document),
             project_root=root,
@@ -716,7 +723,7 @@ def test_coverage_json_rejects_one_measured_path_defect(tmp_path: Path, path_def
     elif path_defect == "symlink_escape":
         outside = tmp_path / "outside.py"
         outside.write_text("# outside\n")
-        (root / "escape.py").symlink_to(outside)
+        symlink_or_skip(root / "escape.py", outside)
         document["files"]["escape.py"] = document["files"].pop("src/alpha.py")
     elif path_defect == "missing":
         document["files"]["missing.py"] = document["files"].pop("src/alpha.py")

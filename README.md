@@ -5,6 +5,12 @@ Python 3.13.15 or newer is required for the controller, while every selected Che
 that can execute runs in the target repository's own locked uv environment and under
 one repository-selected CPython.
 
+Native Windows checks use handle-relative file access and protected user ACLs.
+They require a local filesystem that provides stable file identities and native
+directory enumeration. Junctions, other reparse points, alternate data streams,
+and UNC/device paths are rejected at safety boundaries. Configuration reads report
+`platform_safety_unavailable` when a required filesystem capability is missing.
+
 ## Install the controller
 
 Install the CLI globally once. It does not need to be a dependency of every project
@@ -237,5 +243,8 @@ uv run --frozen pyrepo-check --format json --all
 ```
 
 The current strict gate measures `src/pyrepo_check` with line and branch coverage,
-`parallel = false`, `fail_under = 86.01`, and `precision = 2`. See the implemented
-design for the fresh final verification evidence.
+`parallel = false`, `fail_under = 86.01`, and `precision = 2`. CI combines Linux and
+native Windows coverage before enforcing that threshold. A single-platform run
+does not exercise the other platform's filesystem backend and can fall below it.
+The Windows job also installs a separate controller under CPython 3.13.15 and
+checks a locked fixture project, including pytest, coverage, and a Ruff violation.

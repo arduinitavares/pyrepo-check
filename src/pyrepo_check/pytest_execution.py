@@ -6,6 +6,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import json
 import os
+
+from pyrepo_check import filesystem as fs
 from pathlib import Path
 import secrets
 from typing import Literal, cast
@@ -778,7 +780,7 @@ def _prepare_run_directory(
         run_descriptor=verified_run.descriptor,
     )
     writer_directory = run_directory / "writers"
-    os.mkdir(writer_directory.name, mode=0o700, dir_fd=verified_run.descriptor)
+    fs.mkdir(writer_directory.name, mode=0o700, dir_fd=verified_run.descriptor)
     return run_directory / "artifact.json", writer_directory
 
 
@@ -788,8 +790,8 @@ def _copy_plugin_source(
     *,
     run_descriptor: int,
 ) -> None:
-    no_follow = cast(int, getattr(os, "O_NOFOLLOW"))
-    descriptor = os.open(
+    no_follow = cast(int, getattr(fs, "O_NOFOLLOW"))
+    descriptor = fs.open(
         destination_name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
         0o600,
@@ -856,15 +858,15 @@ def _snapshot_writer_ids(
     try:
         try:
             if run_descriptor is None:
-                entries = os.scandir(writer_directory)
+                entries = fs.scandir(writer_directory)
             else:
-                writer_descriptor = os.open(
+                writer_descriptor = fs.open(
                     writer_directory.name,
                     execution_workspace._secure_directory_open_flags(),
                     dir_fd=run_descriptor,
                 )
                 os.set_inheritable(writer_descriptor, False)
-                entries = os.scandir(writer_descriptor)
+                entries = fs.scandir(writer_descriptor)
         except OSError as error:
             return (), f"writer inventory failed: {error}"
         marker_seen = False

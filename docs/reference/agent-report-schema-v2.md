@@ -405,6 +405,7 @@ otherwise yields `passed`, and non-eligible valid evidence yields `guidance`.
 ### Planning and report values
 
 - `PlanningErrorCodeV2`: `invalid_arguments`, `invalid_project_config`,
+  `platform_safety_unavailable` (required filesystem safety is unavailable),
   `invalid_test_shortcut`, `unknown_check`, `unknown_test_shortcut`,
   `unknown_target`, `coverage_configuration_required`,
   `unsafe_unlocked_execution`, `uv_project_required`, `internal_planning_error`.
@@ -417,7 +418,7 @@ otherwise yields `passed`, and non-eligible valid evidence yields `guidance`.
   `repository_state_changed`.
 - `CheckErrorCodeV2`: `spawn_failed`, `terminated_by_signal`,
   `pytest_preflight_failed`, `pytest_evidence_error`, `coverage_preflight_failed`,
-  `missing_primary_process`, `cleanup_failed`, `repository_environment_unavailable`,
+  `missing_primary_process`, `platform_safety_unavailable`, `cleanup_failed`, `repository_environment_unavailable`,
   `check_dependency_missing`, `check_dependency_incompatible`,
   `check_dependency_shadowed`, `check_dependency_unusable`,
   `check_start_evidence_invalid`, `check_execution_failed`.

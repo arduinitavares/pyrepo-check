@@ -52,6 +52,7 @@ CheckErrorCodeV2 = Literal[
     "pytest_evidence_error",
     "coverage_preflight_failed",
     "missing_primary_process",
+    "platform_safety_unavailable",
     "cleanup_failed",
     "repository_environment_unavailable",
     "check_dependency_missing",
@@ -121,6 +122,7 @@ _PLANNING_ERROR_CODES = frozenset(
     (
         "invalid_arguments",
         "invalid_project_config",
+        "platform_safety_unavailable",
         "invalid_test_shortcut",
         "unknown_check",
         "unknown_test_shortcut",
@@ -139,6 +141,7 @@ _CHECK_ERROR_CODES_V2 = frozenset(
         "pytest_evidence_error",
         "coverage_preflight_failed",
         "missing_primary_process",
+        "platform_safety_unavailable",
         "cleanup_failed",
         "repository_environment_unavailable",
         "check_dependency_missing",

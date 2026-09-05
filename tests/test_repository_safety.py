@@ -7,6 +7,8 @@ import subprocess  # nosec B404
 
 import pytest
 
+from tests.support import symlink_or_skip
+
 from pyrepo_check.repository_safety import (
     capture_repository_baseline,
     verify_repository_state,
@@ -229,7 +231,7 @@ def test_symlinked_venv_is_rejected_without_following_it(tmp_path: Path) -> None
     root = initialize_git_fixture(tmp_path)
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
-    (root / ".venv").symlink_to(outside, target_is_directory=True)
+    symlink_or_skip(root / ".venv", outside, target_is_directory=True)
 
     result = capture_repository_baseline(
         root,
@@ -497,7 +499,7 @@ def test_tracked_file_cannot_be_read_through_an_external_symlink_ancestor(
     (outside / "module.py").write_text("value = 1\n", encoding="utf-8")
     tracked.unlink()
     package.rmdir()
-    package.symlink_to(outside, target_is_directory=True)
+    symlink_or_skip(package, outside, target_is_directory=True)
 
     result = verify_repository_state(
         baseline.snapshot,
@@ -608,12 +610,14 @@ def test_annotations_fix_never_exempts_structural_or_dependency_changes(
     tmp_path: Path,
     mutation: str,
 ) -> None:
+    if os.name == "nt" and mutation == "mode":
+        raise pytest.skip.Exception("Windows does not expose POSIX executable permission bits")
     root = initialize_git_fixture(tmp_path)
     gitlink_object: str | None = None
     if mutation == "symlink_to_regular":
         source = root / "src/example.py"
         source.unlink()
-        source.symlink_to("target.py")
+        symlink_or_skip(source, Path("target.py"))
         _run_git(root, "add", "src/example.py")
         _commit_fixture(root, "track symlink")
     if mutation == "gitlink_object":
@@ -630,7 +634,7 @@ def test_annotations_fix_never_exempts_structural_or_dependency_changes(
         source.chmod(stat.S_IMODE(source.stat().st_mode) | stat.S_IXUSR)
     elif mutation == "regular_to_symlink":
         source.unlink()
-        source.symlink_to("target.py")
+        symlink_or_skip(source, Path("target.py"))
     elif mutation == "symlink_to_regular":
         source.unlink()
         source.write_text("regular = True\n", encoding="utf-8")
@@ -684,7 +688,7 @@ def test_annotations_fix_rejects_existing_symlink_target_content_change(
     root = initialize_git_fixture(tmp_path)
     source = root / "src/example.py"
     source.unlink()
-    source.symlink_to("target-a.py")
+    symlink_or_skip(source, Path("target-a.py"))
     _run_git(root, "add", "src/example.py")
     _commit_fixture(root, "track symlink")
     baseline = capture_repository_baseline(
@@ -694,7 +698,7 @@ def test_annotations_fix_rejects_existing_symlink_target_content_change(
     )
     assert baseline.snapshot is not None
     source.unlink()
-    source.symlink_to("target-b.py")
+    symlink_or_skip(source, Path("target-b.py"))
 
     result = verify_repository_state(
         baseline.snapshot,

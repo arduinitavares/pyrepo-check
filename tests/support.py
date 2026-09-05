@@ -12,6 +12,8 @@ import subprocess  # nosec B404
 from typing import cast
 import uuid
 
+import pytest
+
 from pyrepo_check.config import ProjectConfig
 from pyrepo_check.execution import (
     CapturedBytes,
@@ -22,6 +24,7 @@ from pyrepo_check.execution import (
     PythonObservation,
 )
 from pyrepo_check import execution_workspace
+from pyrepo_check import filesystem
 from pyrepo_check.planning import (
     CheckName,
     DefaultRepositoryPython,
@@ -48,6 +51,19 @@ _REPOSITORY_FIXTURE_DEPENDENCIES = (
     "ruff>=0.15,<1",
     "ty>=0.0.35,<0.1",
 )
+_OBSERVED_REPOSITORY_ROOT = Path("C:/repository") if os.name == "nt" else Path("/repository")
+
+
+def symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    """Create a test symlink, skipping only when Windows denies that privilege."""
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as error:
+        if os.name == "nt" and error.winerror == 1314:
+            raise pytest.skip.Exception(
+                "Windows symlink creation requires unavailable SeCreateSymbolicLinkPrivilege"
+            ) from error
+        raise
 
 
 def repository_test_environment(storage_root: Path) -> dict[str, str]:
@@ -163,6 +179,8 @@ def test_repository_process_has_native_isolated_startup() -> None:
                     "path0": sys.path[0],
                     "argv": sys.argv,
                     "orig_argv": sys.orig_argv,
+                    "executable": sys.executable,
+                    "base_executable": getattr(sys, "_base_executable", sys.executable),
                     "spec": {
                         "name": spec.name,
                         "parent": spec.parent,
@@ -217,7 +235,11 @@ def assert_repository_startup_parity(
 ) -> None:
     """Compare real native and standalone-launcher startup inside a repository."""
     workspace.mkdir()
-    repository_python = repository / ".venv" / "bin" / "python"
+    repository_python = (
+        repository / ".venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else repository / ".venv" / "bin" / "python"
+    )
     launcher = Path(__file__).parents[1] / "src" / "pyrepo_check" / "_check_launcher.py"
     coverage_data = workspace / ".coverage"
     module = "coverage" if coverage else "pytest"
@@ -274,7 +296,16 @@ def assert_repository_startup_parity(
     launched = snapshots["launched"]
     assert launched["path0"] == direct["path0"]
     assert launched["argv"] == direct["argv"]
-    assert launched["orig_argv"] == direct["orig_argv"]
+    assert launched["executable"] == direct["executable"]
+    assert launched["base_executable"] == direct["base_executable"]
+    direct_original = cast(list[str], direct["orig_argv"])
+    launched_original = cast(list[str], launched["orig_argv"])
+    if os.name == "nt":
+        assert direct_original[0] == direct["base_executable"]
+        assert launched_original[0] == launched["executable"]
+        assert launched_original[1:] == direct_original[1:]
+    else:
+        assert launched_original == direct_original
     assert launched["spec"] == direct["spec"]
 
 
@@ -500,7 +531,7 @@ def available_dependency(name: DependencyName, version: str) -> DependencyObserv
         required=_dependency_required(dependency.minimum, dependency.maximum),
         status="available",
         version=version,
-        origin=f"/repository/.venv/site-packages/{dependency.module}/__init__.py",
+        origin=str(_OBSERVED_REPOSITORY_ROOT / ".venv/site-packages" / dependency.module / "__init__.py"),
         process=_dependency_process(name),
         error=None,
     )
@@ -532,7 +563,7 @@ def _dependency_process(name: DependencyName) -> ExecutedProcess:
     return ExecutedProcess(
         role="dependency_probe",
         command=("uv", "run", "dependency-probe", name),
-        cwd=Path("/repository"),
+        cwd=_OBSERVED_REPOSITORY_ROOT,
         returncode=0,
         duration_ms=1,
         stdout=CapturedBytes(b"", 0),
@@ -614,7 +645,7 @@ def _publish_pytest_artifact(
     marker_path = writer_directory / f"pytest-writer-{writer_id}.json"
 
     def open_owner_only(path: str, flags: int) -> int:
-        return os.open(path, flags, 0o600)
+        return filesystem.open(path, flags | filesystem.O_NOFOLLOW, 0o600)
 
     with open(  # noqa: PTH123
         marker_path,

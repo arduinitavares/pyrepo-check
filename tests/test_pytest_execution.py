@@ -15,6 +15,7 @@ import pytest
 from pyrepo_check.check_launcher import stage_check_launcher
 from pyrepo_check.controller_tools import resolve_controller_tools
 from pyrepo_check.coverage_evidence import build_coverage_result
+from pyrepo_check import filesystem
 from pyrepo_check.execution import (
     DependencyObservation,
     ExecutedCheck,
@@ -45,10 +46,21 @@ from tests.support import (
 
 
 _T = TypeVar("_T")
-_OS_NONBLOCK = cast(int, getattr(os, "O_NONBLOCK"))
-_OS_DIRECTORY = cast(int, getattr(os, "O_DIRECTORY"))
-_OS_NOFOLLOW = cast(int, getattr(os, "O_NOFOLLOW"))
-_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo"))
+_HAS_POSIX_FIFO = callable(getattr(os, "mkfifo", None))
+_POSIX_FIFO = pytest.mark.skipif(
+    not _HAS_POSIX_FIFO,
+    reason="exercises POSIX FIFO behavior; native Windows file coverage is separate",
+)
+_POSIX_RENAME_RACE = pytest.mark.skipif(
+    os.name == "nt",
+    reason="requires replacing an open POSIX directory; Windows handle sharing blocks that race",
+)
+_OS_NONBLOCK = filesystem.O_NONBLOCK
+_MKFIFO = cast(Callable[[Path], None], getattr(os, "mkfifo", None))
+
+
+def _controller_executable_name(name: str) -> str:
+    return f"{name}.exe" if os.name == "nt" else name
 
 
 def run_prepared_pytest_fixture(
@@ -295,6 +307,7 @@ def test_cleanup_budget_accepts_exact_boundaries_and_rejects_one_over() -> None:
     assert deadline_error.value.message == "cleanup duration limit exceeded (5000000000 ns)"
 
 
+@_POSIX_FIFO
 def test_fifo_artifact_is_rejected_promptly_with_exact_diagnostic(tmp_path: Path) -> None:
     artifact = tmp_path / "artifact.json"
     _MKFIFO(artifact)
@@ -309,6 +322,7 @@ def test_fifo_artifact_is_rejected_promptly_with_exact_diagnostic(tmp_path: Path
     assert observation.diagnostic == "path is not a regular file: artifact.json"
 
 
+@_POSIX_FIFO
 def test_fifo_writer_marker_is_rejected_promptly_with_exact_diagnostic(
     tmp_path: Path,
 ) -> None:
@@ -383,9 +397,9 @@ def test_descriptor_relative_writer_snapshot_closes_inventory_descriptor(
         for index in range(pytest_execution._MAX_WRITER_DIRECTORY_ENTRIES + 1):
             (writer_directory / f"unrelated-{index}").touch()
 
-    original_open = os.open
+    original_open = pytest_execution.fs.open
     inventory_descriptors: list[int] = []
-    run_descriptor = original_open(tmp_path, execution_workspace._secure_directory_open_flags())
+    run_descriptor = filesystem.open(tmp_path, execution_workspace._secure_directory_open_flags())
 
     def capture_open(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
@@ -394,12 +408,12 @@ def test_descriptor_relative_writer_snapshot_closes_inventory_descriptor(
         *,
         dir_fd: int | None = None,
     ) -> int:
-        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        descriptor = original_open(os.fsdecode(path), flags, mode, dir_fd=dir_fd)
         if dir_fd == run_descriptor:
             inventory_descriptors.append(descriptor)
         return descriptor
 
-    monkeypatch.setattr(pytest_execution.os, "open", capture_open)
+    monkeypatch.setattr(pytest_execution.fs, "open", capture_open)
     try:
         writer_ids, diagnostic = pytest_execution._snapshot_writer_ids(
             writer_directory,
@@ -453,7 +467,7 @@ def test_writer_scandir_iteration_error_retains_validated_writer_and_diagnostic(
 ) -> None:
     marker = tmp_path / "pytest-writer-one.json"
     marker.write_text('{"schema_version":1,"writer_id":"one","pid":1}')
-    original_scandir = os.scandir
+    original_scandir = pytest_execution.fs.scandir
     with original_scandir(tmp_path) as iterator:
         entry = next(iterator)
 
@@ -470,13 +484,13 @@ def test_writer_scandir_iteration_error_retains_validated_writer_and_diagnostic(
         def __iter__(self) -> FailingInventory:
             return self
 
-        def __next__(self) -> os.DirEntry[str]:
+        def __next__(self) -> filesystem.ScandirEntry:
             if not self.yielded:
                 self.yielded = True
                 return entry
             raise PermissionError("synthetic writer iteration failure")
 
-    monkeypatch.setattr(pytest_execution.os, "scandir", lambda _path: FailingInventory())
+    monkeypatch.setattr(pytest_execution.fs, "scandir", lambda _path: FailingInventory())
 
     writer_ids, diagnostic = pytest_execution._snapshot_writer_ids(tmp_path)
 
@@ -533,6 +547,7 @@ def test_prepared_pytest_multiple_writer_orchestration_fails_closed(
     assert pytest_result.error.code == "artifact_invalid"
 
 
+@_POSIX_RENAME_RACE
 def test_prepared_pytest_run_swap_retains_process_without_snapshotting_replacement(
     tmp_path: Path,
 ) -> None:
@@ -783,7 +798,7 @@ def test_pinned_uv_identity_loss_before_coverage_helper_preserves_primary(
     helper_bin = tmp_path / "controller-bin"
     helper_bin.mkdir()
     for name in ("uv", "git"):
-        helper = helper_bin / name
+        helper = helper_bin / _controller_executable_name(name)
         helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         helper.chmod(0o755)
     tools = resolve_controller_tools(root, path=str(helper_bin))
@@ -797,8 +812,9 @@ def test_pinned_uv_identity_loss_before_coverage_helper_preserves_primary(
         replacement = tmp_path / "replacement-uv"
         replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         replacement.chmod(0o755)
-        (helper_bin / "uv").unlink()
-        replacement.rename(helper_bin / "uv")
+        helper = helper_bin / _controller_executable_name("uv")
+        helper.unlink()
+        replacement.rename(helper)
 
     result = run_prepared_pytest_fixture(
         prepared=prepared,
