@@ -615,7 +615,63 @@ def test_private_directory_creation_adjusts_unequal_owner_and_verifies_postcondi
     assert tracker.requested_access.count(adjust_access) == 1
     assert not tracker.live_handles
     assert tracker.opened_handles == tracker.closed_handles
-    assert expected_buffer is not None
+    # Keep the SID's backing storage alive through all native comparisons above.
+    del expected_buffer
+
+
+@pytest.mark.parametrize("adjust_owner", (False, True), ids=("query", "adjust"))
+@pytest.mark.parametrize("invalid_handle", (None, -1), ids=("null", "invalid"))
+def test_private_directory_creation_rejects_invalid_token_without_closing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adjust_owner: bool,
+    invalid_handle: int | None,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    tracked_open_token = _windows_files._OpenProcessToken
+    tracked_close_handle = _windows_files._CloseHandle
+    failing_access = _windows_files._TOKEN_QUERY
+    if adjust_owner:
+        failing_access |= _windows_files._TOKEN_ADJUST_DEFAULT
+    injected_access: list[int] = []
+
+    def return_invalid_token(
+        process: int,
+        access: int,
+        token_ref: ctypes.c_void_p,
+    ) -> int:
+        if access == failing_access:
+            injected_access.append(access)
+            handle_ptr = ctypes.cast(token_ref, ctypes.POINTER(wintypes.HANDLE))
+            handle_ptr.contents.value = invalid_handle
+            return 1
+        return int(tracked_open_token(process, access, token_ref))
+
+    def reject_invalid_close(handle: int | None) -> int:
+        assert handle not in {None, 0, _windows_files._INVALID_HANDLE_VALUE}, (
+            "invalid token reached native CloseHandle"
+        )
+        return int(tracked_close_handle(handle))
+
+    def reject_owner_adjustment(*args: object) -> int:
+        raise AssertionError("an invalid token must not reach owner adjustment")
+
+    monkeypatch.setattr(_windows_files, "_OpenProcessToken", return_invalid_token)
+    monkeypatch.setattr(_windows_files, "_CloseHandle", reject_invalid_close)
+    monkeypatch.setattr(_windows_files, "_EqualSid", lambda *args: 0)
+    monkeypatch.setattr(_windows_files, "_SetTokenInformation", reject_owner_adjustment)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(filesystem.PlatformSafetyError, match="invalid handle"):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert injected_access == [failing_access]
+    assert not target_dir.exists()
+    assert len(tracker.opened_handles) == int(adjust_owner)
+    assert tracker.opened_handles == tracker.closed_handles
+    assert not tracker.live_handles
 
 
 def test_private_directory_creation_fails_closed_when_query_token_open_fails(
