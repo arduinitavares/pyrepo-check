@@ -93,6 +93,7 @@ try:
                 "GetSecurityInfo",
                 "GetTokenInformation",
                 "OpenProcessToken",
+                "SetTokenInformation",
             ),
         ),
     ):
@@ -149,7 +150,9 @@ _ERROR_NO_MORE_FILES = 18
 _UNSUPPORTED_CAPABILITY_ERRORS = frozenset({1, 50, 87, 120, 124})
 
 _TOKEN_QUERY = 0x0008
+_TOKEN_ADJUST_DEFAULT = 0x0080
 _TOKEN_USER_CLASS = 1
+_TOKEN_OWNER_CLASS = 4
 _SE_FILE_OBJECT = 1
 _OWNER_SECURITY_INFORMATION = 0x0000_0001
 _DACL_SECURITY_INFORMATION = 0x0000_0004
@@ -231,6 +234,10 @@ class _ACE_HEADER(ctypes.Structure):
         ("AceFlags", ctypes.c_ubyte),
         ("AceSize", wintypes.USHORT),
     )
+
+
+class _TOKEN_OWNER(ctypes.Structure):
+    _fields_ = (("Owner", wintypes.LPVOID),)
 
 
 class _FILE_ID_BOTH_DIR_INFO_HEADER(ctypes.Structure):
@@ -334,6 +341,15 @@ _GetTokenInformation.argtypes = (
     ctypes.POINTER(wintypes.DWORD),
 )
 _GetTokenInformation.restype = wintypes.BOOL
+
+_SetTokenInformation = _advapi32.SetTokenInformation
+_SetTokenInformation.argtypes = (
+    wintypes.HANDLE,
+    ctypes.c_int,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+)
+_SetTokenInformation.restype = wintypes.BOOL
 
 _ConvertSidToStringSidW = _advapi32.ConvertSidToStringSidW
 _ConvertSidToStringSidW.argtypes = (wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR))
@@ -523,6 +539,101 @@ def _current_user_sid() -> tuple[ctypes.Array[ctypes.c_char], int]:
         return buffer, sid
     finally:
         _close_handle(cast(int, token.value))
+
+
+def _raise_token_safety_error(message: str, error: int | None = None) -> NoReturn:
+    if error is None:
+        error = _windows_ctypes.get_last_error()
+    detail = _windows_ctypes.FormatError(error).strip()
+    if error in _UNSUPPORTED_CAPABILITY_ERRORS:
+        raise PlatformSafetyError(
+            error,
+            f"{message}: required Windows safety capability is unsupported: {detail}",
+        )
+    if detail:
+        raise PlatformSafetyError(error, f"{message}: {detail}")
+    if error:
+        raise PlatformSafetyError(error, message)
+    raise PlatformSafetyError(message)
+
+
+def _query_token_sid(
+    token: wintypes.HANDLE | int,
+    info_class: int,
+    message: str,
+) -> tuple[ctypes.Array[ctypes.c_char], int]:
+    required = wintypes.DWORD()
+    _windows_ctypes.set_last_error(0)
+    result = _GetTokenInformation(token, info_class, None, 0, ctypes.byref(required))
+    error = _windows_ctypes.get_last_error()
+    if not result and error != 122:
+        _raise_token_safety_error(f"cannot size {message}", error)
+    if required.value == 0:
+        _raise_token_safety_error(f"cannot size {message}", error or None)
+    buffer = ctypes.create_string_buffer(required.value)
+    if not _GetTokenInformation(
+        token,
+        info_class,
+        buffer,
+        required,
+        ctypes.byref(required),
+    ):
+        _raise_token_safety_error(f"cannot query {message}")
+    sid = ctypes.c_void_p.from_buffer(buffer).value
+    if sid is None:
+        raise PlatformSafetyError(f"the process token has no {message} SID")
+    return buffer, sid
+
+
+def _ensure_process_owner_is_user() -> None:
+    query_token = wintypes.HANDLE()
+    if not _OpenProcessToken(_GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(query_token)):
+        _raise_token_safety_error("cannot open the process token for query")
+    query_handle = cast(int, query_token.value)
+    if not query_handle or query_handle == _INVALID_HANDLE_VALUE:
+        _close_handle(query_handle)
+        raise PlatformSafetyError("OpenProcessToken returned an invalid handle")
+    try:
+        user_buffer, user_sid = _query_token_sid(
+            query_handle, _TOKEN_USER_CLASS, "process token user"
+        )
+        owner_buffer, owner_sid = _query_token_sid(
+            query_handle, _TOKEN_OWNER_CLASS, "process token owner"
+        )
+        if _EqualSid(user_sid, owner_sid):
+            return
+    finally:
+        _close_handle(query_handle)
+
+    adjust_token = wintypes.HANDLE()
+    if not _OpenProcessToken(
+        _GetCurrentProcess(),
+        _TOKEN_ADJUST_DEFAULT | _TOKEN_QUERY,
+        ctypes.byref(adjust_token),
+    ):
+        _raise_token_safety_error("cannot open the process token for owner adjustment")
+    adjust_handle = cast(int, adjust_token.value)
+    if not adjust_handle or adjust_handle == _INVALID_HANDLE_VALUE:
+        _close_handle(adjust_handle)
+        raise PlatformSafetyError("OpenProcessToken returned an invalid handle")
+    try:
+        new_owner = _TOKEN_OWNER(user_sid)
+        if not _SetTokenInformation(
+            adjust_handle,
+            _TOKEN_OWNER_CLASS,
+            ctypes.byref(new_owner),
+            ctypes.sizeof(new_owner),
+        ):
+            _raise_token_safety_error("cannot set process token owner")
+        verify_buffer, verify_sid = _query_token_sid(
+            adjust_handle, _TOKEN_OWNER_CLASS, "adjusted process token owner"
+        )
+        if not _EqualSid(user_sid, verify_sid):
+            raise PlatformSafetyError(
+                "process token owner could not be synchronized to current user"
+            )
+    finally:
+        _close_handle(adjust_handle)
 
 
 def _private_security_descriptor(*, directory: bool) -> int:
@@ -724,6 +835,9 @@ def _open_native_handle(
                 _close_handle(parent_handle)
             parent_handle = child
             owns_parent = True
+
+        if create_private and expected_directory is True:
+            _ensure_process_owner_is_user()
 
         security_descriptor = (
             _private_security_descriptor(directory=expected_directory is True)

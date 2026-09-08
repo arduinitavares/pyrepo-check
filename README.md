@@ -10,6 +10,14 @@ They require a local filesystem that provides stable file identities and native
 directory enumeration. Junctions, other reparse points, alternate data streams,
 and UNC/device paths are rejected at safety boundaries. Configuration reads report
 `platform_safety_unavailable` when a required filesystem capability is missing.
+When creating a private workspace directory, the controller inspects the current
+process token and sets its default owner (`TokenOwner`) to match the actual
+user (`TokenUser`) if they differ. This ensures ordinary child writers and
+third-party tools inherit correct current-user ownership on newly created files.
+The setting persists for the controller process lifetime and affects subsequent
+creations if embedded in a long-lived process. It does not alter privileges,
+group membership, system security policy, or existing file DACLs, and it fails
+closed with `PlatformSafetyError` if the required token operations are unavailable.
 
 ## Install the controller
 
