@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import ctypes
+from ctypes import wintypes
 import errno
 import os
 from pathlib import Path
 import subprocess  # nosec B404
+import sys
 from typing import cast
 import pytest
 
@@ -42,6 +44,54 @@ def _junction(link: Path, target: Path) -> None:
 
 def _directory_flags() -> int:
     return os.O_RDONLY | filesystem.O_DIRECTORY | filesystem.O_NOFOLLOW
+
+
+class _TokenTracker:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        _windows_files: object,
+        *,
+        deny_access_mask: int = 0,
+        deny_error: int = 5,
+    ) -> None:
+        self.opened_handles: list[int] = []
+        self.closed_handles: list[int] = []
+        self.live_handles: set[int] = set()
+        self.requested_access: list[int] = []
+        self.denied_access: list[int] = []
+
+        real_open_token = getattr(_windows_files, "_OpenProcessToken")
+        real_close_handle = getattr(_windows_files, "_CloseHandle")
+
+        def tracking_open_token(
+            process: int,
+            access: int,
+            token_ref: ctypes.c_void_p,
+        ) -> int:
+            self.requested_access.append(access)
+            if deny_access_mask and (access & deny_access_mask):
+                self.denied_access.append(access)
+                _set_last_error(deny_error)
+                return 0
+            result = int(real_open_token(process, access, token_ref))
+            if result:
+                handle_ptr = ctypes.cast(token_ref, ctypes.POINTER(wintypes.HANDLE))
+                handle = handle_ptr.contents.value
+                if handle:
+                    handle_val = cast(int, handle)
+                    self.opened_handles.append(handle_val)
+                    self.live_handles.add(handle_val)
+            return result
+
+        def tracking_close_handle(handle: int) -> int:
+            if handle in self.live_handles:
+                self.live_handles.remove(handle)
+                self.closed_handles.append(handle)
+            return int(real_close_handle(handle))
+
+        monkeypatch.setattr(_windows_files, "_OpenProcessToken", tracking_open_token)
+        monkeypatch.setattr(_windows_files, "_CloseHandle", tracking_close_handle)
 
 
 @pytest.mark.parametrize(
@@ -306,7 +356,15 @@ def test_unsupported_security_descriptor_control_is_a_platform_safety_error(
     from pyrepo_check import _windows_files
 
     artifact = tmp_path / "artifact.bin"
-    artifact.write_bytes(b"payload")
+    creator = filesystem.open(
+        artifact,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | filesystem.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        assert os.write(creator, b"payload") == 7
+    finally:
+        os.close(creator)
     descriptor = filesystem.open(artifact, os.O_RDONLY | filesystem.O_NOFOLLOW)
 
     def unsupported_descriptor_control(*args: object) -> int:
@@ -434,6 +492,464 @@ def test_private_directory_makes_plain_exclusive_child_private(tmp_path: Path) -
         filesystem.verify_private(descriptor)
     finally:
         os.close(descriptor)
+
+
+def test_private_directory_creation_owner_already_user_is_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    set_token_info_called = False
+
+    def trap_set_token_info(*args: object) -> int:
+        nonlocal set_token_info_called
+        set_token_info_called = True
+        return 1
+
+    monkeypatch.setattr(_windows_files, "_SetTokenInformation", trap_set_token_info)
+
+    equal_sid_called = False
+
+    def reporting_equal_sid(sid1: int, sid2: int) -> int:
+        nonlocal equal_sid_called
+        equal_sid_called = True
+        return 1
+
+    monkeypatch.setattr(_windows_files, "_EqualSid", reporting_equal_sid)
+
+    target_dir = tmp_path / "private_dir"
+    filesystem.mkdir(target_dir, mode=0o700)
+
+    assert target_dir.is_dir()
+    assert equal_sid_called
+    assert not set_token_info_called
+    assert tracker.opened_handles
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+    assert all(access == _windows_files._TOKEN_QUERY for access in tracker.requested_access)
+
+
+def test_private_directory_creation_adjusts_unequal_owner_and_verifies_postcondition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    expected_buffer, expected_user_sid = _windows_files._current_user_sid()
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+
+    real_equal_sid = _windows_files._EqualSid
+    real_get_token_info = _windows_files._GetTokenInformation
+
+    operations: list[tuple[str, int]] = []
+    set_info_calls: list[tuple[int, int, bool]] = []
+
+    def tracking_get_token_info(
+        token: int,
+        info_class: int,
+        buffer: object,
+        length: int,
+        return_length: object,
+    ) -> int:
+        result = int(
+            real_get_token_info(token, info_class, buffer, length, return_length)
+        )
+        if buffer is not None and result:
+            operations.append(("QUERY", info_class))
+        return result
+
+    def recording_set_token_info(
+        token: int,
+        info_class: int,
+        info_ptr: ctypes.c_void_p,
+        info_length: int,
+    ) -> int:
+        operations.append(("SET", info_class))
+        owner_struct = ctypes.cast(
+            info_ptr,
+            ctypes.POINTER(_windows_files._TOKEN_OWNER),
+        ).contents
+        owner_sid = cast(int, owner_struct.Owner) if owner_struct.Owner else 0
+        is_expected_user = bool(
+            owner_sid and real_equal_sid(owner_sid, expected_user_sid)
+        )
+        set_info_calls.append((info_class, info_length, is_expected_user))
+        return 1
+
+    equal_sid_call_count = 0
+
+    def sequence_equal_sid(sid1: int, sid2: int) -> int:
+        nonlocal equal_sid_call_count
+        equal_sid_call_count += 1
+        if equal_sid_call_count == 1:
+            return 0
+        return 1
+
+    monkeypatch.setattr(
+        _windows_files, "_GetTokenInformation", tracking_get_token_info
+    )
+    monkeypatch.setattr(
+        _windows_files, "_SetTokenInformation", recording_set_token_info
+    )
+    monkeypatch.setattr(_windows_files, "_EqualSid", sequence_equal_sid)
+
+    target_dir = tmp_path / "private_dir"
+    filesystem.mkdir(target_dir, mode=0o700)
+
+    assert target_dir.is_dir()
+    assert len(set_info_calls) == 1
+    info_class, info_length, is_expected_user = set_info_calls[0]
+    assert info_class == _windows_files._TOKEN_OWNER_CLASS
+    assert info_length == ctypes.sizeof(_windows_files._TOKEN_OWNER)
+    assert is_expected_user is True
+    assert equal_sid_call_count == 2
+    assert operations[:4] == [
+        ("QUERY", _windows_files._TOKEN_USER_CLASS),
+        ("QUERY", _windows_files._TOKEN_OWNER_CLASS),
+        ("SET", _windows_files._TOKEN_OWNER_CLASS),
+        ("QUERY", _windows_files._TOKEN_OWNER_CLASS),
+    ]
+    adjust_access = _windows_files._TOKEN_ADJUST_DEFAULT | _windows_files._TOKEN_QUERY
+    assert tracker.requested_access.count(adjust_access) == 1
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+    assert expected_buffer is not None
+
+
+def test_private_directory_creation_fails_closed_when_query_token_open_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(
+        monkeypatch,
+        _windows_files,
+        deny_access_mask=_windows_files._TOKEN_QUERY,
+    )
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(
+        filesystem.PlatformSafetyError,
+        match="cannot open the process token for query",
+    ):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert tracker.denied_access
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+@pytest.mark.parametrize(
+    ("windows_error", "return_size"),
+    (
+        (87, 0),
+        (122, 0),
+    ),
+)
+def test_private_directory_creation_fails_closed_on_token_sizing_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows_error: int,
+    return_size: int,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    injection_executed = False
+    real_get_token_info = _windows_files._GetTokenInformation
+
+    def mock_sizing_get_token_info(
+        token: int,
+        info_class: int,
+        buffer: object,
+        length: int,
+        return_length: ctypes.c_void_p,
+    ) -> int:
+        nonlocal injection_executed
+        if buffer is None and info_class == _windows_files._TOKEN_USER_CLASS:
+            injection_executed = True
+            _set_last_error(windows_error)
+            ctypes.cast(
+                return_length,
+                ctypes.POINTER(wintypes.DWORD),
+            ).contents.value = return_size
+            return 0
+        return int(
+            real_get_token_info(token, info_class, buffer, length, return_length)
+        )
+
+    monkeypatch.setattr(_windows_files, "_GetTokenInformation", mock_sizing_get_token_info)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(filesystem.PlatformSafetyError, match="cannot size process token user"):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert injection_executed
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+def test_private_directory_creation_fails_closed_when_user_query_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    injection_executed = False
+    real_get_token_info = _windows_files._GetTokenInformation
+
+    def fail_user_token_info(
+        token: int,
+        info_class: int,
+        buffer: object,
+        length: int,
+        return_length: object,
+    ) -> int:
+        nonlocal injection_executed
+        if info_class == _windows_files._TOKEN_USER_CLASS and buffer is not None:
+            injection_executed = True
+            _set_last_error(87)
+            return 0
+        return int(real_get_token_info(token, info_class, buffer, length, return_length))
+
+    monkeypatch.setattr(_windows_files, "_GetTokenInformation", fail_user_token_info)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(
+        filesystem.PlatformSafetyError,
+        match="cannot query process token user",
+    ):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert injection_executed
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+def test_private_directory_creation_fails_closed_when_owner_query_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    injection_executed = False
+    real_get_token_info = _windows_files._GetTokenInformation
+
+    def fail_owner_token_info(
+        token: int,
+        info_class: int,
+        buffer: object,
+        length: int,
+        return_length: object,
+    ) -> int:
+        nonlocal injection_executed
+        if info_class == _windows_files._TOKEN_OWNER_CLASS and buffer is not None:
+            injection_executed = True
+            _set_last_error(87)
+            return 0
+        return int(real_get_token_info(token, info_class, buffer, length, return_length))
+
+    monkeypatch.setattr(_windows_files, "_GetTokenInformation", fail_owner_token_info)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(
+        filesystem.PlatformSafetyError,
+        match="cannot query process token owner",
+    ):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert injection_executed
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+def test_private_directory_creation_fails_closed_when_adjust_token_open_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(
+        monkeypatch,
+        _windows_files,
+        deny_access_mask=_windows_files._TOKEN_ADJUST_DEFAULT,
+    )
+    monkeypatch.setattr(_windows_files, "_EqualSid", lambda s1, s2: 0)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(
+        filesystem.PlatformSafetyError,
+        match="cannot open the process token for owner adjustment",
+    ):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert tracker.denied_access
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+def test_private_directory_creation_fails_closed_when_set_token_information_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    injection_executed = False
+
+    def fail_set_token_info(*args: object) -> int:
+        nonlocal injection_executed
+        injection_executed = True
+        _set_last_error(87)
+        return 0
+
+    monkeypatch.setattr(_windows_files, "_EqualSid", lambda s1, s2: 0)
+    monkeypatch.setattr(_windows_files, "_SetTokenInformation", fail_set_token_info)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(
+        filesystem.PlatformSafetyError,
+        match="cannot set process token owner",
+    ):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert injection_executed
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+def test_private_directory_creation_fails_closed_when_owner_postcondition_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    tracker = _TokenTracker(monkeypatch, _windows_files)
+    set_info_called = False
+    equal_sid_calls = 0
+
+    def mock_set_token_info(*args: object) -> int:
+        nonlocal set_info_called
+        set_info_called = True
+        return 1
+
+    def always_unequal_sid(sid1: int, sid2: int) -> int:
+        nonlocal equal_sid_calls
+        equal_sid_calls += 1
+        return 0
+
+    monkeypatch.setattr(_windows_files, "_SetTokenInformation", mock_set_token_info)
+    monkeypatch.setattr(_windows_files, "_EqualSid", always_unequal_sid)
+
+    target_dir = tmp_path / "private_dir"
+    with pytest.raises(
+        filesystem.PlatformSafetyError,
+        match="process token owner could not be synchronized",
+    ):
+        filesystem.mkdir(target_dir, mode=0o700)
+
+    assert set_info_called
+    assert equal_sid_calls >= 2
+    assert not target_dir.exists()
+    assert not tracker.live_handles
+    assert tracker.opened_handles == tracker.closed_handles
+
+
+def test_private_directory_inherited_by_spawned_process_writers(tmp_path: Path) -> None:
+    parent = filesystem.open(tmp_path, _directory_flags())
+    try:
+        filesystem.mkdir("private", mode=0o700, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+    private_dir = tmp_path / "private"
+
+    child_code = (
+        "import os, sys, pathlib\n"
+        "target_dir = pathlib.Path(sys.argv[1])\n"
+        "o_binary = getattr(os, 'O_BINARY', 0)\n"
+        "fd = os.open(target_dir / 'child_exclusive.bin', os.O_WRONLY | os.O_CREAT | os.O_EXCL | o_binary, 0o600)\n"
+        "assert os.write(fd, b'child-exclusive-payload') == 23\n"
+        "os.close(fd)\n"
+        "with open(target_dir / 'child_open_x.bin', 'xb') as f:\n"
+        "    assert f.write(b'child-open-x-payload') == 20\n"
+        "temp_file = target_dir / 'child_temp.bin'\n"
+        "with open(temp_file, 'xb') as f:\n"
+        "    assert f.write(b'child-atomic-replace-payload') == 28\n"
+        "os.replace(temp_file, target_dir / 'child_atomic.bin')\n"
+    )
+
+    result = subprocess.run(  # nosec B603
+        (sys.executable, "-c", child_code, str(private_dir)),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"child process failed: stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
+
+    expected_files = (
+        ("child_exclusive.bin", b"child-exclusive-payload"),
+        ("child_open_x.bin", b"child-open-x-payload"),
+        ("child_atomic.bin", b"child-atomic-replace-payload"),
+    )
+    for filename, expected_content in expected_files:
+        filepath = private_dir / filename
+        descriptor = filesystem.open(filepath, os.O_RDONLY | filesystem.O_NOFOLLOW)
+        try:
+            filesystem.verify_private(descriptor)
+            content = os.read(descriptor, len(expected_content) + 10)
+            assert content == expected_content
+        finally:
+            os.close(descriptor)
+
+
+def test_verify_private_rejects_owner_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyrepo_check import _windows_files
+
+    artifact = tmp_path / "artifact.bin"
+    creator = filesystem.open(
+        artifact,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | filesystem.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        assert os.write(creator, b"payload") == 7
+    finally:
+        os.close(creator)
+
+    descriptor = filesystem.open(artifact, os.O_RDONLY | filesystem.O_NOFOLLOW)
+    injection_executed = False
+
+    def mismatched_owner_equal_sid(sid1: int, sid2: int) -> int:
+        nonlocal injection_executed
+        injection_executed = True
+        return 0
+
+    monkeypatch.setattr(_windows_files, "_EqualSid", mismatched_owner_equal_sid)
+    try:
+        with pytest.raises(PermissionError, match="not owned by the current user"):
+            filesystem.verify_private(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert injection_executed
 
 
 def test_relative_operations_reject_unsafe_components(tmp_path: Path) -> None:
