@@ -412,14 +412,21 @@ def test_must_not_run():
     )
 
 
+@pytest.mark.parametrize("large_index", [False, True])
 def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
-    tmp_path: Path,
+    tmp_path: Path, large_index: bool,
 ) -> None:
     consumer = tmp_path / "consumer"
     consumer.mkdir()
     _write_external_consumer(consumer)
     subprocess.run(("uv", "lock"), cwd=consumer, check=True, capture_output=True)  # nosec B603
     subprocess.run(("git", "init", "-q"), cwd=consumer, check=True)  # nosec B603
+    if large_index:
+        tracked = consumer / "tracked"
+        tracked.mkdir()
+        for index in range(700):
+            (tracked / f"{index:04d}-{'document-' * 5}.md").write_bytes(b"tracked\n")
+        subprocess.run(("git", "add", "."), cwd=consumer, check=True)  # nosec B603
     before_status = subprocess.run(  # nosec B603
         ("git", "status", "--short"),
         cwd=consumer,
@@ -468,6 +475,11 @@ def test_external_consumer_emits_structured_pytest_json_and_stays_clean(
 
     assert completed.returncode == 0
     assert completed.stderr == b""
+    if large_index:
+        evidence = payload["repository_environment"]
+        assert evidence["mutation_protection"] == "tracked_files"
+        assert evidence["processes"][-1]["stdout"]["omitted_bytes"] > 0
+        assert any(advisory["code"] == "output_truncated" for advisory in payload["advisories"])
     assert payload["pytest"]["evidence"] is not None
     assert [process["role"] for process in payload["checks"][0]["processes"]] == ["primary"]
     assert after_status == before_status

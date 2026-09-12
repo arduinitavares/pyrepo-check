@@ -370,7 +370,11 @@ def execute_process(
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
     environment: Mapping[str, str] | None = None,
+    stdout_consumer: Callable[[bytes], None] | None = None,
 ) -> ExecutedProcess:
+    """Run a child, optionally consuming complete stdout before diagnostic truncation."""
+    if stdout_consumer is not None and not capture_output:
+        raise ValueError("A stdout consumer requires captured output.")
     started_ns: int | None = None
     returncode: int | None = None
     stdout: CapturedBytes | None = None
@@ -384,6 +388,7 @@ def execute_process(
                 cwd=cwd,
                 capture_output=capture_output,
                 environment=environment,
+                stdout_consumer=stdout_consumer,
             )
         else:
             runner_kwargs: dict[str, object] = {
@@ -397,9 +402,18 @@ def execute_process(
             completed = runner(command, **runner_kwargs)
             returncode = completed.returncode
             if capture_output:
-                stdout = _normalize_buffered_output(cast(bytes | str | None, completed.stdout))
+                raw_stdout = cast(bytes | str | None, completed.stdout)
+                if stdout_consumer is not None:
+                    raw = raw_stdout.encode() if isinstance(raw_stdout, str) else raw_stdout or b""
+                    try:
+                        for offset in range(0, len(raw), _PIPE_READ_BYTES):
+                            stdout_consumer(raw[offset : offset + _PIPE_READ_BYTES])
+                    except (OSError, RuntimeError) as error:
+                        raise _ProcessExecutionFailure("stdout drain", error) from error
+                stdout = _normalize_buffered_output(raw_stdout)
                 stderr = _normalize_buffered_output(cast(bytes | str | None, completed.stderr))
     except _ProcessExecutionFailure as error:
+        returncode = None
         spawn_error = str(error)
     except OSError as error:
         spawn_error = f"{type(error).__name__}: {error}"
@@ -423,6 +437,7 @@ def _run_bounded_process(
     cwd: Path,
     capture_output: bool,
     environment: Mapping[str, str] | None,
+    stdout_consumer: Callable[[bytes], None] | None = None,
 ) -> tuple[int, CapturedBytes | None, CapturedBytes | None]:
     process = subprocess.Popen(  # nosec B603
         command,
@@ -458,7 +473,13 @@ def _run_bounded_process(
             try:
                 reader = threading.Thread(
                     target=_run_pipe_reader,
-                    args=(stream, pipe, accumulator, results),
+                    args=(
+                        stream,
+                        pipe,
+                        accumulator,
+                        results,
+                        stdout_consumer if stream == "stdout" else None,
+                    ),
                     name=f"pyrepo-check-{stream}",
                     daemon=True,
                 )
@@ -503,10 +524,11 @@ def _run_pipe_reader(
     pipe: _ReadablePipe | None,
     accumulator: _TailAccumulator,
     results: queue.SimpleQueue[_ReaderResult],
+    consumer: Callable[[bytes], None] | None = None,
 ) -> None:
     error: BaseException | None = None
     try:
-        _drain_pipe(pipe, accumulator)
+        _drain_pipe(pipe, accumulator, consumer)
     except BaseException as caught:
         error = caught
     finally:
@@ -570,12 +592,15 @@ def _cleanup_failed_process(
 def _drain_pipe(
     pipe: _ReadablePipe | None,
     accumulator: _TailAccumulator,
+    consumer: Callable[[bytes], None] | None = None,
 ) -> None:
     if pipe is None:
         return
     read_buffer = bytearray(_PIPE_READ_BYTES)
     while (read_bytes := pipe.readinto(read_buffer)) != 0:
         accumulator.feed(memoryview(read_buffer)[:read_bytes])
+        if consumer is not None:
+            consumer(bytes(memoryview(read_buffer)[:read_bytes]))
 
 
 def _normalize_buffered_output(output: bytes | str | None) -> CapturedBytes:

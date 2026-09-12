@@ -28,6 +28,7 @@ from pyrepo_check.execution import (
 
 _INDEX_ENTRY_PATTERN = re.compile(rb"([0-7]{6}) ([0-9a-f]+) ([0-3])\t(.*)", re.DOTALL)
 _READ_CHUNK_BYTES = 64 * 1024
+_MAX_INDEX_RECORD_BYTES = 65_536
 _PROTECTED_NAMES = ("pyproject.toml", "uv.lock")
 
 
@@ -74,6 +75,74 @@ class _SnapshotError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class _IndexEntry:
+    path: str
+    mode: str
+    object_id: str
+
+
+class _TrackedIndexParser:
+    """Consume complete index records separately from bounded diagnostic tails."""
+
+    def __init__(self) -> None:
+        self.total_bytes = 0
+        self._pending = b""
+        self._entries: list[_IndexEntry] = []
+        self._observed_paths: set[str] = set()
+        self._has_unmerged = False
+        self._invalid = False
+
+    def feed(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        if self._invalid:
+            return
+        records = (self._pending + chunk).split(b"\0")
+        self._pending = records.pop()
+        try:
+            if len(self._pending) > _MAX_INDEX_RECORD_BYTES:
+                raise _SnapshotError
+            for record in records:
+                self._consume_record(record)
+        except _SnapshotError:
+            # Continue draining the child, but never publish a partial snapshot.
+            self._invalid = True
+            self._pending = b""
+            self._entries.clear()
+            self._observed_paths.clear()
+
+    def _consume_record(self, record: bytes) -> None:
+        if len(record) > _MAX_INDEX_RECORD_BYTES:
+            raise _SnapshotError
+        match = _INDEX_ENTRY_PATTERN.fullmatch(record)
+        if match is None:
+            raise _SnapshotError
+        path = os.fsdecode(match.group(4))
+        if not path or Path(path).is_absolute() or ".." in Path(path).parts:
+            raise _SnapshotError
+        if match.group(3) != b"0":
+            self._has_unmerged = True
+            return
+        if path in self._observed_paths:
+            raise _SnapshotError
+        self._observed_paths.add(path)
+        self._entries.append(
+            _IndexEntry(path, match.group(1).decode("ascii"), match.group(2).decode("ascii"))
+        )
+
+    def finish(self, process: ExecutedProcess) -> tuple[tuple[_IndexEntry, ...], bool]:
+        if (
+            self._invalid
+            or self._pending
+            or process.spawn_error is not None
+            or process.returncode != 0
+            or process.stdout is None
+            or self.total_bytes != len(process.stdout.tail) + process.stdout.omitted_bytes
+        ):
+            raise _SnapshotError
+        return tuple(self._entries), self._has_unmerged
+
+
 def capture_repository_baseline(
     root: Path,
     *,
@@ -93,8 +162,7 @@ def capture_repository_baseline(
     except _SnapshotError:
         return _baseline_failure([], "Protected files could not be safely captured.")
     if expected_pyproject_sha256 is not None and (
-        protected[0].kind != "regular"
-        or protected[0].sha256 != expected_pyproject_sha256
+        protected[0].kind != "regular" or protected[0].sha256 != expected_pyproject_sha256
     ):
         return _baseline_failure(
             [],
@@ -106,8 +174,7 @@ def capture_repository_baseline(
     )
     processes: list[ExecutedProcess] = []
     git_marker = any(
-        _lexically_exists(directory / ".git")
-        for directory in (project_root, *project_root.parents)
+        _lexically_exists(directory / ".git") for directory in (project_root, *project_root.parents)
     )
     if git_executable is None:
         if git_marker:
@@ -136,9 +203,7 @@ def capture_repository_baseline(
         return _capture_non_git_baseline(project_root, processes, protected=protected)
 
     git_root = _parse_git_root(root_process)
-    if git_root is None or not (
-        project_root == git_root or git_root in project_root.parents
-    ):
+    if git_root is None or not (project_root == git_root or git_root in project_root.parents):
         return _baseline_failure(processes, "Git repository-root evidence is invalid.")
 
     tracked_venv = _git_process(
@@ -176,7 +241,7 @@ def capture_repository_baseline(
     if ignored_venv.spawn_error is not None or ignored_venv.returncode != 0:
         return _baseline_failure(processes, ".venv must be ignored by the repository.")
 
-    stage_process = _tracked_stage_process(
+    stage_process, index_parser = _tracked_stage_process(
         project_root,
         environment=environment,
         runner=runner,
@@ -185,7 +250,7 @@ def capture_repository_baseline(
     )
     processes.append(stage_process)
     try:
-        entries, has_unmerged = _parse_tracked_entries(project_root, stage_process)
+        entries, has_unmerged = _parse_tracked_entries(project_root, stage_process, index_parser)
     except _SnapshotError:
         return _baseline_failure(processes, "Repository state could not be safely captured.")
     if has_unmerged:
@@ -231,9 +296,7 @@ def verify_repository_state(
             _repository_changed("Protected files could not be safely verified."),
         )
     protected_valid = all(entry.kind == "regular" for entry in protected)
-    baseline_protected_valid = all(
-        entry.kind == "regular" for entry in snapshot.protected_files
-    )
+    baseline_protected_valid = all(entry.kind == "regular" for entry in snapshot.protected_files)
 
     if snapshot.git_root is None:
         if not protected_valid or not baseline_protected_valid:
@@ -257,7 +320,7 @@ def verify_repository_state(
         )
 
     environment = _sanitized_git_environment(os.environ)
-    stage_process = _tracked_stage_process(
+    stage_process, index_parser = _tracked_stage_process(
         project_root,
         environment=environment,
         runner=runner,
@@ -266,7 +329,7 @@ def verify_repository_state(
     )
     processes = (stage_process,)
     try:
-        tracked, has_unmerged = _parse_tracked_entries(project_root, stage_process)
+        tracked, has_unmerged = _parse_tracked_entries(project_root, stage_process, index_parser)
     except _SnapshotError:
         return RepositoryVerificationResult(
             processes,
@@ -341,9 +404,7 @@ def _snapshot_project_root(snapshot: RepositoryStateSnapshot) -> Path | None:
         return None
     if snapshot.git_root is not None:
         git_root = _normalized_absolute(snapshot.git_root)
-        if git_root != snapshot.git_root or not (
-            root == git_root or git_root in root.parents
-        ):
+        if git_root != snapshot.git_root or not (root == git_root or git_root in root.parents):
             return None
     return root
 
@@ -409,6 +470,7 @@ def _git_process(
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
     git_executable: ControllerExecutable | str,
+    stdout_consumer: Callable[[bytes], None] | None = None,
 ) -> ExecutedProcess:
     pinned_path = (
         str(git_executable.path)
@@ -442,6 +504,7 @@ def _git_process(
         runner=selected_runner,  # type: ignore[arg-type]
         clock_ns=clock_ns,
         environment=environment,
+        stdout_consumer=stdout_consumer,
     )
 
 
@@ -452,8 +515,9 @@ def _tracked_stage_process(
     runner: ProcessRunner | None,
     clock_ns: Callable[[], int],
     git_executable: ControllerExecutable | str = "git",
-) -> ExecutedProcess:
-    return _git_process(
+) -> tuple[ExecutedProcess, _TrackedIndexParser]:
+    parser = _TrackedIndexParser()
+    process = _git_process(
         role="repository_tracked_snapshot",
         root=root,
         arguments=("ls-files", "--stage", "-z", "--", "."),
@@ -461,7 +525,9 @@ def _tracked_stage_process(
         runner=runner,
         clock_ns=clock_ns,
         git_executable=git_executable,
+        stdout_consumer=parser.feed,
     )
+    return process, parser
 
 
 def _parse_git_root(process: ExecutedProcess) -> Path | None:
@@ -480,36 +546,16 @@ def _parse_git_root(process: ExecutedProcess) -> Path | None:
 def _parse_tracked_entries(
     root: Path,
     process: ExecutedProcess,
+    parser: _TrackedIndexParser,
 ) -> tuple[tuple[TrackedFileSnapshot, ...], bool]:
-    if process.spawn_error is not None or process.returncode != 0:
-        raise _SnapshotError
-    output = _complete_stdout(process)
-    if output is None:
-        raise _SnapshotError
-    records = output.split(b"\0")
-    if records[-1] != b"":
-        raise _SnapshotError
-    entries: list[TrackedFileSnapshot] = []
-    observed_paths: set[str] = set()
-    has_unmerged = False
-    for record in records[:-1]:
-        match = _INDEX_ENTRY_PATTERN.fullmatch(record)
-        if match is None:
-            raise _SnapshotError
-        index_mode = match.group(1).decode("ascii")
-        index_object = match.group(2).decode("ascii")
-        stage = match.group(3)
-        path = os.fsdecode(match.group(4))
-        if not path or Path(path).is_absolute() or ".." in Path(path).parts:
-            raise _SnapshotError
-        if stage != b"0":
-            has_unmerged = True
-            continue
-        if path in observed_paths:
-            raise _SnapshotError
-        observed_paths.add(path)
-        entries.append(_capture_tracked_file(root, path, index_mode, index_object))
-    return tuple(entries), has_unmerged
+    entries, has_unmerged = parser.finish(process)
+    return (
+        tuple(
+            _capture_tracked_file(root, entry.path, entry.mode, entry.object_id)
+            for entry in entries
+        ),
+        has_unmerged,
+    )
 
 
 def _capture_tracked_file(

@@ -13,7 +13,106 @@ from pyrepo_check.repository_safety import (
     capture_repository_baseline,
     verify_repository_state,
 )
+from pyrepo_check.execution import CAPTURE_LIMIT_BYTES
 from tests.support import RecordingRunner, monotonic_clock
+
+
+@pytest.mark.parametrize("mutation", ["content", "add", "remove"])
+def test_large_git_snapshot_preserves_all_entries_and_detects_mutation(
+    tmp_path: Path, mutation: str
+) -> None:
+    root = initialize_git_fixture(tmp_path)
+    directory = root / "tracked"
+    directory.mkdir()
+    paths = [directory / f"{index:04d}-{'source-' * 5}.py" for index in range(700)]
+    for path in paths:
+        path.write_bytes(b"value = 1\n")
+    _run_git(root, "add", ".")
+    raw_index = _run_git(root, "ls-files", "--stage", "-z", "--", ".").stdout
+    assert len(raw_index) > CAPTURE_LIMIT_BYTES
+
+    baseline = capture_repository_baseline(root, runner=None, clock_ns=monotonic_clock())
+    assert baseline.error is None
+    assert baseline.snapshot is not None
+    expected_paths = {
+        os.fsdecode(record.split(b"\t", 1)[1]) for record in raw_index.split(b"\0")[:-1]
+    }
+    assert {entry.path for entry in baseline.snapshot.tracked_files} == expected_paths
+    assert baseline.processes[-1].stdout is not None
+    assert baseline.processes[-1].stdout.omitted_bytes == len(raw_index) - CAPTURE_LIMIT_BYTES
+
+    unchanged = verify_repository_state(
+        baseline.snapshot,
+        annotations_fix_targets=None,
+        runner=None,
+        clock_ns=monotonic_clock(),
+    )
+    assert unchanged.error is None
+    if mutation == "content":
+        paths[0].write_bytes(b"value = 2\n")
+    elif mutation == "add":
+        (directory / "new.py").write_bytes(b"new = True\n")
+        _run_git(root, "add", ".")
+    else:
+        _run_git(root, "rm", "--cached", "--", paths[-1].relative_to(root).as_posix())
+    changed = verify_repository_state(
+        baseline.snapshot,
+        annotations_fix_targets=None,
+        runner=None,
+        clock_ns=monotonic_clock(),
+    )
+    assert changed.error is not None
+    assert changed.error.code == "repository_state_changed"
+
+
+@pytest.mark.parametrize("location", ["before_tail", "after_tail"])
+@pytest.mark.parametrize(
+    "invalid", ["malformed", "duplicate", "unsafe_path", "unmerged", "unterminated", "overlong"]
+)
+def test_large_index_rejects_invalid_records_anywhere(
+    tmp_path: Path, location: str, invalid: str
+) -> None:
+    root = _write_non_git_project(tmp_path)
+    valid = b"".join(
+        f"100644 {'a' * 40} 0\ttracked/{index:04d}-{'file' * 10}.py\0".encode()
+        for index in range(800)
+    )
+    assert len(valid) > CAPTURE_LIMIT_BYTES
+    invalid_records = {
+        "malformed": b"invalid index record\0",
+        "duplicate": valid.split(b"\0", 1)[0] + b"\0",
+        "unsafe_path": f"100644 {'a' * 40} 0\t../outside.py\0".encode(),
+        "unmerged": f"100644 {'a' * 40} 1\tconflicted.py\0".encode(),
+        "unterminated": b"unfinished record",
+        "overlong": b"x" * (CAPTURE_LIMIT_BYTES + 1) + b"\0",
+    }
+    bad = invalid_records[invalid]
+    output = bad + valid if location == "before_tail" else valid + bad
+    runner = RecordingRunner(stdout=(os.fsencode(root) + b"\n", b"", b"", output))
+
+    result = capture_repository_baseline(root, runner=runner, clock_ns=monotonic_clock())
+
+    assert result.snapshot is None
+    assert result.error is not None
+    assert result.error.code == "unsafe_repository_environment"
+    process = result.processes[-1]
+    assert process.returncode == 0
+    assert process.stdout is not None
+    assert process.stdout.omitted_bytes == len(output) - CAPTURE_LIMIT_BYTES
+
+
+def test_complete_index_is_rejected_after_git_command_failure(tmp_path: Path) -> None:
+    root = _write_non_git_project(tmp_path)
+    runner = RecordingRunner(
+        stdout=(os.fsencode(root) + b"\n", b"", b"", _scripted_stage(root)),
+        returncodes=(0, 0, 0, 1),
+    )
+
+    result = capture_repository_baseline(root, runner=runner, clock_ns=monotonic_clock())
+
+    assert result.snapshot is None
+    assert result.error is not None
+    assert result.error.code == "unsafe_repository_environment"
 
 
 def test_missing_safe_git_preserves_non_git_protected_file_fallback(
@@ -123,10 +222,7 @@ def _set_unmerged_index(root: Path) -> None:
         root,
         "update-index",
         "--index-info",
-        input_bytes=(
-            f"0 {'0' * 40}\tsrc/example.py\n"
-            f"100644 {blob} 1\tsrc/example.py\n"
-        ).encode(),
+        input_bytes=(f"0 {'0' * 40}\tsrc/example.py\n100644 {blob} 1\tsrc/example.py\n").encode(),
     )
 
 
@@ -361,14 +457,10 @@ def test_git_probes_ignore_all_inherited_git_redirection(tmp_path: Path) -> None
         if environment is not None
     )
     assert all(
-        environment["LC_ALL"] == "C"
-        for environment in git_environments
-        if environment is not None
+        environment["LC_ALL"] == "C" for environment in git_environments if environment is not None
     )
     assert all(
-        "GIT_DIR" not in environment
-        for environment in git_environments
-        if environment is not None
+        "GIT_DIR" not in environment for environment in git_environments if environment is not None
     )
     assert all(
         "GIT_WORK_TREE" not in environment

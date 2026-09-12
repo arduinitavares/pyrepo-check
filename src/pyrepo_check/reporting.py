@@ -388,7 +388,11 @@ def _validate_environment_state_v2(
         if (
             not environment.processes
             or environment.processes[-1].role != "repository_safety"
-            or not _successful_process(environment.processes[-1])
+            # tracked_files is set only after complete semantic index validation.
+            # Its diagnostic excerpts may be truncated independently.
+            or not _zero_exit_process(environment.processes[-1])
+            or not environment.processes[-1].stdout.captured
+            or not environment.processes[-1].stderr.captured
             or len(environment.processes[-1].argv) != len(expected_final_tail) + 1
             or not Path(environment.processes[-1].argv[0]).is_absolute()
             or environment.processes[-1].argv[1:] != expected_final_tail

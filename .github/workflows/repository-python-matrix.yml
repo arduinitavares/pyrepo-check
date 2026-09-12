@@ -60,7 +60,10 @@ jobs:
           tests/test_windows_integration.py
           tests/test_artifact_safety.py tests/test_execution_workspace.py
           tests/test_pytest_execution.py tests/test_coverage_execution.py
-          tests/test_controller_tools.py tests/test_repository_executor.py -q
+          tests/test_controller_tools.py tests/test_repository_executor.py
+          tests/test_execution.py tests/test_repository_safety.py
+          tests/test_reporting.py tests/test_reporting_schema_v2.py
+          tests/test_compatibility.py::test_external_consumer_emits_structured_pytest_json_and_stays_clean -q
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-windows
