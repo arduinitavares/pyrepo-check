@@ -67,6 +67,10 @@ Before/after evidence detects tracked or protected-file changes and reports
 writes. Inspect changes and restore them
 only with user authority. A tracked, unignored, or symlinked `.venv` is rejected.
 
+Git snapshots consume the complete tracked-file listing, including listings larger
+than 64 KiB. Process diagnostics retain only the last 64 KiB per stream and report
+the omitted byte count; those excerpts do not replace the validated snapshot.
+
 ## Usage
 
 Run from the target repository root or pass `--root <path>`.

@@ -186,12 +186,15 @@ def test_raw_command_compatibility_helper_retains_isolated_exit_contract(
 ) -> None:
     commands = tuple(("tool", str(index)) for index in range(len(returncodes)))
 
-    assert execute_legacy_commands(
-        commands,
-        cwd=tmp_path,
-        runner=RecordingRunner(returncodes=returncodes),
-        clock_ns=monotonic_clock(),
-    ) == expected
+    assert (
+        execute_legacy_commands(
+            commands,
+            cwd=tmp_path,
+            runner=RecordingRunner(returncodes=returncodes),
+            clock_ns=monotonic_clock(),
+        )
+        == expected
+    )
 
 
 def test_execute_process_normalizes_injected_json_streams(tmp_path: Path) -> None:
@@ -224,6 +227,80 @@ def test_execute_process_bounds_each_injected_stream_independently(tmp_path: Pat
 
     assert process.stdout == CapturedBytes(b"x" * CAPTURE_LIMIT_BYTES, 3)
     assert process.stderr == CapturedBytes(b"y" * CAPTURE_LIMIT_BYTES, 5)
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_stdout_consumer_receives_complete_owned_bytes_with_bounded_diagnostics(
+    tmp_path: Path, injected: bool
+) -> None:
+    output = bytes(range(256)) * 1024 + b"final"
+    chunks: list[bytes] = []
+    process = execute_process(
+        role="primary",
+        command=(
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(bytes(range(256))*1024+b'final')",
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        runner=RecordingRunner(stdout=(output,)) if injected else None,
+        clock_ns=monotonic_clock(),
+        stdout_consumer=chunks.append,
+    )
+
+    assert process.returncode == 0
+    assert process.spawn_error is None
+    assert len(chunks) > 1
+    assert all(type(chunk) is bytes for chunk in chunks)
+    assert b"".join(chunks) == output
+    assert process.stdout == CapturedBytes(
+        output[-CAPTURE_LIMIT_BYTES:], len(output) - CAPTURE_LIMIT_BYTES
+    )
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_stdout_consumer_failure_rejects_output_and_reaps_native_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, injected: bool
+) -> None:
+    child = _FakePopen(_VirtualPipe(100, ord("a")), _VirtualPipe(10, ord("b")))
+    if not injected:
+        _install_fake_popen(monkeypatch, child)
+
+    def fail(_chunk: bytes) -> None:
+        raise OSError("semantic consumer failed")
+
+    process = execute_process(
+        role="primary",
+        command=("tool",),
+        cwd=tmp_path,
+        capture_output=True,
+        runner=RecordingRunner(stdout=(b"data",)) if injected else None,
+        clock_ns=monotonic_clock(),
+        stdout_consumer=fail,
+    )
+
+    assert process.returncode is None
+    assert process.stdout is None and process.stderr is None
+    assert process.spawn_error == "stdout drain failed: OSError: semantic consumer failed"
+    if not injected:
+        assert child.terminated
+        assert child.wait_calls
+
+
+def test_stdout_consumer_requires_captured_output_before_spawn(tmp_path: Path) -> None:
+    runner = RecordingRunner()
+    with pytest.raises(ValueError, match="requires captured output"):
+        execute_process(
+            role="primary",
+            command=("tool",),
+            cwd=tmp_path,
+            capture_output=False,
+            runner=runner,
+            clock_ns=monotonic_clock(),
+            stdout_consumer=lambda _chunk: None,
+        )
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize("error", (FileNotFoundError("tool"), OSError("spawn blocked")))
@@ -280,7 +357,9 @@ def test_production_process_capture_is_bounded(tmp_path: Path) -> None:
     assert process.stderr == CapturedBytes(b"b" * CAPTURE_LIMIT_BYTES, 11)
 
 
-def test_terminal_process_inherits_streams(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:
+def test_terminal_process_inherits_streams(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
     process = execute_process(
         role="primary",
         command=(execution.sys.executable, "-c", "print('visible')"),

@@ -431,6 +431,30 @@ def test_public_composition_builds_strict_schema_v2_from_execution_evidence() ->
     assert report == valid_run_report()
 
 
+def test_validated_snapshot_keeps_truncated_diagnostics_in_successful_report() -> None:
+    root, plan, execution = _ordinary_success_composition()
+    environment = execution.repository_environment
+    final_safety = replace(
+        environment.processes[-1], stdout=CapturedBytes(b"tail", 298)
+    )
+    execution = replace(
+        execution,
+        repository_environment=replace(
+            environment, processes=(*environment.processes[:-1], final_safety)
+        ),
+    )
+
+    report = build_run_report(root, plan, execution)
+
+    assert report.complete
+    assert select_exit_code(report) == 0
+    payload = json.loads(serialize_json(report))
+    assert payload["repository_environment"]["mutation_protection"] == "tracked_files"
+    assert payload["repository_environment"]["processes"][-1]["stdout"]["omitted_bytes"] == 298
+    assert any(advisory.code == "output_truncated" for advisory in report.advisories)
+    assert "298" in render_terminal(report)
+
+
 def test_public_planning_error_composition_retains_observed_tool_environment() -> None:
     tool = ToolEnvironmentObservation(
         "0.1.0",

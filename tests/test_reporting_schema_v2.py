@@ -2752,7 +2752,7 @@ def test_schema_v2_successful_machine_evidence_requires_complete_capture() -> No
             environment,
             processes=(
                 *environment.processes[:-1],
-                replace(environment.processes[-1], stdout=truncated),
+                replace(environment.processes[-1], stdout=uncaptured),
             ),
         ),
         replace(
