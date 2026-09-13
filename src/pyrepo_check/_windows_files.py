@@ -589,7 +589,7 @@ def _ensure_process_owner_is_user() -> None:
     query_token = wintypes.HANDLE()
     if not _OpenProcessToken(_GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(query_token)):
         _raise_token_safety_error("cannot open the process token for query")
-    query_handle = cast(int, query_token.value)
+    query_handle = cast(int, query_token.value or 0)
     if not query_handle or query_handle == _INVALID_HANDLE_VALUE:
         _close_handle(query_handle)
         raise PlatformSafetyError("OpenProcessToken returned an invalid handle")
@@ -612,7 +612,7 @@ def _ensure_process_owner_is_user() -> None:
         ctypes.byref(adjust_token),
     ):
         _raise_token_safety_error("cannot open the process token for owner adjustment")
-    adjust_handle = cast(int, adjust_token.value)
+    adjust_handle = cast(int, adjust_token.value or 0)
     if not adjust_handle or adjust_handle == _INVALID_HANDLE_VALUE:
         _close_handle(adjust_handle)
         raise PlatformSafetyError("OpenProcessToken returned an invalid handle")
